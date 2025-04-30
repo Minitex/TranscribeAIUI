@@ -1,0 +1,12 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <path d="M0 0h1024v1024H0z"/>
+  <path d="M256 128h384l256 256v566H256Z" fill="#FFF" transform="matrix(.8 0 0 .8 58 -20)"/>
+  <path fill="#E0E0E0" d="m640 128 256 256H640z" transform="matrix(.8 0 0 .8 58 -20)"/>
+  <text x="350" y="400" font-family="Segoe UI, Arial, sans-serif" font-size="300" font-weight="bold" transform="matrix(.8 0 0 .8 58 -20)">
+        T
+      </text>
+  <path d="M350 560h450M350 660h450M350 760h450" stroke="#000" stroke-width="25" stroke-linecap="round" transform="matrix(.8 0 0 .8 58 -20)"/>
+  <text x="-250" y="900" font-family="Segoe UI, Arial, sans-serif" font-size="160" font-weight="bold" transform="translate(275)">
+      <tspan fill="#FFF">Transcribe</tspan><tspan fill="#1B75BC">AI</tspan>
+    </text>
+</svg>

@@ -1,0 +1,50 @@
+{
+  "name": "TranscribeAI",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "author": "Ninh Tran <ninhtran@umn.edu>",
+  "main": "dist-electron/main.js",
+  "description": "TranscribeAI - A desktop application for audio transcription using AI",
+  "scripts": {
+    "build:python": "pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build python/preprocess_to_jpeg.py && pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build python/flash_process_local_dir.py && pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build python/audio_transcribe.py",
+    "dev": "npm-run-all --parallel dev:react dev:electron",
+    "dev:react": "vite",
+    "dev:electron": "npm run transpile:electron && cross-env NODE_ENV=development electron .",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "transpile:electron": "tsc --project src/electron/tsconfig.json",
+    "dist:mac": "npm run build:python && npm run transpile:electron && npm run build && electron-builder --mac --arm64",
+    "dist:win": "npm run build:python && npm run transpile:electron && npm run build && electron-builder --win --x64",
+    "dist:linux": "npm run build:python && npm run transpile:electron && npm run build && electron-builder --linux --x64",
+    "test:e2e": "playwright test",
+    "test:unit": "vitest src"
+  },
+  "dependencies": {
+    "electron-store": "^10.0.1",
+    "execa": "^9.5.2",
+    "python-shell": "^5.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-icons": "^5.5.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.22.0",
+    "@types/execa": "^0.9.0",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "cross-env": "^7.0.3",
+    "electron": "^35.2.1",
+    "electron-builder": "^26.0.12",
+    "eslint": "^9.22.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.19",
+    "globals": "^16.0.0",
+    "npm-run-all": "^4.1.5",
+    "save": "^2.9.0",
+    "typescript": "~5.7.2",
+    "typescript-eslint": "^8.26.1",
+    "vite": "^6.3.1"
+  }
+}

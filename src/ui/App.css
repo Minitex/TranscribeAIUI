@@ -1,0 +1,293 @@
+/* src/App.css */
+/* Box‐sizing so width:100% includes padding */
+*, *::before, *::after { box-sizing: border-box; }
+
+:root {
+  --bg-primary: #1e1e28;
+  --bg-secondary: #16161f;
+  --accent: #4e8cff;
+  --button-bg: #2a6fd1;
+  --button-hover: #3c7fee;
+  --text-light: #e0e0e0;
+}
+
+html, body, #root {
+  margin: 0; padding: 0; height: 100%; width: 100%;
+  background: var(--bg-primary);
+  color: var(--text-light);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+.app-shell { display: flex; height: 100%; }
+
+/* Sidebar */
+.sidebar {
+  position: relative;
+  width: 240px;
+  background: var(--bg-secondary);
+  padding: 1rem;
+  display: flex; flex-direction: column;
+  font-size: 0.85rem;
+  box-shadow: inset -1px 0 0 rgba(255,255,255,0.1);
+  overflow: visible;
+}
+.filter-input {
+  width: 100%; padding: 0.4rem 0.6rem; margin-bottom: 0.75rem;
+  background: #2a2a3d; border: 1px solid #333; border-radius: 4px;
+}
+.transcript-list { flex:1; margin:0; padding:0; list-style:none; overflow-y:auto; }
+.transcript-list li {
+  padding:0.5rem; border-bottom:1px solid #333;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer;
+}
+.transcript-list li:hover { background:rgba(255,255,255,0.05); }
+
+.sidebar-resizer {
+  position: absolute;
+  top: 0;
+  right: -10px;
+  width: 20px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 1000;
+  pointer-events: auto;
+}
+
+.app-shell.resizing,
+.app-shell.resizing * {
+  cursor: col-resize !important;
+}
+
+/* Main content */
+.content {
+  flex:1; display:flex; flex-direction:column;
+  justify-content:center; align-items:center;
+  padding:2rem; min-width:350px;
+}
+
+/* Logo */
+.logo {
+  font-size:3rem; color:var(--accent);
+  margin:0 auto 2rem; text-align:center;
+  user-select:none;
+}
+
+/* Controls */
+.controls { display:flex; flex-direction:column; width:100%; max-width:none; }
+.field-row {
+  display:grid; grid-template-columns:auto 1fr; gap:0.75rem;
+  align-items:center; width:100%; margin-bottom:1rem;
+}
+.field-row button {
+  background:var(--button-bg); border:none; border-radius:4px;
+  padding:0.6rem; color:#fff; font-size:1.4rem; cursor:pointer;
+  transition:background 0.2s;
+}
+.field-row button:hover { background:var(--button-hover); }
+.field-row input {
+  width:100%; padding:0.6rem; background:#2a2a3d; border:1px solid #333;
+  border-radius:4px; color:var(--text-light); font-size:0.95rem;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+
+/* Transcribe button */
+.transcribe-btn {
+  display:inline-flex; gap:0.5rem; align-items:center;
+  padding:0.6rem 1.2rem; background:var(--accent);
+  border:none; border-radius:4px; color:#fff; cursor:pointer;
+  margin: 0; transition:opacity 0.2s;
+}
+.transcribe-btn:disabled { opacity:0.5; cursor:not-allowed; }
+
+/* Status bar */
+.status-bar {
+  margin:0.5rem auto; font-size:0.9rem; color:var(--accent);
+}
+
+/* Logs controls */
+.logs-controls {
+  display:flex; gap:0.5rem; margin:0.5rem 0;
+}
+.logs-toggle, .logs-clear {
+  background:none; border:1px solid var(--accent);
+  color:var(--accent); padding:0.4rem 0.8rem; border-radius:4px;
+  cursor:pointer; display:inline-flex; align-items:center; gap:0.25rem;
+  transition:background 0.2s;
+}
+.logs-toggle:hover, .logs-clear:hover {
+  background:rgba(78,140,255,0.1);
+}
+
+/* Logs panel */
+.logs {
+  width:90%; max-width:800px; margin:0.5rem auto 2rem;
+  padding:1rem; background:#1a1a2e; color:#ccc; font-family:monospace;
+  font-size:0.85rem; border-radius:4px; overflow-y:auto; max-height:300px;
+  white-space:pre-wrap; word-break:break-all;
+}
+
+/* Toast */
+.toast {
+  position:fixed; top:1rem; right:1rem;
+  background:var(--accent); color:#fff; padding:0.75rem 1rem;
+  border-radius:4px; box-shadow:0 2px 6px rgba(0,0,0,0.3);
+  font-size:0.95rem; pointer-events:none; opacity:0.9;
+}
+
+/* Action buttons container */
+.action-buttons {
+  display: flex;
+  gap: 1rem;
+  margin: 1rem auto 0;
+}
+
+/* Cancel button (only visible during transcription) */
+.cancel-btn {
+  background: none;
+  border: 1px solid #e06c75;
+  color: #e06c75;
+  padding: 0.6rem 1.2rem;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.cancel-btn:hover {
+  background: rgba(224, 108, 117, 0.1);
+}
+
+/* Animated mode toggle */
+.mode-toggle {
+  position: relative;
+  width: 220px;
+  min-width: 220px;
+  max-width: 220px;
+  flex: 0 0 220px;
+  height: 2.5rem;
+  min-height: 2.5rem;
+  max-height: 2.5rem;
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent);
+  border-radius: 1.25rem;
+  display: flex;
+  cursor: pointer;
+  overflow: hidden;
+  margin: 1rem auto;
+}
+.mode-toggle .label {
+  flex: 1;
+  text-align: center;
+  line-height: 2.5rem;
+  z-index: 1;
+  color: var(--text-light);
+  font-weight: 400;
+  transition: color 0.3s ease;
+  user-select: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mode-toggle .label.active {
+  color: #fff;
+}
+.mode-toggle .toggle-thumb {
+  position: absolute;
+  top: 0;
+  width: 50%;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 1.25rem;
+  transition: transform 0.3s ease;
+}
+.mode-toggle.audio .toggle-thumb {
+  transform: translateX(0%);
+}
+.mode-toggle.image .toggle-thumb {
+  transform: translateX(100%);
+}
+
+
+
+/* Ensure the root is positioned for absolute children */
+.app-shell {
+  position: relative;
+  display: flex;
+  height: 100%;
+}
+
+/* Settings gear (cog) */
+.settings-gear {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  font-size: 1.6rem;
+  color: var(--accent);
+  cursor: pointer;
+  transition: color 0.2s;
+}
+.settings-gear:hover {
+  color: #fff;
+}
+
+/* Settings modal styling */
+.settings-container {
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  padding: 2rem;
+  margin: 0;
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent);
+  border-radius: 0.6rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+}
+
+.settings-container h2 {
+  margin: 0 0 0.5rem;
+  color: var(--accent);
+  text-align: center;
+}
+.settings-container label {
+  font-weight: 500;
+}
+.settings-container input {
+  width: 20rem;
+  padding: 0.5rem;
+  border: 1px solid #333;
+  border-radius: 4px;
+  background: #2a2a3d;
+  color: var(--text-light);
+  margin-top: 0.5rem;
+}
+.settings-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+.settings-buttons .btn {
+  padding: 0.4rem 0.8rem;
+  border-radius: 4px;
+  border: none;
+  cursor: pointer;
+  font-weight: 500;
+}
+.settings-buttons .cancel {
+  background: transparent;
+  color: var(--accent);
+}
+.settings-buttons .cancel:hover {
+  background: rgba(78, 140, 255, 0.1);
+}
+.settings-buttons .save {
+  background: var(--accent);
+  color: #fff;
+}
+.settings-buttons .save:hover {
+  opacity: 0.9;
+}

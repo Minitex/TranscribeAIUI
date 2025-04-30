@@ -1,0 +1,6 @@
+python-dotenv
+Pillow
+google-generativeai
+opencv-python
+jinja2
+pyinstaller

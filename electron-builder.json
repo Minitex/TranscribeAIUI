@@ -1,0 +1,16 @@
+{
+  "appId": "edu.umn.transcribeai",
+  "asar": true,
+  "files": [
+    "dist-electron/**/*",
+    "dist-react/**/*",
+    "python/dist/**/*"
+  ],
+  "asarUnpack": [
+    "python/dist/**/*"
+  ],
+  "icon": "./desktopIcon.png",
+  "mac": { "target": ["dmg","zip"] },
+  "linux": { "target": "AppImage" },
+  "win":   { "target": ["nsis","portable"] }
+}
