@@ -6,7 +6,6 @@
   </tr>
 </table>
 
-
 **TranscribeAI** is a cross-platform desktop app that uses Large Language Models to transcribe audio files and scanned images/pages. It features:
 
 - **LLM-powered transcription** (e.g. Google Gemini via `google-generativeai`)
@@ -15,6 +14,9 @@
 - **Persistent settings** (stores your API key with `electron-store`)
 - **Drag-resizable, searchable sidebar** for managing transcripts
 
+> **Note:** A “headless” version (no UI) is also available and can be integrated into your own system—see  
+> https://github.com/Minitex/TranscribeAI  
+
 ## Technologies
 
 - **Electron**: Main process for file I/O, spawning Python/CLI binaries, and IPC  
@@ -22,4 +24,4 @@
 - **Vite**: Modern build tool for instant feedback and optimized production builds  
 - **Python CLI**: Native binaries handle image prep & OCR  
 - **google-generativeai SDK**: Interfaces with LLMs for high-quality transcription  
-- **electron-store**: Simple JSON storage for your Gemini API key  
+- **electron-store**: Simple JSON storage for your Gemini API key
