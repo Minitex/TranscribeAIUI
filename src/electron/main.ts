@@ -57,9 +57,9 @@ if (isDev()) {
   scriptsDir = found;
 }
 
-const audioBin = path.join(scriptsDir, `audio_transcribe${ext}`);
+const audioBin     = path.join(scriptsDir, `audio_transcribe${ext}`);
 const preprocessFn = path.join(scriptsDir, `preprocess_to_jpeg${ext}`);
-const flashFn = path.join(scriptsDir, `flash_process_local_dir${ext}`);
+const flashFn      = path.join(scriptsDir, `flash_process_local_dir${ext}`);
 
 for (const p of [audioBin, preprocessFn, flashFn]) {
   if (!fs.existsSync(p)) {
@@ -69,6 +69,7 @@ for (const p of [audioBin, preprocessFn, flashFn]) {
   }
 }
 
+// run shell commands with logging
 function runCommand(cmd: string, mode: string): Promise<string> {
   return new Promise((resolve, reject) => {
     currentExec = exec(cmd, { env: process.env }, async (err, stdout, stderr) => {
@@ -82,11 +83,20 @@ function runCommand(cmd: string, mode: string): Promise<string> {
 }
 
 // ── IPC HANDLERS ──────────────────────────────────────────────────────────────
+ipcMain.handle('get-audio-model',   () => store.get('audioModel') || 'gemini-2.5-flash-preview-04-17');
+ipcMain.handle('set-audio-model',   (_e, m: string) => { store.set('audioModel', m); });
+
+ipcMain.handle('get-image-model',   () => store.get('imageModel') || 'gemini-2.0-flash');
+ipcMain.handle('set-image-model',   (_e, m: string) => { store.set('imageModel', m); });
 ipcMain.handle('list-transcripts', async (_e, folder: string) => {
   const files = await fs.promises.readdir(folder);
-  return files.filter(f => f.endsWith('.txt')).map(f => ({ name: f, path: path.join(folder, f) }));
+  return files
+    .filter(f => f.endsWith('.txt'))
+    .map(f => ({ name: f, path: path.join(folder, f) }));
 });
+
 ipcMain.handle('open-transcript', (_e, file: string) => shell.openPath(file));
+
 ipcMain.handle('read-logs', async (_e, mode: string) => {
   try {
     return await fs.promises.readFile(getLogPath(mode), 'utf-8');
@@ -94,15 +104,18 @@ ipcMain.handle('read-logs', async (_e, mode: string) => {
     return '';
   }
 });
+
 ipcMain.handle('clear-logs', (_e, mode: string) =>
   fs.promises.writeFile(getLogPath(mode), '', 'utf-8')
 );
+
 ipcMain.handle('cancel-transcription', () => {
   if (currentExec) {
     currentExec.kill();
     currentExec = null;
   }
 });
+
 ipcMain.handle('select-input-file', async (_e, mode: string = 'audio') => {
   const filters: Electron.FileFilter[] = mode === 'audio'
     ? [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'm4a'] }]
@@ -112,6 +125,7 @@ ipcMain.handle('select-input-file', async (_e, mode: string = 'audio') => {
   const { canceled, filePaths } = await dialog.showOpenDialog({ properties, filters });
   return canceled ? null : filePaths[0];
 });
+
 ipcMain.handle('select-output-dir', async () => {
   const res = await dialog.showOpenDialog({ properties: ['openDirectory'] });
   return res.canceled ? null : res.filePaths[0];
@@ -126,11 +140,14 @@ ipcMain.handle('run-transcription', async (_e, mode: string, inputPath: string, 
   process.env.GOOGLE_API_KEY = apiKey;
 
   const win = BrowserWindow.getAllWindows()[0];
+  const modelName = mode === 'audio'
+    ? (store.get('audioModel') as string)
+    : (store.get('imageModel') as string);
 
   if (mode === 'audio') {
     const filename = path.basename(inputPath);
     win.webContents.send('transcription-progress', filename, 1, 1, 'Transcribing…');
-    const cmd = `"${audioBin}" --input "${inputPath}" --output_dir "${outputDir}"`;
+    const cmd = `"${audioBin}" --input "${inputPath}" --model "${modelName}" --output_dir "${outputDir}"`;
     try {
       const out = await runCommand(cmd, 'audio');
       win.webContents.send('transcription-progress', filename, 1, 1, 'Done');
@@ -172,14 +189,16 @@ ipcMain.handle('run-transcription', async (_e, mode: string, inputPath: string, 
       await runCommand(`"${preprocessFn}" "${file}" "${outputDir}"`, 'image');
 
       win.webContents.send('transcription-progress', name, i + 1, files.length, 'Transcribing…');
-      const out = await runCommand(`"${flashFn}" "${pngOut}" "${outputDir}"`, 'image');
+      const out = await runCommand(
+        `"${flashFn}" --model "${modelName}" "${pngOut}" "${outputDir}"`,
+        'image'
+      );
       aggregate += out;
 
       win.webContents.send('transcription-progress', name, i + 1, files.length, 'Done');
     }
 
     return aggregate;
-
   } catch (err: any) {
     if (err.killed || err.signal === 'SIGTERM') {
       const lastIndex = Math.max(0, files.indexOf(err.file || '') + 1);
@@ -191,8 +210,7 @@ ipcMain.handle('run-transcription', async (_e, mode: string, inputPath: string, 
     win.webContents.send('transcription-progress', path.basename(last), 1, files.length, 'Error');
     throw err;
   }
-}
-);
+});
 
 function createMainWindow() {
   const { workAreaSize } = screen.getPrimaryDisplay();
@@ -204,19 +222,19 @@ function createMainWindow() {
     webPreferences: { nodeIntegration: true, contextIsolation: false }
   });
 
-  // In your createMainWindow(), replace the entire production branch with:
   if (isDev()) {
     win.loadURL('http://localhost:5123');
     win.webContents.openDevTools();
   } else {
-    // Production (Windows, macOS, Linux) — dist-react is packaged inside the ASAR
     const indexPath = path.join(app.getAppPath(), 'dist-react', 'index.html');
     win.loadFile(indexPath);
   }
 }
 
 app.whenReady().then(createMainWindow);
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('window-all-closed', () => {
+  app.quit();
+});
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createMainWindow(); });
 
 // settings handlers
@@ -224,11 +242,20 @@ ipcMain.handle('get-api-key', () => store.get('apiKey') || '');
 ipcMain.handle('set-api-key', (_e, key: string) => { store.set('apiKey', key); });
 ipcMain.handle('open-settings', () => {
   const parent = BrowserWindow.getAllWindows()[0];
-  const child = new BrowserWindow({ width: 500, height: 300, parent, modal: true, resizable: false, webPreferences: { nodeIntegration: true, contextIsolation: false } });
-  if (isDev()) child.loadURL('http://localhost:5123/#/settings');
-  else {
+  const child = new BrowserWindow({
+    width: 600,
+    height: 700,
+    parent,
+    modal: true,
+    resizable: false,
+    webPreferences: { nodeIntegration: true, contextIsolation: false }
+  });
+
+  if (isDev()) {
+    child.loadURL('http://localhost:5123/#/settings');
+  } else {
     const indexPath = path.join(app.getAppPath(), 'dist-react', 'index.html');
-    const indexURL = pathToFileURL(indexPath).toString() + '#/settings';
+    const indexURL  = pathToFileURL(indexPath).toString() + '#/settings';
     child.loadURL(indexURL);
   }
 });

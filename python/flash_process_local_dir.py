@@ -61,35 +61,38 @@ def print_instructions():
     print(
         "\nUsage for transcribe_single_image.py\n"
         "Process a single PNG (or supported) image and save transcription as .txt.\n\n"
-        "  python3 transcribe_single_image.py /path/to/image.png /path/to/output_folder\n"
+        "  python3 transcribe_single_image.py /path/to/image.png /path/to/output_folder --model <model_name>\n"
     )
 
 
 def main():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("input_file", nargs="?", help="Path to the image file.")
-    parser.add_argument("output_folder", nargs="?", help="Folder for the output .txt.")
-    parser.add_argument("-h", "--help", action="store_true", help="Show help")
+    parser.add_argument("input_file",     nargs="?", help="Path to the image file.")
+    parser.add_argument("output_folder",  nargs="?", help="Folder for the output .txt.")
+    parser.add_argument("--model",        help="Gemini model to use", required=True)
+    parser.add_argument("-h", "--help",   action="store_true", help="Show help")
     args = parser.parse_args()
 
-    if args.help or not args.input_file or not args.output_folder:
+    if args.help or not args.input_file or not args.output_folder or not args.model:
         print_instructions()
         return
 
     input_path = args.input_file
     output_dir = args.output_folder
+    model_name = args.model
 
+    # Validate file
     if not os.path.isfile(input_path) or os.path.splitext(input_path)[1].lower() not in VALID_EXTS:
-        print(f"ERROR: Unsupported or missing input file: {input_path}")
+        print(f"[ERR] Unsupported or missing input file: {input_path}")
         return
 
-    # Read API key from environment (injected by Electron)
+    # Read API key
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         print("[ERR] API key not set. Please open Settings and enter your Gemini API key.")
         sys.exit(1)
 
-    # Configure Gemini SDK
+    # Configure SDK
     logging.getLogger("google").setLevel(logging.CRITICAL)
     logging.getLogger("absl").setLevel(logging.CRITICAL)
     genai.configure(api_key=api_key)
@@ -98,9 +101,12 @@ def main():
     base = os.path.splitext(os.path.basename(input_path))[0]
     output_path = os.path.join(output_dir, f"{base}.txt")
 
+    # Load context + build prompt
     global_ctx, ctx_map = load_contexts()
     prompt = compose_prompt(base, global_ctx, ctx_map)
-    model = genai.GenerativeModel('gemini-2.0-flash')
+
+    # Use the requested model
+    model = genai.GenerativeModel(model_name)
 
     success = False
     for attempt in range(MAX_RETRIES):

@@ -95,9 +95,10 @@ def process_transcript(input_text, max_segment_duration=30):
 
 def main():
     parser = argparse.ArgumentParser(description='Transcribe audio using Google Gemini API.')
-    parser.add_argument('--input', '-i', required=True, help='Path to the audio file')
-    parser.add_argument('--output_dir', '-o', required=True, help='Directory to save transcript')
-    parser.add_argument('--speakers', '-s', nargs='+', default=['Speaker1'], help='List of speaker names')
+    parser.add_argument('--input',     '-i', required=True, help='Path to the audio file')
+    parser.add_argument('--output_dir','-o', required=True, help='Directory to save transcript')
+    parser.add_argument('--speakers',  '-s', nargs='+', default=['Speaker1'], help='List of speaker names')
+    parser.add_argument('--model',     '-m', required=True, help='Gemini model to use for transcription')
     args = parser.parse_args()
 
     # Read API key from environment (injected by Electron)
@@ -106,10 +107,10 @@ def main():
         logging.error('[ERR] API key not set. Please open Settings and enter your Gemini API key.')
         return
 
-    # Configure the new SDK
+    # Configure Gemini SDK
     genai.configure(api_key=api_key)
 
-    # Prepare prompt
+    # Prepare prompt template
     prompt_tmpl = Template("""Generate a transcript of the episode. Include timestamps and identify speakers.
 
 Speakers are:
@@ -130,12 +131,12 @@ Ensure correct spelling.
     # Upload audio file
     uploaded = genai.upload_file(args.input)
 
-    # Generate transcription
-    model = genai.GenerativeModel('gemini-2.5-pro-exp-03-25')
-    resp = model.generate_content(contents=[prompt, uploaded])
-    raw_text = resp.text
+    # Generate transcription using the chosen model
+    model = genai.GenerativeModel(args.model)
+    response = model.generate_content(contents=[prompt, uploaded])
+    raw_text = response.text
 
-    # Process and save
+    # Post-process and save
     processed = process_transcript(raw_text)
     os.makedirs(args.output_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(args.input))[0]
@@ -143,7 +144,7 @@ Ensure correct spelling.
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(processed)
 
-    print(f"Transcript saved to {out_path}")
+    print(f"[OK] Transcript saved to {out_path}")
 
 if __name__ == '__main__':
     main()

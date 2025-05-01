@@ -1,7 +1,7 @@
 {
   "name": "TranscribeAI",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "author": "Ninh Tran <ninhtran@umn.edu>",
   "main": "dist-electron/main.js",
