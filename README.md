@@ -62,12 +62,12 @@
 <table align="center">
   <tr>
     <td>
-      <img src="transcribeAIScreenshotMain.jpeg" alt="TranscribeAI Main Interface" width="600">
+      <img src="transcribeAIMainView.jpeg" alt="TranscribeAI Main Interface" width="600">
     </td>
   </tr>
   <tr>
     <td>
-      <img src="transcribeAIScreenshotSettings.jpeg" alt="TranscribeAI Settings" width="600">
+      <img src="transcribeAISettingsView.jpeg" alt="TranscribeAI Settings" width="600">
     </td>
   </tr>
 </table>
