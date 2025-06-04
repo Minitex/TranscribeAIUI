@@ -36,13 +36,13 @@
    - Copy the generated key to your clipboard.
 
 2. **Download TranscribeAI**
-   - Go to the [TranscribeAI Releases page](https://github.com/Minitex/TranscribeAI/releases).  
+   - Go to the [TranscribeAI Releases page](https://github.com/Minitex/TranscribeAIUI/releases).  
    - Choose the installer for your OS:  
      - **macOS:** `.dmg`  
      - **Windows:** `.exe`  
      - **Linux:** `.AppImage` or `.tar.gz`  
    - Download and run the installer. Because TranscribeAI is an open-source project and we don’t bundle a paid code-signing certificate, you may see a security warning the first time you run it:  
-     - **macOS Gatekeeper** (“Unidentified Developer”): open **System Preferences → Security & Privacy**, then click **Open Anyway** next to the TranscribeAI entry.  
+     - **macOS Gatekeeper** (“Unidentified Developer” or "damaged and can't be opened"): open **System Preferences → Security & Privacy**, then click **Open Anyway** next to the TranscribeAI entry.  
      - **Windows SmartScreen** (“Windows protected your PC”): click **More info**, then **Run anyway**.  
    - Follow the installer prompts to complete installation.
 

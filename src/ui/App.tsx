@@ -1,5 +1,6 @@
 // src/ui/App.tsx
 import React, { useState, useRef, useEffect } from 'react';
+import path from 'path';
 import AudioTranscriber, { Transcript } from './components/AudioTranscriber';
 import ImageTranscriber from './components/ImageTranscriber';
 import { FaCog, FaChevronDown, FaChevronUp } from 'react-icons/fa';
@@ -9,9 +10,9 @@ const { ipcRenderer } = (window as any).require('electron');
 
 // ─── Model options ─────────────────────────────────────────────────────────────
 const MODEL_OPTIONS = [
-  'gemini-2.5-flash-preview-04-17',
+  'gemini-2.5-flash-preview-05-20',
   'gemini-2.0-flash',
-  'gemini-2.5-pro-preview-03-25',
+  'gemini-2.0-flash-lite',
 ];
 
 // ─── Settings View ──────────────────────────────────────────────────────────────
@@ -80,6 +81,13 @@ function SettingsView() {
   );
 }
 
+// ─── UTILITY: SORT transcripts alphanumerically ────────────────────────────────
+function sortTranscripts(list: Transcript[]): Transcript[] {
+  return [...list].sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+  );
+}
+
 // ─── Main App ───────────────────────────────────────────────────────────────────
 export default function App() {
   // If in settings route, show only SettingsView
@@ -89,28 +97,28 @@ export default function App() {
 
   // ─ Sidebar resizing ─────────────────────────────────
   const [sidebarWidth, setSidebarWidth] = useState(240);
-  const [isResizing, setIsResizing]     = useState(false);
+  const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
 
   // ─ Mode toggle ──────────────────────────────────────
   const [mode, setMode] = useState<'audio' | 'image'>('audio');
 
   // ─ Audio state ──────────────────────────────────────
-  const [audioInputPath, setAudioInputPath]   = useState('');
-  const [audioOutputDir, setAudioOutputDir]   = useState('');
+  const [audioInputPath, setAudioInputPath] = useState('');
+  const [audioOutputDir, setAudioOutputDir] = useState('');
   const [audioTranscripts, setAudioTranscripts] = useState<Transcript[]>([]);
 
   // ─ Image state ──────────────────────────────────────
-  const [imageInputPath, setImageInputPath]     = useState('');
-  const [imageOutputDir, setImageOutputDir]     = useState('');
+  const [imageInputPath, setImageInputPath] = useState('');
+  const [imageOutputDir, setImageOutputDir] = useState('');
   const [imageTranscripts, setImageTranscripts] = useState<Transcript[]>([]);
 
   // ─ Shared UI ────────────────────────────────────────
-  const [filter, setFilter]       = useState('');
-  const [logs, setLogs]           = useState('');
-  const [status, setStatus]       = useState('');
-  const [toast, setToast]         = useState<string | null>(null);
-  const [showLogs, setShowLogs]   = useState(false);
+  const [filter, setFilter] = useState('');
+  const [logs, setLogs] = useState('');
+  const [status, setStatus] = useState('');
+  const [toast, setToast] = useState<string | null>(null);
+  const [showLogs, setShowLogs] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
 
   // Load logs whenever mode changes
@@ -128,9 +136,12 @@ export default function App() {
       const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
       if (dir) {
         ipcRenderer.invoke('list-transcripts', dir).then((list: Transcript[]) => {
-          mode === 'audio'
-            ? setAudioTranscripts(list)
-            : setImageTranscripts(list);
+          const sorted = sortTranscripts(list);
+          if (mode === 'audio') {
+            setAudioTranscripts(sorted);
+          } else {
+            setImageTranscripts(sorted);
+          }
         });
       }
     };
@@ -161,33 +172,66 @@ export default function App() {
     setIsResizing(true);
   };
 
-  // File pickers
-  const selectInput = async () => {
-    const file = await ipcRenderer.invoke('select-input-file', mode);
-    if (!file) return;
-    mode === 'audio'
-      ? setAudioInputPath(file)
-      : setImageInputPath(file);
+  // ─ Delete a single transcript (file) and refresh the list ─────────────────────
+  const removeTranscript = async (filePath: string) => {
+    await ipcRenderer.invoke('delete-transcript', filePath);
+    const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
+    if (!dir) return;
+    const rawList: Transcript[] = await ipcRenderer.invoke('list-transcripts', dir);
+    const sorted = sortTranscripts(rawList);
+    if (mode === 'audio') {
+      setAudioTranscripts(sorted);
+    } else {
+      setImageTranscripts(sorted);
+    }
   };
+
+  const selectInput = async () => {
+    if (mode === 'audio') {
+      const file = await ipcRenderer.invoke('select-input-file', mode);
+      if (!file) return;
+      setAudioInputPath(file);
+    } else {
+      const folder = await ipcRenderer.invoke('select-input-folder');
+      if (!folder) return;
+      setImageInputPath(folder);
+    }
+  };
+
   const selectOutput = async () => {
     const dir = await ipcRenderer.invoke('select-output-dir');
     if (!dir) return;
     if (mode === 'audio') {
       setAudioOutputDir(dir);
-      setAudioTranscripts(await ipcRenderer.invoke('list-transcripts', dir));
+      const rawList = await ipcRenderer.invoke('list-transcripts', dir);
+      setAudioTranscripts(sortTranscripts(rawList));
     } else {
       setImageOutputDir(dir);
-      setImageTranscripts(await ipcRenderer.invoke('list-transcripts', dir));
+      const rawList = await ipcRenderer.invoke('list-transcripts', dir);
+      setImageTranscripts(sortTranscripts(rawList));
     }
   };
 
-  // Transcribe / Cancel
   const transcribe = async () => {
-    const input  = mode === 'audio' ? audioInputPath : imageInputPath;
-    const output = mode === 'audio' ? audioOutputDir   : imageOutputDir;
+    const input = mode === 'audio' ? audioInputPath : imageInputPath;
+    const output = mode === 'audio' ? audioOutputDir : imageOutputDir;
     if (!input || !output) return;
 
-    // do *not* clear logs here—preserve existing!
+    if (mode === 'image' && input === output) {
+      setToast('❌ Input and output folder cannot be the same');
+      setTimeout(() => setToast(null), 4000);
+      return;
+    }
+    if (mode === 'audio') {
+      // If input file resides in the same folder as output
+      const inputDir = path.dirname(input);
+      if (inputDir === output) {
+        setToast('❌ Input file and output folder cannot be the same');
+        setTimeout(() => setToast(null), 4000);
+        return;
+      }
+    }
+
     setStatus('');
     setIsTranscribing(true);
 
@@ -210,20 +254,19 @@ export default function App() {
       setIsTranscribing(false);
     }
   };
+
   const cancel = async () => {
     await ipcRenderer.invoke('cancel-transcription');
     setStatus('❌ Cancelled by user');
     setIsTranscribing(false);
   };
 
-  // Open / clear logs
   const openTranscript = (p: string) => ipcRenderer.invoke('open-transcript', p);
-  const clearLogs     = async () => {
+  const clearLogs = async () => {
     await ipcRenderer.invoke('clear-logs', mode);
     setLogs('');
   };
 
-  // Filter sidebar
   const currentList = mode === 'audio' ? audioTranscripts : imageTranscripts;
   const filtered = currentList.filter(t =>
     t.name.toLowerCase().includes(filter.toLowerCase())
@@ -242,8 +285,21 @@ export default function App() {
         />
         <ul className="transcript-list">
           {filtered.map(t => (
-            <li key={t.path} title={t.name} onDoubleClick={() => openTranscript(t.path)}>
-              {t.name}
+            <li key={t.path} className="transcript-item">
+              <span
+                className="transcript-name"
+                title={t.name}
+                onDoubleClick={() => openTranscript(t.path)}
+              >
+                {t.name}
+              </span>
+              <button
+                className="transcript-delete"
+                onClick={() => removeTranscript(t.path)}
+                title="Remove"
+              >
+                ×
+              </button>
             </li>
           ))}
         </ul>

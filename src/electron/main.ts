@@ -57,9 +57,9 @@ if (isDev()) {
   scriptsDir = found;
 }
 
-const audioBin     = path.join(scriptsDir, `audio_transcribe${ext}`);
+const audioBin = path.join(scriptsDir, `audio_transcribe${ext}`);
 const preprocessFn = path.join(scriptsDir, `preprocess_to_jpeg${ext}`);
-const flashFn      = path.join(scriptsDir, `flash_process_local_dir${ext}`);
+const flashFn = path.join(scriptsDir, `flash_process_local_dir${ext}`);
 
 for (const p of [audioBin, preprocessFn, flashFn]) {
   if (!fs.existsSync(p)) {
@@ -83,11 +83,12 @@ function runCommand(cmd: string, mode: string): Promise<string> {
 }
 
 // ── IPC HANDLERS ──────────────────────────────────────────────────────────────
-ipcMain.handle('get-audio-model',   () => store.get('audioModel') || 'gemini-2.5-flash-preview-04-17');
-ipcMain.handle('set-audio-model',   (_e, m: string) => { store.set('audioModel', m); });
+ipcMain.handle('get-audio-model', () => store.get('audioModel') || 'gemini-2.0-flash');
+ipcMain.handle('set-audio-model', (_e, m: string) => { store.set('audioModel', m); });
 
-ipcMain.handle('get-image-model',   () => store.get('imageModel') || 'gemini-2.0-flash');
-ipcMain.handle('set-image-model',   (_e, m: string) => { store.set('imageModel', m); });
+ipcMain.handle('get-image-model', () => store.get('imageModel') || 'gemini-2.0-flash');
+ipcMain.handle('set-image-model', (_e, m: string) => { store.set('imageModel', m); });
+
 ipcMain.handle('list-transcripts', async (_e, folder: string) => {
   const files = await fs.promises.readdir(folder);
   return files
@@ -126,9 +127,25 @@ ipcMain.handle('select-input-file', async (_e, mode: string = 'audio') => {
   return canceled ? null : filePaths[0];
 });
 
+ipcMain.handle('select-input-folder', async () => {
+  const res = await dialog.showOpenDialog({
+    properties: ['openDirectory']
+  });
+  return res.canceled ? null : res.filePaths[0];
+});
+
 ipcMain.handle('select-output-dir', async () => {
   const res = await dialog.showOpenDialog({ properties: ['openDirectory'] });
   return res.canceled ? null : res.filePaths[0];
+});
+
+ipcMain.handle('delete-transcript', async (_e, filePath: string) => {
+  try {
+    await fs.promises.unlink(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 });
 
 ipcMain.handle('run-transcription', async (_e, mode: string, inputPath: string, outputDir: string) => {
@@ -162,11 +179,20 @@ ipcMain.handle('run-transcription', async (_e, mode: string, inputPath: string, 
 
   // IMAGE MODE WITH RESUME SUPPORT
   const stat = await fs.promises.stat(inputPath);
-  const files = stat.isDirectory()
-    ? (await fs.promises.readdir(inputPath))
-      .filter(f => /\.(png|jpe?g|tif{1,2})$/i.test(f))
-      .map(f => path.join(inputPath, f))
-    : [inputPath];
+
+  let files: string[];
+  if (stat.isDirectory()) {
+    const names = (await fs.promises.readdir(inputPath))
+      .filter(f => /\.(png|jpe?g|tif{1,2})$/i.test(f));
+
+    names.sort((a, b) =>
+      a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+    );
+
+    files = names.map(f => path.join(inputPath, f));
+  } else {
+    files = [inputPath];
+  }
 
   let aggregate = '';
   try {
@@ -255,7 +281,7 @@ ipcMain.handle('open-settings', () => {
     child.loadURL('http://localhost:5123/#/settings');
   } else {
     const indexPath = path.join(app.getAppPath(), 'dist-react', 'index.html');
-    const indexURL  = pathToFileURL(indexPath).toString() + '#/settings';
+    const indexURL = pathToFileURL(indexPath).toString() + '#/settings';
     child.loadURL(indexURL);
   }
 });
