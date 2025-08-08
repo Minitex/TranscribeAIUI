@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Transcribe a single image using Gemini API, with document context.
+Requires IMAGE_PROMPT environment variable; will abort if missing.
 """
 
 import os
@@ -22,20 +23,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONTEXT_FOLDER = os.path.join(SCRIPT_DIR, "OcrDocumentContext")
 
 
-def compose_prompt(image_basename, global_context, context_mapping):
-    context_text = global_context or ""
-    if image_basename in context_mapping:
-        extra = context_mapping[image_basename]
-        context_text = f"{context_text}\n{extra}" if context_text else extra
-
-    base = (
-        "Please transcribe the text from the uploaded image. "
-        "Ensure correct English spelling, grammar, and sentence structure. "
-        "Mark completely missing words as [blank] and unclear words as [unsure]."
-    )
-    return f"Given the context: {context_text}\n{base}" if context_text else base
-
-
 def load_contexts():
     global_ctx = ""
     ctx_map = {}
@@ -55,6 +42,24 @@ def load_contexts():
     else:
         print("Context folder not found; proceeding without context.")
     return global_ctx, ctx_map
+
+
+def build_final_prompt(image_basename, env_prompt, global_context, context_mapping):
+    if not env_prompt:
+        print("[ERR] IMAGE_PROMPT environment variable not set or empty. Aborting.")
+        return None
+
+    context_parts = []
+    if global_context:
+        context_parts.append(global_context)
+    if image_basename in context_mapping:
+        context_parts.append(context_mapping[image_basename])
+
+    if context_parts:
+        context_text = "\n".join(context_parts)
+        return f"Given the context: {context_text}\n{env_prompt}"
+    else:
+        return env_prompt
 
 
 def print_instructions():
@@ -81,18 +86,22 @@ def main():
     output_dir = args.output_folder
     model_name = args.model
 
-    # Validate file
     if not os.path.isfile(input_path) or os.path.splitext(input_path)[1].lower() not in VALID_EXTS:
         print(f"[ERR] Unsupported or missing input file: {input_path}")
         return
 
-    # Read API key
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         print("[ERR] API key not set. Please open Settings and enter your Gemini API key.")
         sys.exit(1)
 
-    # Configure SDK
+    image_prompt_env = os.getenv("IMAGE_PROMPT", "").strip()
+
+    global_ctx, ctx_map = load_contexts()
+    prompt = build_final_prompt(os.path.splitext(os.path.basename(input_path))[0], image_prompt_env, global_ctx, ctx_map)
+    if not prompt:
+        sys.exit(1)
+
     logging.getLogger("google").setLevel(logging.CRITICAL)
     logging.getLogger("absl").setLevel(logging.CRITICAL)
     genai.configure(api_key=api_key)
@@ -101,28 +110,20 @@ def main():
     base = os.path.splitext(os.path.basename(input_path))[0]
     output_path = os.path.join(output_dir, f"{base}.txt")
 
-    # Load context + build prompt
-    global_ctx, ctx_map = load_contexts()
-    prompt = compose_prompt(base, global_ctx, ctx_map)
-
-    # Use the requested model
     model = genai.GenerativeModel(model_name)
 
     success = False
     for attempt in range(MAX_RETRIES):
         try:
-            # Open the image in a context manager so it auto-closes on exit
             with PIL.Image.open(input_path) as img:
                 response = model.generate_content([prompt, img], stream=True)
                 if not response:
                     raise ValueError("No response from API")
 
-                # Write out the streamed transcription
                 with open(output_path, "w", encoding="utf-8") as out_f:
                     for chunk in response:
                         out_f.write(chunk.text)
 
-            # Verify non-empty output and remove temp image
             if os.path.getsize(output_path) > 0:
                 print(f"[OK] Transcription saved: {output_path}")
                 try:
@@ -134,7 +135,6 @@ def main():
                 break
             else:
                 raise ValueError("Empty transcription file")
-
         except Exception as e:
             print(f"[ERR] ERROR (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES - 1:

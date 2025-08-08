@@ -35,7 +35,8 @@ body,
 /* Sidebar */
 .sidebar {
   position: relative;
-  width: 240px;
+  width: 275px;
+  min-width: 275px;
   background: var(--bg-secondary);
   padding: 1rem;
   display: flex;
@@ -374,7 +375,7 @@ body,
   flex-direction: column;
   align-items: center;
   gap: 1.5rem;
-  text-align: center;
+  text-align: left;
 }
 
 .settings-container h2 {
@@ -389,10 +390,9 @@ body,
   width: 100%;
 }
 
-.settings-container input,
-.settings-container select {
-  width: 24rem;
-  max-width: 90%;
+.settings-container input {
+  width: 100%;
+  max-width: 800px;
   padding: 0.75rem 1rem;
   font-size: 1rem;
   text-align: center;
@@ -400,12 +400,20 @@ body,
   border: 1px solid #333;
   border-radius: 4px;
   color: var(--text-light);
+  box-sizing: border-box;
 }
 
 .settings-container select {
   font-size: 1.1rem;
+  padding: 0.75rem 1rem;
+  background: #2a2a3d;
+  border: 1px solid #333;
+  border-radius: 4px;
+  color: var(--text-light);
+  box-sizing: border-box;
 }
 
+/* Settings buttons */
 .settings-buttons {
   display: flex;
   justify-content: center;
@@ -439,4 +447,195 @@ body,
 
 .settings-buttons .save:hover {
   opacity: 0.9;
+}
+
+.model-prompt-row {
+  display: flex !important;
+  gap: 2rem;
+  width: 100%;
+  flex-wrap: nowrap; /* stay side-by-side */
+  margin-top: 1rem;
+  align-items: flex-start;
+}
+
+.model-with-prompt {
+  flex: 0 0 50%;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  box-sizing: border-box;
+}
+
+/* ensure model dropdown is above prompt and spans full width */
+.model-with-prompt .model-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.model-with-prompt .model-group select,
+.model-with-prompt .model-group input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 0.75rem 1rem;
+  font-size: 1.1rem;
+  background: #2a2a3d;
+  border: 1px solid #333;
+  border-radius: 4px;
+  color: var(--text-light);
+  appearance: none;
+}
+
+/* prompt area */
+.prompt-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.prompt-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+/* Revert button – force icon color across platforms */
+.revert-btn {
+  color: var(--text-light);
+}
+.revert-btn:hover {
+  color: #fff;
+}
+
+.prompt-group textarea {
+  width: 100%;
+  min-height: 160px;
+  resize: none;
+  padding: 0.75rem;
+  background: #2a2a3d;
+  border: 1px solid #333;
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 0.85rem;
+  color: var(--text-light);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  box-sizing: border-box;
+}
+
+/* fallback to single column on narrow viewports */
+@media (max-width: 800px) {
+  .model-prompt-row {
+    flex-wrap: wrap;
+  }
+  .model-with-prompt {
+    flex: 1 1 100%;
+  }
+}
+
+/* Layout the two options side-by-side with plenty of gap */
+.options-row {
+  display: flex;
+  gap: 4rem;
+  margin: 1.5rem 0;
+}
+
+/* Each label + checkbox + tooltip */
+.option-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+}
+
+/* Tooltip wrapper to position the question mark */
+.tooltip-wrapper {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  cursor: default;
+}
+
+/* The floating tooltip box */
+.tooltip-box {
+  position: absolute;
+  top: 110%;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1f2330;
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: normal;
+  width: 200px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  z-index: 100;
+}
+
+.scan-input {
+  -moz-appearance: textfield;
+  appearance: none;
+  flex: none;
+  width: 3rem !important;
+  height: 2rem;
+  padding: 0 0.5rem;
+  font-size: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--sidebar-bg);
+  color: var(--text);
+  text-align: center;
+}
+.scan-input::-webkit-outer-spin-button,
+.scan-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.quality-scan-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  width: 100%;
+}
+
+
+.scan-btn.btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  height: 2rem;
+  padding: 0 1.2rem;
+  background: var(--accent);
+  border: none;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 0.95rem;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+.scan-btn.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.quality-scan-row .tooltip-wrapper {
+  margin-left: 0.25rem;
+  display: inline-flex;
+  vertical-align: middle;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
 }

@@ -16,10 +16,8 @@ const scriptsDir    = isDev()
   ? path.join(process.cwd(), 'python')
   : path.join(process.resourcesPath, 'python');
 const preprocessPy  = path.join(scriptsDir, 'preprocess_to_jpeg.py');
-const flashScript   = path.join(scriptsDir, 'flash_process_local_dir.py');
-const cleanupScript = path.join(scriptsDir, 'cleanup_temp.py');
+const flashScript   = path.join(scriptsDir, 'image_transcribe.py');
 
-// Sanity‐check presence
 [preprocessPy, flashScript].forEach(p => {
   if (!fs.existsSync(p)) {
     dialog.showErrorBox(
@@ -47,20 +45,15 @@ async function runSingleImage(mode: string, inputPath: string, outputDir: string
   const pngOut = path.join(outputDir, `${base}.png`);
   let result = '';
 
-  // 1) Preprocess → JPEG
   await runCommand(
     `"${pythonCmd}" "${preprocessPy}" --simple "${inputPath}" "${outputDir}"`,
     mode
   );
 
-  // 2) Flash → text
   result = await runCommand(
     `"${pythonCmd}" "${flashScript}" "${pngOut}" "${outputDir}"`,
     mode
   );
-
-  // 3) Cleanup (fire-and-forget)
-  exec(`"${pythonCmd}" "${cleanupScript}" "${pngOut}"`, { env: process.env });
 
   return result;
 }

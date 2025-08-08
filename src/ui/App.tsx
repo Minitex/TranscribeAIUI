@@ -1,41 +1,207 @@
-// src/ui/App.tsx
-import React, { useState, useRef, useEffect } from 'react';
-import path from 'path';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import AudioTranscriber, { Transcript } from './components/AudioTranscriber';
 import ImageTranscriber from './components/ImageTranscriber';
-import { FaCog, FaChevronDown, FaChevronUp } from 'react-icons/fa';
+import {
+  DEFAULT_AUDIO_PROMPT,
+  INTERVIEW_AUDIO_PROMPT,
+  SUBTITLE_AUDIO_PROMPT,
+  DEFAULT_IMAGE_PROMPT
+} from '../../defaultPrompts';
+import {
+  FaCog,
+  FaChevronDown,
+  FaChevronUp,
+  FaUndo,
+  FaQuestionCircle,
+  FaTimes,
+  FaSpinner,
+} from 'react-icons/fa';
 import './App.css';
 
 const { ipcRenderer } = (window as any).require('electron');
 
 // ─── Model options ─────────────────────────────────────────────────────────────
 const MODEL_OPTIONS = [
-  'gemini-2.5-flash-preview-05-20',
+  'gemini-2.5-pro',
+  'gemini-2.5-flash',
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite',
 ];
+
+// Simple tooltip component
+const InfoTooltip: React.FC<{ text: string }> = ({ text }) => {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div
+      style={{
+        position: 'relative',
+        display: 'inline-flex',
+        alignItems: 'center',
+        marginLeft: 6,
+      }}
+    >
+      <div
+        onMouseEnter={() => setVisible(true)}
+        onMouseLeave={() => setVisible(false)}
+        aria-label="More info"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          cursor: 'default',
+          padding: 4,
+          borderRadius: '50%',
+          background: 'rgba(255,255,255,0.08)',
+        }}
+      >
+        <FaQuestionCircle size={14} />
+      </div>
+      {visible && (
+        <div
+          role="tooltip"
+          style={{
+            position: 'absolute',
+            top: '110%',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: '#1f2330',
+            color: '#fff',
+            padding: '8px 12px',
+            borderRadius: 6,
+            fontSize: 12,
+            lineHeight: 1.3,
+            width: 240,
+            boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+            zIndex: 100,
+            whiteSpace: 'normal',
+          }}
+        >
+          {text}
+        </div>
+      )}
+    </div>
+  );
+};
 
 // ─── Settings View ──────────────────────────────────────────────────────────────
 function SettingsView() {
   const [key, setKey] = useState('');
   const [audioModel, setAudioModel] = useState(MODEL_OPTIONS[0]);
   const [imageModel, setImageModel] = useState(MODEL_OPTIONS[1]);
+  const [audioPrompt, setAudioPrompt] = useState<string>(DEFAULT_AUDIO_PROMPT);
+  const [imagePrompt, setImagePrompt] = useState<string>(DEFAULT_IMAGE_PROMPT);
+  const [saved, setSaved] = useState(false);
 
   useEffect(() => {
-    ipcRenderer.invoke('get-api-key').then((k: string) => setKey(k || ''));
-    ipcRenderer.invoke('get-audio-model').then((m: string) => setAudioModel(m));
-    ipcRenderer.invoke('get-image-model').then((m: string) => setImageModel(m));
+    ipcRenderer
+      .invoke('get-api-key')
+      .then((k: string) => setKey(k || localStorage.getItem('apiKey') || ''))
+      .catch(() => setKey(localStorage.getItem('apiKey') || ''));
+
+    ipcRenderer
+      .invoke('get-audio-model')
+      .then((m: string) =>
+        setAudioModel(m || (localStorage.getItem('audioModel') || MODEL_OPTIONS[0]))
+      )
+      .catch(() =>
+        setAudioModel((localStorage.getItem('audioModel') as string) || MODEL_OPTIONS[0])
+      );
+
+    ipcRenderer
+      .invoke('get-image-model')
+      .then((m: string) =>
+        setImageModel(m || (localStorage.getItem('imageModel') || MODEL_OPTIONS[1]))
+      )
+      .catch(() =>
+        setImageModel((localStorage.getItem('imageModel') as string) || MODEL_OPTIONS[1])
+      );
+
+    ipcRenderer
+      .invoke('get-audio-prompt')
+      .then((p: string) =>
+        setAudioPrompt(
+          p || (localStorage.getItem('audioPrompt') as string) || DEFAULT_AUDIO_PROMPT
+        )
+      )
+      .catch(() =>
+        setAudioPrompt((localStorage.getItem('audioPrompt') as string) || DEFAULT_AUDIO_PROMPT)
+      );
+
+    ipcRenderer
+      .invoke('get-image-prompt')
+      .then((p: string) =>
+        setImagePrompt(
+          p || (localStorage.getItem('imagePrompt') as string) || DEFAULT_IMAGE_PROMPT
+        )
+      )
+      .catch(() =>
+        setImagePrompt((localStorage.getItem('imagePrompt') as string) || DEFAULT_IMAGE_PROMPT)
+      );
   }, []);
 
   const save = async () => {
-    await ipcRenderer.invoke('set-api-key', key);
-    await ipcRenderer.invoke('set-audio-model', audioModel);
-    await ipcRenderer.invoke('set-image-model', imageModel);
-    window.close();
+    try {
+      await ipcRenderer.invoke('set-api-key', key);
+    } catch {
+      localStorage.setItem('apiKey', key);
+    }
+
+    try {
+      await ipcRenderer.invoke('set-audio-model', audioModel);
+    } catch {
+      localStorage.setItem('audioModel', audioModel);
+    }
+    try {
+      await ipcRenderer.invoke('set-image-model', imageModel);
+    } catch {
+      localStorage.setItem('imageModel', imageModel);
+    }
+
+    try {
+      await ipcRenderer.invoke('set-audio-prompt', audioPrompt);
+    } catch {
+      localStorage.setItem('audioPrompt', audioPrompt);
+    }
+    try {
+      await ipcRenderer.invoke('set-image-prompt', imagePrompt);
+    } catch {
+      localStorage.setItem('imagePrompt', imagePrompt);
+    }
+
+    // show saved feedback instead of closing
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2500);
   };
 
+  const revertAudioPrompt = () => setAudioPrompt(DEFAULT_AUDIO_PROMPT);
+  const revertImagePrompt = () => setImagePrompt(DEFAULT_IMAGE_PROMPT);
+
   return (
-    <div className="settings-container">
+    <div className="settings-container" style={{ position: 'relative' }}>
+      {/* X close button top-right */}
+      <button
+        aria-label="Close settings"
+        onClick={() => window.close()}
+        style={{
+          position: 'absolute',
+          top: '1rem',
+          right: '1rem',
+          background: 'transparent',
+          border: 'none',
+          cursor: 'pointer',
+          padding: 6,
+          borderRadius: 6,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: 'var(--text-light)',
+          fontSize: '1.2rem',
+        }}
+        title="Close"
+      >
+        <FaTimes />
+      </button>
+
       <h2>Settings</h2>
 
       <label htmlFor="api-key">Gemini API Key</label>
@@ -47,29 +213,155 @@ function SettingsView() {
         onChange={e => setKey(e.target.value)}
       />
 
-      <label htmlFor="audio-model">Audio Model</label>
-      <select
-        id="audio-model"
-        value={audioModel}
-        onChange={e => setAudioModel(e.target.value)}
+      <div
+        className="model-prompt-row"
+        style={{
+          display: 'flex',
+          gap: '2rem',
+          flexWrap: 'nowrap',
+          alignItems: 'flex-start',
+          width: '100%',
+          marginTop: '1rem',
+        }}
       >
-        {MODEL_OPTIONS.map(m => (
-          <option key={m} value={m}>{m}</option>
-        ))}
-      </select>
+        {/* Audio */}
+        <div
+          className="model-with-prompt"
+          style={{ flex: '1 1 0', minWidth: 320, display: 'flex', flexDirection: 'column', gap: 12 }}
+        >
+          <div className="model-group">
+            <label htmlFor="audio-model">Audio Model</label>
+            <select
+              id="audio-model"
+              value={audioModel}
+              onChange={e => setAudioModel(e.target.value)}
+            >
+              {MODEL_OPTIONS.map(m => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="prompt-group">
+            <div
+              className="prompt-header"
+              style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <label htmlFor="audio-prompt" style={{ margin: 0 }}>
+                  Audio Prompt
+                </label>
+                <InfoTooltip text="Editing this changes the instructions sent to the model for transcription. Click the revert icon to restore the recommended default prompt." />
+              </div>
+              <button
+                type="button"
+                className="revert-btn"
+                onClick={revertAudioPrompt}
+                aria-label="Revert to default prompt"
+                style={{
+                  background: 'rgba(0,0,0,0.6)',
+                  border: 'none',
+                  padding: '10px',
+                  borderRadius: 8,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                }}
+              >
+                <FaUndo size={18} />
+              </button>
+            </div>
+            <textarea
+              id="audio-prompt"
+              value={audioPrompt}
+              onChange={e => setAudioPrompt(e.target.value)}
+              style={{ resize: 'none' }}
+            />
+          </div>
+        </div>
 
-      <label htmlFor="image-model">Image Model</label>
-      <select
-        id="image-model"
-        value={imageModel}
-        onChange={e => setImageModel(e.target.value)}
+        {/* Image */}
+        <div
+          className="model-with-prompt"
+          style={{ flex: '1 1 0', minWidth: 320, display: 'flex', flexDirection: 'column', gap: 12 }}
+        >
+          <div className="model-group">
+            <label htmlFor="image-model">Image Model</label>
+            <select
+              id="image-model"
+              value={imageModel}
+              onChange={e => setImageModel(e.target.value)}
+            >
+              {MODEL_OPTIONS.map(m => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="prompt-group">
+            <div
+              className="prompt-header"
+              style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <label htmlFor="image-prompt" style={{ margin: 0 }}>
+                  Image Prompt
+                </label>
+                <InfoTooltip text="Editing this changes the instructions sent to the model for transcription. Click the revert icon to restore the recommended default prompt." />
+              </div>
+              <button
+                type="button"
+                className="revert-btn"
+                onClick={revertImagePrompt}
+                aria-label="Revert to default prompt"
+                style={{
+                  background: 'rgba(0,0,0,0.6)',
+                  border: 'none',
+                  padding: '10px',
+                  borderRadius: 8,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                }}
+              >
+                <FaUndo size={18} />
+              </button>
+            </div>
+            <textarea
+              id="image-prompt"
+              value={imagePrompt}
+              onChange={e => setImagePrompt(e.target.value)}
+              style={{ resize: 'none' }}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* buttons + saved feedback */}
+      <div
+        className="settings-buttons"
+        style={{ position: 'relative', paddingTop: 12, flexWrap: 'nowrap' }}
       >
-        {MODEL_OPTIONS.map(m => (
-          <option key={m} value={m}>{m}</option>
-        ))}
-      </select>
+        {/* Saved badge positioned above without affecting layout */}
+        {saved && (
+          <div
+            style={{
+              position: 'absolute',
+              top: -24,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              color: '#6dd36d',
+              fontWeight: 500,
+              fontSize: '0.95rem',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            Saved!
+          </div>
+        )}
 
-      <div className="settings-buttons">
         <button className="btn cancel" onClick={() => window.close()}>
           Cancel
         </button>
@@ -90,7 +382,7 @@ function sortTranscripts(list: Transcript[]): Transcript[] {
 
 // ─── Main App ───────────────────────────────────────────────────────────────────
 export default function App() {
-  // If in settings route, show only SettingsView
+  // settings route
   if (window.location.hash === '#/settings') {
     return <SettingsView />;
   }
@@ -113,7 +405,13 @@ export default function App() {
   const [imageOutputDir, setImageOutputDir] = useState('');
   const [imageTranscripts, setImageTranscripts] = useState<Transcript[]>([]);
 
-  // ─ Shared UI ────────────────────────────────────────
+  // Quality scan state
+  const [threshold, setThreshold] = useState<number>(15);
+  const [qualityScores, setQualityScores] = useState<Record<string, { percentage: number }>>({});
+
+  const [isScanningQuality, setIsScanningQuality] = useState(false);
+
+  // ─ Shared UI ───────────────────────────────────────
   const [filter, setFilter] = useState('');
   const [logs, setLogs] = useState('');
   const [status, setStatus] = useState('');
@@ -130,12 +428,10 @@ export default function App() {
   useEffect(() => {
     const handler = (_: any, file: string, idx: number, total: number, msg: string) => {
       setStatus(`Transcribing ${file} (${idx}/${total})`);
-      // Reload only the new log text
       ipcRenderer.invoke('read-logs', mode).then(setLogs);
-      // Refresh sidebar file list
       const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
       if (dir) {
-        ipcRenderer.invoke('list-transcripts', dir).then((list: Transcript[]) => {
+        ipcRenderer.invoke('list-transcripts-subtitles', dir).then((list: Transcript[]) => {
           const sorted = sortTranscripts(list);
           if (mode === 'audio') {
             setAudioTranscripts(sorted);
@@ -149,6 +445,31 @@ export default function App() {
     return () => {
       ipcRenderer.removeListener('transcription-progress', handler);
     };
+  }, [mode, audioOutputDir, imageOutputDir]);
+
+  // Handler to scan placeholder percentages via Python script
+  const scanQuality = useCallback(async () => {
+    const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
+    if (!dir) return;
+    setIsScanningQuality(true);
+    try {
+      const result: { all: Array<{ file: string; percentage: number }> } =
+        await ipcRenderer.invoke('scan-quality', dir, threshold);
+      const map = result.all.reduce<Record<string, { percentage: number }>>((acc, entry) => {
+        acc[entry.file] = entry;
+        return acc;
+      }, {});
+      setQualityScores(map);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsScanningQuality(false);
+    }
+  }, [mode, audioOutputDir, imageOutputDir, threshold]);
+
+  // Clear previous quality scores when output folder or mode changes
+  useEffect(() => {
+    setQualityScores({});
   }, [mode, audioOutputDir, imageOutputDir]);
 
   // Sidebar drag/resizing
@@ -172,21 +493,23 @@ export default function App() {
     setIsResizing(true);
   };
 
-  // ─ Delete a single transcript (file) and refresh the list ─────────────────────
-  const removeTranscript = async (filePath: string) => {
-    await ipcRenderer.invoke('delete-transcript', filePath);
-    const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
-    if (!dir) return;
-    const rawList: Transcript[] = await ipcRenderer.invoke('list-transcripts', dir);
-    const sorted = sortTranscripts(rawList);
-    if (mode === 'audio') {
-      setAudioTranscripts(sorted);
-    } else {
-      setImageTranscripts(sorted);
-    }
-  };
+  const removeFile = useCallback(
+    async (filePath: string) => {
+      await ipcRenderer.invoke('delete-transcript', filePath);
+      const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
+      if (!dir) return;
+      const rawList: Transcript[] = await ipcRenderer.invoke('list-transcripts-subtitles', dir);
+      const sorted = sortTranscripts(rawList);
+      if (mode === 'audio') {
+        setAudioTranscripts(sorted);
+      } else {
+        setImageTranscripts(sorted);
+      }
+    },
+    [mode, audioOutputDir, imageOutputDir]
+  );
 
-  const selectInput = async () => {
+  const selectInput = useCallback(async () => {
     if (mode === 'audio') {
       const file = await ipcRenderer.invoke('select-input-file', mode);
       if (!file) return;
@@ -196,55 +519,81 @@ export default function App() {
       if (!folder) return;
       setImageInputPath(folder);
     }
-  };
+  }, [mode]);
 
-  const selectOutput = async () => {
+  const selectOutput = useCallback(async () => {
     const dir = await ipcRenderer.invoke('select-output-dir');
     if (!dir) return;
     if (mode === 'audio') {
       setAudioOutputDir(dir);
-      const rawList = await ipcRenderer.invoke('list-transcripts', dir);
+      const rawList = await ipcRenderer.invoke('list-transcripts-subtitles', dir);
       setAudioTranscripts(sortTranscripts(rawList));
     } else {
       setImageOutputDir(dir);
-      const rawList = await ipcRenderer.invoke('list-transcripts', dir);
+      const rawList = await ipcRenderer.invoke('list-transcripts-subtitles', dir);
       setImageTranscripts(sortTranscripts(rawList));
     }
-  };
+  }, [mode]);
 
-  const transcribe = async () => {
-    const input = mode === 'audio' ? audioInputPath : imageInputPath;
-    const output = mode === 'audio' ? audioOutputDir : imageOutputDir;
-    if (!input || !output) return;
+  // ─── Transcribe Audio ─────────────────────────────────────────────────────
+  const transcribeAudio = useCallback(
+    async (interviewMode: boolean, generateSubtitles: boolean) => {
+      if (!audioInputPath || !audioOutputDir) return;
+      setStatus('');
+      setIsTranscribing(true);
 
-    if (mode === 'image' && input === output) {
-      setToast('❌ Input and output folder cannot be the same');
-      setTimeout(() => setToast(null), 4000);
-      return;
-    }
-    if (mode === 'audio') {
-      // If input file resides in the same folder as output
-      const inputDir = path.dirname(input);
-      if (inputDir === output) {
-        setToast('❌ Input file and output folder cannot be the same');
-        setTimeout(() => setToast(null), 4000);
-        return;
+      // choose prompt based on flags
+      let promptToUse = DEFAULT_AUDIO_PROMPT;
+      if (generateSubtitles) {
+        promptToUse = SUBTITLE_AUDIO_PROMPT;
+      } else if (interviewMode) {
+        promptToUse = INTERVIEW_AUDIO_PROMPT;
       }
-    }
 
+      try {
+        await ipcRenderer.invoke(
+          'run-transcription',
+          'audio',
+          audioInputPath,
+          audioOutputDir,
+          promptToUse,
+          generateSubtitles,
+          interviewMode
+        );
+        setStatus('✅ Batch complete');
+        setToast('✅ Done');
+        setTimeout(() => setToast(null), 6000);
+      } catch (err: any) {
+        const cancelled = err.message?.includes('terminated');
+        const msg = cancelled
+          ? '❌ Cancelled by user'
+          : `❌ ${err.message || 'Unknown error'}`;
+        setStatus(msg);
+        if (!cancelled) {
+          setToast(msg);
+          setTimeout(() => setToast(null), 6000);
+        }
+      } finally {
+        setIsTranscribing(false);
+      }
+    },
+    [audioInputPath, audioOutputDir]
+  );
+
+  const transcribeImage = useCallback(async () => {
+    if (!imageInputPath || !imageOutputDir) return;
     setStatus('');
     setIsTranscribing(true);
-
     try {
-      await ipcRenderer.invoke('run-transcription', mode, input, output);
+      await ipcRenderer.invoke('run-transcription', 'image', imageInputPath, imageOutputDir);
       setStatus('✅ Batch complete');
       setToast('✅ Done');
       setTimeout(() => setToast(null), 6000);
     } catch (err: any) {
-      const cancelled = err.message.includes('terminated');
+      const cancelled = err.message?.includes('terminated');
       const msg = cancelled
         ? '❌ Cancelled by user'
-        : `❌ ${err.message}`;
+        : `❌ ${err.message || 'Unknown error'}`;
       setStatus(msg);
       if (!cancelled) {
         setToast(msg);
@@ -253,19 +602,19 @@ export default function App() {
     } finally {
       setIsTranscribing(false);
     }
-  };
+  }, [imageInputPath, imageOutputDir]);
 
-  const cancel = async () => {
+  const cancel = useCallback(async () => {
     await ipcRenderer.invoke('cancel-transcription');
     setStatus('❌ Cancelled by user');
     setIsTranscribing(false);
-  };
+  }, []);
 
-  const openTranscript = (p: string) => ipcRenderer.invoke('open-transcript', p);
-  const clearLogs = async () => {
+  const openTranscript = useCallback((p: string) => ipcRenderer.invoke('open-transcript', p), []);
+  const clearLogs = useCallback(async () => {
     await ipcRenderer.invoke('clear-logs', mode);
     setLogs('');
-  };
+  }, [mode]);
 
   const currentList = mode === 'audio' ? audioTranscripts : imageTranscripts;
   const filtered = currentList.filter(t =>
@@ -277,9 +626,50 @@ export default function App() {
       <FaCog className="settings-gear" onClick={() => ipcRenderer.invoke('open-settings')} />
 
       <aside className="sidebar" ref={sidebarRef} style={{ width: sidebarWidth }}>
+        <div className="controls">
+          <div className="field-row quality-scan-row">
+            <div style={{ position: 'relative', display: 'inline-block' }}>
+              <input
+                className="scan-input"
+                type="number"
+                inputMode="numeric"
+                min={0}
+                max={99}
+                step={1}
+                value={threshold}
+                onKeyDown={e => {
+                  // Prevent invalid chars: no e, +, -, .
+                  if (['e','E','+','-','.'].includes(e.key)) e.preventDefault();
+                }}
+                onChange={e => {
+                  // Strip leading zeros (unless single zero)
+                  let raw = e.target.value;
+                  raw = raw.replace(/^0+(?=\d)/, '');
+                  let v = parseInt(raw, 10);
+                  if (isNaN(v)) v = 0;
+                  if (v < 0) v = 0;
+                  if (v > 99) v = 99;
+                  setThreshold(v);
+                }}
+                title="Minimum placeholder percentage to highlight"
+                style={{ paddingRight: '1.5ch' }}
+              />
+              <span style={{ position: 'absolute', right: '0.5ch', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-light)' }}>%</span>
+            </div>
+            <button
+              className="scan-btn btn"
+              onClick={scanQuality}
+              disabled={isScanningQuality || !(audioOutputDir || imageOutputDir)}
+              aria-label="Scan transcripts for placeholder quality"
+            >
+              {isScanningQuality ? <FaSpinner className="spin" /> : 'Check Quality'}
+            </button>
+            <InfoTooltip text="Enter a minimum placeholder percentage (0–99) to highlight. The scan calculates the ratio of [unsure] and [blank] tokens in each files. Color codes: green = 0%, yellow = below the threshold, red = at or above the threshold." />
+          </div>
+        </div>
         <input
           className="filter-input"
-          placeholder="Filter transcripts…"
+          placeholder="Filter transcripts, subtitles…"
           value={filter}
           onChange={e => setFilter(e.target.value)}
         />
@@ -293,9 +683,18 @@ export default function App() {
               >
                 {t.name}
               </span>
+              {qualityScores[t.name] && (() => {
+                const pct = qualityScores[t.name].percentage;
+                const color = pct === 0 ? 'green' : pct >= threshold ? 'red' : 'yellow';
+                return (
+                  <span style={{ marginLeft: '0.5rem', color }}>
+                    {pct}%
+                  </span>
+                );
+              })()}
               <button
                 className="transcript-delete"
-                onClick={() => removeTranscript(t.path)}
+                onClick={() => removeFile(t.path)}
                 title="Remove"
               >
                 ×
@@ -309,7 +708,10 @@ export default function App() {
       <main className="content">
         <div className="logo">TranscribeAI</div>
 
-        <div className={`mode-toggle ${mode}`} onClick={() => setMode(m => m === 'audio' ? 'image' : 'audio')}>
+        <div
+          className={`mode-toggle ${mode}`}
+          onClick={() => setMode(m => (m === 'audio' ? 'image' : 'audio'))}
+        >
           <div className={mode === 'audio' ? 'label active' : 'label'}>Audio</div>
           <div className={mode === 'image' ? 'label active' : 'label'}>Image/Page</div>
           <div className="toggle-thumb" />
@@ -322,7 +724,7 @@ export default function App() {
             isTranscribing={isTranscribing}
             onSelectInput={selectInput}
             onSelectOutput={selectOutput}
-            onTranscribe={transcribe}
+            onTranscribe={transcribeAudio}
             onCancel={cancel}
           />
         ) : (
@@ -332,7 +734,7 @@ export default function App() {
             isTranscribing={isTranscribing}
             onSelectInput={selectInput}
             onSelectOutput={selectOutput}
-            onTranscribe={transcribe}
+            onTranscribe={transcribeImage}
             onCancel={cancel}
           />
         )}
@@ -341,9 +743,12 @@ export default function App() {
 
         <div className="logs-controls">
           <button className="logs-toggle" onClick={() => setShowLogs(s => !s)}>
-            {showLogs ? <FaChevronUp /> : <FaChevronDown />} {showLogs ? 'Hide Logs' : 'Show Logs'}
+            {showLogs ? <FaChevronUp /> : <FaChevronDown />}{' '}
+            {showLogs ? 'Hide Logs' : 'Show Logs'}
           </button>
-          <button className="logs-clear" onClick={clearLogs}>Clear Logs</button>
+          <button className="logs-clear" onClick={clearLogs}>
+            Clear Logs
+          </button>
         </div>
         {showLogs && <pre className="logs">{logs || '— no logs —'}</pre>}
       </main>

@@ -1,4 +1,3 @@
-// src/electron/main.ts
 import { app, BrowserWindow, ipcMain, dialog, shell, screen } from 'electron';
 import path from 'path';
 import fs from 'fs';
@@ -12,8 +11,14 @@ import { getLogPath } from './logHelpers.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Store for API key
-const store = new Store<{ apiKey?: string }>();
+interface StoreSchema {
+  apiKey?: string;
+  audioModel?: string;
+  imageModel?: string;
+  audioPrompt?: string;
+  imagePrompt?: string;
+}
+const store = new Store<StoreSchema>();
 
 // Track running process
 let currentExec: ChildProcess | null = null;
@@ -59,9 +64,10 @@ if (isDev()) {
 
 const audioBin = path.join(scriptsDir, `audio_transcribe${ext}`);
 const preprocessFn = path.join(scriptsDir, `preprocess_to_jpeg${ext}`);
-const flashFn = path.join(scriptsDir, `flash_process_local_dir${ext}`);
+const imageBin = path.join(scriptsDir, `image_transcribe${ext}`);
+const qualityScanScript = path.join(scriptsDir, `scan_transcription_quality${ext}`);
 
-for (const p of [audioBin, preprocessFn, flashFn]) {
+for (const p of [audioBin, preprocessFn, imageBin, qualityScanScript]) {
   if (!fs.existsSync(p)) {
     dialog.showErrorBox('Missing binary', `Expected to find:\n${p}`);
     app.quit();
@@ -69,10 +75,11 @@ for (const p of [audioBin, preprocessFn, flashFn]) {
   }
 }
 
-// run shell commands with logging
-function runCommand(cmd: string, mode: string): Promise<string> {
+// run shell commands with logging and optional extra env
+function runCommand(cmd: string, mode: string, extraEnv: Record<string, string> = {}): Promise<string> {
   return new Promise((resolve, reject) => {
-    currentExec = exec(cmd, { env: process.env }, async (err, stdout, stderr) => {
+    const env = { ...process.env, ...extraEnv };
+    currentExec = exec(cmd, { env }, async (err, stdout, stderr) => {
       if (stdout) await fs.promises.appendFile(getLogPath(mode), `[OUT] ${stdout}`);
       if (stderr) await fs.promises.appendFile(getLogPath(mode), `[ERR] ${stderr}`);
       currentExec = null;
@@ -83,16 +90,22 @@ function runCommand(cmd: string, mode: string): Promise<string> {
 }
 
 // ── IPC HANDLERS ──────────────────────────────────────────────────────────────
-ipcMain.handle('get-audio-model', () => store.get('audioModel') || 'gemini-2.0-flash');
+ipcMain.handle('get-audio-model', () => store.get('audioModel') || 'gemini-2.5-flash');
 ipcMain.handle('set-audio-model', (_e, m: string) => { store.set('audioModel', m); });
 
-ipcMain.handle('get-image-model', () => store.get('imageModel') || 'gemini-2.0-flash');
+ipcMain.handle('get-image-model', () => store.get('imageModel') || 'gemini-2.5-flash');
 ipcMain.handle('set-image-model', (_e, m: string) => { store.set('imageModel', m); });
 
-ipcMain.handle('list-transcripts', async (_e, folder: string) => {
+ipcMain.handle('get-audio-prompt', () => store.get('audioPrompt') || '');
+ipcMain.handle('set-audio-prompt', (_e, p: string) => { store.set('audioPrompt', p); });
+
+ipcMain.handle('get-image-prompt', () => store.get('imagePrompt') || '');
+ipcMain.handle('set-image-prompt', (_e, p: string) => { store.set('imagePrompt', p); });
+
+ipcMain.handle('list-transcripts-subtitles', async (_e, folder: string) => {
   const files = await fs.promises.readdir(folder);
   return files
-    .filter(f => f.endsWith('.txt'))
+    .filter(f => f.endsWith('.txt') || f.endsWith('.srt'))
     .map(f => ({ name: f, path: path.join(folder, f) }));
 });
 
@@ -122,7 +135,7 @@ ipcMain.handle('select-input-file', async (_e, mode: string = 'audio') => {
     ? [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'm4a'] }]
     : [{ name: 'Image & PDF', extensions: ['png', 'jpg', 'jpeg', 'tif', 'tiff', 'pdf'] }];
   const properties: Electron.OpenDialogOptions['properties'] =
-    mode === 'audio' ? ['openFile'] : ['openFile', 'openDirectory'];
+    mode === 'audio' ? ['openFile', 'openDirectory'] : ['openFile', 'openDirectory'];
   const { canceled, filePaths } = await dialog.showOpenDialog({ properties, filters });
   return canceled ? null : filePaths[0];
 });
@@ -139,6 +152,18 @@ ipcMain.handle('select-output-dir', async () => {
   return res.canceled ? null : res.filePaths[0];
 });
 
+ipcMain.handle('get-parent-dir', async (_e, filePath: string) => {
+  try {
+    const stat = await fs.promises.stat(filePath);
+    if (stat.isDirectory()) {
+      return filePath;
+    }
+    return path.dirname(filePath);
+  } catch {
+    return null;
+  }
+});
+
 ipcMain.handle('delete-transcript', async (_e, filePath: string) => {
   try {
     await fs.promises.unlink(filePath);
@@ -148,95 +173,155 @@ ipcMain.handle('delete-transcript', async (_e, filePath: string) => {
   }
 });
 
-ipcMain.handle('run-transcription', async (_e, mode: string, inputPath: string, outputDir: string) => {
-  // clear previous logs
-  await fs.promises.writeFile(getLogPath(mode), '', 'utf-8');
+// ── Updated run-transcription to pass flags to Python ──────────────────────────
+ipcMain.handle(
+  'run-transcription',
+  async (_e,
+    mode: string,
+    inputPath: string,
+    outputDir: string,
+    promptArg: string,
+    generateSubtitles: boolean,
+    interviewMode: boolean) => {
+    // clear previous logs
+    await fs.promises.writeFile(getLogPath(mode), '', 'utf-8');
 
-  const apiKey = (store.get('apiKey') || '').trim();
-  if (!apiKey) throw new Error('API key not set. Please enter it in Settings.');
-  process.env.GOOGLE_API_KEY = apiKey;
+    const apiKey = (store.get('apiKey') || '').trim();
+    if (!apiKey) throw new Error('API key not set. Please enter it in Settings.');
+    process.env.GOOGLE_API_KEY = apiKey;
 
-  const win = BrowserWindow.getAllWindows()[0];
-  const modelName = mode === 'audio'
-    ? (store.get('audioModel') as string)
-    : (store.get('imageModel') as string);
+    const win = BrowserWindow.getAllWindows()[0];
+    const modelName = mode === 'audio'
+      ? (store.get('audioModel') as string)
+      : (store.get('imageModel') as string);
 
-  if (mode === 'audio') {
-    const filename = path.basename(inputPath);
-    win.webContents.send('transcription-progress', filename, 1, 1, 'Transcribing…');
-    const cmd = `"${audioBin}" --input "${inputPath}" --model "${modelName}" --output_dir "${outputDir}"`;
-    try {
-      const out = await runCommand(cmd, 'audio');
-      win.webContents.send('transcription-progress', filename, 1, 1, 'Done');
-      return out;
-    } catch (err: any) {
-      const cancelled = err.killed || err.signal === 'SIGTERM';
-      win.webContents.send('transcription-progress', filename, 1, 1, cancelled ? 'Cancelled' : 'Error');
-      if (cancelled) throw new Error('terminated by user');
-      throw err;
-    }
-  }
-
-  // IMAGE MODE WITH RESUME SUPPORT
-  const stat = await fs.promises.stat(inputPath);
-
-  let files: string[];
-  if (stat.isDirectory()) {
-    const names = (await fs.promises.readdir(inputPath))
-      .filter(f => /\.(png|jpe?g|tif{1,2})$/i.test(f));
-
-    names.sort((a, b) =>
-      a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
-    );
-
-    files = names.map(f => path.join(inputPath, f));
-  } else {
-    files = [inputPath];
-  }
-
-  let aggregate = '';
-  try {
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      const name = path.basename(file);
-      const base = path.basename(file, path.extname(file));
-      const pngOut = path.join(outputDir, `${base}.png`);
-      const txtOut = path.join(outputDir, `${base}.txt`);
-
-      // skip already done
-      if (fs.existsSync(txtOut) && !fs.existsSync(pngOut)) {
-        win.webContents.send('transcription-progress', name, i + 1, files.length, 'Skipped');
-        continue;
+    if (mode === 'audio') {
+      const rawAudioPrompt = ((store.get('audioPrompt') as string) || '').trim();
+      if (!rawAudioPrompt) {
+        const msg = 'Audio prompt not set. Aborting transcription.';
+        await fs.promises.appendFile(getLogPath('audio'), `[ERR] ${msg}\n`);
+        throw new Error(msg);
       }
-      // clean up partial
-      if (fs.existsSync(pngOut)) await fs.promises.unlink(pngOut);
 
-      win.webContents.send('transcription-progress', name, i + 1, files.length, 'Preprocessing…');
-      await runCommand(`"${preprocessFn}" "${file}" "${outputDir}"`, 'image');
+      // support single file or directory of audio files
+      let audioFiles: string[] = [];
+      try {
+        const stat = await fs.promises.stat(inputPath);
+        if (stat.isDirectory()) {
+          const names = (await fs.promises.readdir(inputPath))
+            .filter(f => /\.(mp3|wav|m4a)$/i.test(f))
+            .sort((a, b) =>
+              a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+            );
+          audioFiles = names.map(f => path.join(inputPath, f));
+        } else {
+          audioFiles = [inputPath];
+        }
+      } catch {
+        audioFiles = [inputPath];
+      }
 
-      win.webContents.send('transcription-progress', name, i + 1, files.length, 'Transcribing…');
-      const out = await runCommand(
-        `"${flashFn}" --model "${modelName}" "${pngOut}" "${outputDir}"`,
-        'image'
-      );
-      aggregate += out;
+      for (let i = 0; i < audioFiles.length; i++) {
+        const file = audioFiles[i];
+        const name = path.basename(file);
+        const base = path.basename(file, path.extname(file));
+        const transcriptOut = path.join(outputDir, `${base}.txt`);
 
-      win.webContents.send('transcription-progress', name, i + 1, files.length, 'Done');
+        if (fs.existsSync(transcriptOut)) {
+          win.webContents.send('transcription-progress', name, i + 1, audioFiles.length, 'Skipped');
+          continue;
+        }
+
+        win.webContents.send('transcription-progress', name, i + 1, audioFiles.length, 'Transcribing…');
+        let cmd = `"${audioBin}" --input "${file}" --model "${modelName}" --output_dir "${outputDir}"`;
+        if (interviewMode) cmd += ' --interview';
+        if (generateSubtitles) cmd += ' --subtitles';
+
+        try {
+          await runCommand(cmd,
+            'audio',
+            { AUDIO_PROMPT: promptArg, GOOGLE_API_KEY: apiKey }
+          );
+          win.webContents.send('transcription-progress', name, i + 1, audioFiles.length, 'Done');
+        } catch (err: any) {
+          const cancelled = err.killed || err.signal === 'SIGTERM';
+          win.webContents.send('transcription-progress', name, i + 1, audioFiles.length,
+            cancelled ? 'Cancelled' : 'Error'
+          );
+          if (cancelled) throw new Error('terminated by user');
+        }
+      }
+
+      return `[OK] Processed ${audioFiles.length} audio file(s)`;
+    } else {
+      const rawImagePrompt = ((store.get('imagePrompt') as string) || '').trim();
+      if (!rawImagePrompt) {
+        const msg = 'Image prompt not set. Aborting transcription.';
+        await fs.promises.appendFile(getLogPath('image'), `[ERR] ${msg}\n`);
+        throw new Error(msg);
+      }
+
+      const stat = await fs.promises.stat(inputPath);
+
+      let files: string[];
+      if (stat.isDirectory()) {
+        const names = (await fs.promises.readdir(inputPath))
+          .filter(f => /\.(png|jpe?g|tif{1,2})$/i.test(f));
+
+        names.sort((a, b) =>
+          a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+        );
+
+        files = names.map(f => path.join(inputPath, f));
+      } else {
+        files = [inputPath];
+      }
+
+      let aggregate = '';
+      try {
+        for (let i = 0; i < files.length; i++) {
+          const file = files[i];
+          const name = path.basename(file);
+          const base = path.basename(file, path.extname(file));
+          const pngOut = path.join(outputDir, `${base}.png`);
+          const txtOut = path.join(outputDir, `${base}.txt`);
+
+          // skip already done
+          if (fs.existsSync(txtOut) && !fs.existsSync(pngOut)) {
+            win.webContents.send('transcription-progress', name, i + 1, files.length, 'Skipped');
+            continue;
+          }
+          // clean up partial
+          if (fs.existsSync(pngOut)) await fs.promises.unlink(pngOut);
+
+          win.webContents.send('transcription-progress', name, i + 1, files.length, 'Preprocessing…');
+          await runCommand(`"${preprocessFn}" "${file}" "${outputDir}"`, 'image');
+
+          win.webContents.send('transcription-progress', name, i + 1, files.length, 'Transcribing…');
+          const out = await runCommand(
+            `"${imageBin}" --model "${modelName}" "${pngOut}" "${outputDir}"`,
+            'image',
+            { IMAGE_PROMPT: rawImagePrompt, GOOGLE_API_KEY: apiKey }
+          );
+          aggregate += out;
+
+          win.webContents.send('transcription-progress', name, i + 1, files.length, 'Done');
+        }
+
+        return aggregate;
+      } catch (err: any) {
+        if (err.killed || err.signal === 'SIGTERM') {
+          const lastIndex = Math.max(0, files.indexOf(err.file || '') + 1);
+          const lastName = path.basename(files[lastIndex] || '');
+          win.webContents.send('transcription-progress', lastName, lastIndex, files.length, 'Cancelled');
+          throw new Error('terminated by user');
+        }
+        const last = files[0];
+        win.webContents.send('transcription-progress', path.basename(last), 1, files.length, 'Error');
+        throw err;
+      }
     }
-
-    return aggregate;
-  } catch (err: any) {
-    if (err.killed || err.signal === 'SIGTERM') {
-      const lastIndex = Math.max(0, files.indexOf(err.file || '') + 1);
-      const lastName = path.basename(files[lastIndex] || '');
-      win.webContents.send('transcription-progress', lastName, lastIndex, files.length, 'Cancelled');
-      throw new Error('terminated by user');
-    }
-    const last = files[0];
-    win.webContents.send('transcription-progress', path.basename(last), 1, files.length, 'Error');
-    throw err;
-  }
-});
+  });
 
 function createMainWindow() {
   const { workAreaSize } = screen.getPrimaryDisplay();
@@ -268,13 +353,20 @@ ipcMain.handle('get-api-key', () => store.get('apiKey') || '');
 ipcMain.handle('set-api-key', (_e, key: string) => { store.set('apiKey', key); });
 ipcMain.handle('open-settings', () => {
   const parent = BrowserWindow.getAllWindows()[0];
+  const parentBounds = parent.getBounds();
+
+  const width = Math.floor(parentBounds.width * 0.85);
+  const height = Math.floor(parentBounds.height * 0.85);
+
   const child = new BrowserWindow({
-    width: 600,
-    height: 700,
+    width,
+    height,
+    minWidth: Math.floor(parentBounds.width * 0.6),
+    minHeight: Math.floor(parentBounds.height * 0.6),
     parent,
     modal: true,
     resizable: false,
-    webPreferences: { nodeIntegration: true, contextIsolation: false }
+    webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
 
   if (isDev()) {
@@ -284,4 +376,15 @@ ipcMain.handle('open-settings', () => {
     const indexURL = pathToFileURL(indexPath).toString() + '#/settings';
     child.loadURL(indexURL);
   }
+
+  child.center();
+});
+
+ipcMain.handle('scan-quality', async (_e, folder: string, threshold: number) => {
+  // clear any previous quality logs
+  await fs.promises.writeFile(getLogPath('quality'), '', 'utf-8');
+  let cmd = `"${qualityScanScript}" --folder "${folder}"`;
+  if (threshold != null) cmd += ` --threshold ${threshold}`;
+  const stdout = await runCommand(cmd, 'quality');
+  return JSON.parse(stdout);
 });
