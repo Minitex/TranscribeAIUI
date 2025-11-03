@@ -1,13 +1,13 @@
 {
   "name": "TranscribeAI",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "author": "Ninh Tran <ninhtran@umn.edu>",
   "main": "dist-electron/main.js",
   "description": "TranscribeAI - A desktop application for image and audio transcription using AI",
   "scripts": {
-    "build:python": "pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build python/preprocess_to_jpeg.py && pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build python/image_transcribe.py && pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build --add-binary \"$(python3 -c 'from imageio_ffmpeg import get_ffmpeg_exe; print(get_ffmpeg_exe())')\":. python/audio_transcribe.py && pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build python/scan_transcription_quality.py",
+    "build:python": "pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build python/preprocess_to_png.py && pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build python/image_transcribe.py && pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build --add-binary \"$(python3 -c 'from imageio_ffmpeg import get_ffmpeg_exe; print(get_ffmpeg_exe())')\":. python/audio_transcribe.py && pyinstaller --onefile --distpath python/dist --workpath python/build --specpath python/build python/transcript_quality_check.py",
     "dev": "npm-run-all --parallel dev:react dev:electron",
     "dev:react": "vite",
     "dev:electron": "npm run transpile:electron && cross-env NODE_ENV=development electron .",

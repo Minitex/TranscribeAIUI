@@ -19,6 +19,7 @@ import {
 import './App.css';
 
 const { ipcRenderer } = (window as any).require('electron');
+const fs = (window as any).require('fs') as typeof import('fs');
 
 // ─── Model options ─────────────────────────────────────────────────────────────
 const MODEL_OPTIONS = [
@@ -27,6 +28,79 @@ const MODEL_OPTIONS = [
   'gemini-2.0-flash',
   'gemini-2.0-flash-lite',
 ];
+
+type QualityEntry = {
+  confidence: number;
+  removeIntroText?: string;
+  removeOutroText?: string;
+};
+
+type ScanResultEntry = {
+  file: string;
+  confidence: number;
+  remove_intro_text?: string;
+  remove_outro_text?: string;
+};
+
+type SortOption = 'name-asc' | 'name-desc' | 'confidence-desc' | 'confidence-asc';
+
+const stripOuterQuotes = (line: string) =>
+  line.replace(/^[\"'“”‘’]+/, '').replace(/[\"'“”‘’]+$/, '');
+
+const removeWrappersFromContent = (
+  content: string,
+  intro?: string,
+  outro?: string
+) => {
+  if (!intro && !outro) return content;
+
+  const endsWithNewline = /\r?\n$/.test(content);
+  const newline = content.includes('\r\n') ? '\r\n' : '\n';
+  const lines = content.split(/\r?\n/);
+
+  let startIdx = 0;
+  while (startIdx < lines.length && !lines[startIdx].trim()) startIdx++;
+
+  let workingLines = lines.slice();
+  let removedIntro = false;
+  let removedOutro = false;
+
+  if (intro && startIdx < workingLines.length) {
+    const firstLine = stripOuterQuotes(workingLines[startIdx]).trim();
+    if (firstLine.toLowerCase().startsWith(intro.toLowerCase())) {
+      workingLines = workingLines.slice(startIdx + 1);
+      removedIntro = true;
+    }
+  }
+
+  if (removedIntro) {
+    while (workingLines.length && !workingLines[0].trim()) workingLines.shift();
+  }
+
+  if (outro && workingLines.length) {
+    let endIdx = workingLines.length - 1;
+    while (endIdx >= 0 && !workingLines[endIdx].trim()) endIdx--;
+    if (endIdx >= 0) {
+      const lastLine = stripOuterQuotes(workingLines[endIdx]).trim();
+      if (lastLine.toLowerCase().startsWith(outro.toLowerCase())) {
+        workingLines = workingLines.slice(0, endIdx);
+        removedOutro = true;
+      }
+    }
+  }
+
+  if (removedOutro) {
+    while (workingLines.length && !workingLines[workingLines.length - 1].trim()) {
+      workingLines.pop();
+    }
+  }
+
+  if (!removedIntro && !removedOutro) return content;
+
+  const cleaned = workingLines.join(newline);
+  if (!cleaned) return '';
+  return endsWithNewline ? `${cleaned}${newline}` : cleaned;
+};
 
 // Simple tooltip component
 const InfoTooltip: React.FC<{ text: string }> = ({ text }) => {
@@ -406,8 +480,8 @@ export default function App() {
   const [imageTranscripts, setImageTranscripts] = useState<Transcript[]>([]);
 
   // Quality scan state
-  const [threshold, setThreshold] = useState<number>(15);
-  const [qualityScores, setQualityScores] = useState<Record<string, { percentage: number }>>({});
+  const [threshold, setThreshold] = useState<number>(85);
+  const [qualityScores, setQualityScores] = useState<Record<string, QualityEntry>>({});
 
   const [isScanningQuality, setIsScanningQuality] = useState(false);
 
@@ -418,6 +492,9 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [showLogs, setShowLogs] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [fileTypeFilter, setFileTypeFilter] = useState<'all' | 'transcript' | 'subtitle'>('all');
+  const [sortOption, setSortOption] = useState<SortOption>('name-asc');
+  const [showFilters, setShowFilters] = useState(false);
 
   // Load logs whenever mode changes
   useEffect(() => {
@@ -447,16 +524,122 @@ export default function App() {
     };
   }, [mode, audioOutputDir, imageOutputDir]);
 
+  const cleanupWrappers = useCallback(
+    async (entries: ScanResultEntry[], dir: string) => {
+      let transcripts = mode === 'audio' ? audioTranscripts : imageTranscripts;
+      if (!transcripts.length) {
+        try {
+          const fetched: Transcript[] = await ipcRenderer.invoke(
+            'list-transcripts-subtitles',
+            dir
+          );
+          const sorted = sortTranscripts(fetched);
+          transcripts = sorted;
+          if (mode === 'audio') {
+            setAudioTranscripts(sorted);
+          } else {
+            setImageTranscripts(sorted);
+          }
+        } catch (error) {
+          console.error('Failed to load transcripts for cleanup', error);
+          return;
+        }
+      }
+      const lookup = new Map(transcripts.map(t => [t.name, t.path]));
+
+      const cleanedFiles: Array<{
+        name: string;
+        path: string;
+        intro?: string;
+        outro?: string;
+      }> = [];
+      await Promise.all(
+        entries.map(async entry => {
+          const intro = entry.remove_intro_text;
+          const outro = entry.remove_outro_text;
+          if (!intro && !outro) return;
+          const filePath = lookup.get(entry.file);
+          if (!filePath) return;
+
+          try {
+            const original = await fs.promises.readFile(filePath, 'utf-8');
+            const cleaned = removeWrappersFromContent(original, intro, outro);
+            if (cleaned !== original) {
+              await fs.promises.writeFile(filePath, cleaned, 'utf-8');
+              cleanedFiles.push({
+                name: entry.file,
+                path: filePath,
+                intro: intro?.trim(),
+                outro: outro?.trim()
+              });
+            }
+          } catch (error) {
+            console.error('Failed to strip wrappers from', filePath, error);
+          }
+        })
+      );
+
+      if (cleanedFiles.length) {
+        const logLines = cleanedFiles
+          .map(({ path, intro, outro }) => {
+            const parts: string[] = [];
+            if (intro) {
+              const snippet = intro.replace(/\s+/g, ' ');
+              parts.push(`[OUT] [OK] Removed intro chatter: ${snippet}`);
+            }
+            if (outro) {
+              const snippet = outro.replace(/\s+/g, ' ');
+              parts.push(`[OUT] [OK] Removed outro chatter: ${snippet}`);
+            }
+            if (!parts.length) {
+              parts.push('[OUT] [OK] Removed intro/outro chatter.');
+            }
+            return parts.join('\n') + `\n[OUT] [OK] Cleaned file: ${path}`;
+          })
+          .concat(
+            `[OUT] [OK] Quality scan cleaned ${cleanedFiles.length} file(s).`
+          )
+          .join('\n');
+        try {
+          await ipcRenderer.invoke('append-log', {
+            mode,
+            message: logLines
+          });
+          const updatedLogs = await ipcRenderer.invoke('read-logs', mode);
+          setLogs(updatedLogs);
+        } catch (error) {
+          console.error(`Failed to write ${mode} log entry`, error);
+        }
+
+        const message =
+          cleanedFiles.length === 1
+            ? `Removed intro/outro chatter from ${cleanedFiles[0].name}`
+            : `Removed intro/outro chatter from ${cleanedFiles.length} files`;
+        setToast(message);
+        setTimeout(() => setToast(null), 6000);
+      }
+    },
+    [mode, audioTranscripts, imageTranscripts]
+  );
+
   // Handler to scan placeholder percentages via Python script
   const scanQuality = useCallback(async () => {
     const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
     if (!dir) return;
     setIsScanningQuality(true);
     try {
-      const result: { all: Array<{ file: string; percentage: number }> } =
-        await ipcRenderer.invoke('scan-quality', dir, threshold);
-      const map = result.all.reduce<Record<string, { percentage: number }>>((acc, entry) => {
-        acc[entry.file] = entry;
+      const result: { all: ScanResultEntry[] } = await ipcRenderer.invoke(
+        'scan-quality',
+        dir,
+        threshold
+      );
+      await cleanupWrappers(result.all, dir);
+      const map = result.all.reduce<Record<string, QualityEntry>>((acc, entry) => {
+        acc[entry.file] = {
+          confidence: entry.confidence,
+          removeIntroText: entry.remove_intro_text,
+          removeOutroText: entry.remove_outro_text
+        };
         return acc;
       }, {});
       setQualityScores(map);
@@ -465,7 +648,7 @@ export default function App() {
     } finally {
       setIsScanningQuality(false);
     }
-  }, [mode, audioOutputDir, imageOutputDir, threshold]);
+  }, [mode, audioOutputDir, imageOutputDir, threshold, cleanupWrappers]);
 
   // Clear previous quality scores when output folder or mode changes
   useEffect(() => {
@@ -617,9 +800,36 @@ export default function App() {
   }, [mode]);
 
   const currentList = mode === 'audio' ? audioTranscripts : imageTranscripts;
-  const filtered = currentList.filter(t =>
-    t.name.toLowerCase().includes(filter.toLowerCase())
-  );
+  const nameFilter = filter.toLowerCase();
+  const filtered = [...currentList]
+    .filter(t => t.name.toLowerCase().includes(nameFilter))
+    .filter(t => {
+      if (fileTypeFilter === 'all') return true;
+      const isSubtitle = t.name.toLowerCase().endsWith('.srt');
+      return fileTypeFilter === 'subtitle' ? isSubtitle : !isSubtitle;
+    })
+    .sort((a, b) => {
+      switch (sortOption) {
+        case 'name-asc':
+          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        case 'name-desc':
+          return b.name.localeCompare(a.name, undefined, { numeric: true, sensitivity: 'base' });
+        case 'confidence-asc': {
+          const aScore = qualityScores[a.name]?.confidence ?? Number.POSITIVE_INFINITY;
+          const bScore = qualityScores[b.name]?.confidence ?? Number.POSITIVE_INFINITY;
+          if (aScore !== bScore) return aScore - bScore;
+          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        }
+        case 'confidence-desc': {
+          const aScore = qualityScores[a.name]?.confidence ?? Number.NEGATIVE_INFINITY;
+          const bScore = qualityScores[b.name]?.confidence ?? Number.NEGATIVE_INFINITY;
+          if (aScore !== bScore) return bScore - aScore;
+          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        }
+        default:
+          return 0;
+      }
+    });
 
   return (
     <div className={`app-shell${isResizing ? ' resizing' : ''}`}>
@@ -634,7 +844,7 @@ export default function App() {
                 type="number"
                 inputMode="numeric"
                 min={0}
-                max={99}
+                max={100}
                 step={1}
                 value={threshold}
                 onKeyDown={e => {
@@ -648,10 +858,10 @@ export default function App() {
                   let v = parseInt(raw, 10);
                   if (isNaN(v)) v = 0;
                   if (v < 0) v = 0;
-                  if (v > 99) v = 99;
+                  if (v > 100) v = 100;
                   setThreshold(v);
                 }}
-                title="Minimum placeholder percentage to highlight"
+                title="Minimum confidence (0–100). Files below this value are flagged in red."
                 style={{ paddingRight: '1.5ch' }}
               />
               <span style={{ position: 'absolute', right: '0.5ch', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-light)' }}>%</span>
@@ -660,19 +870,100 @@ export default function App() {
               className="scan-btn btn"
               onClick={scanQuality}
               disabled={isScanningQuality || !(audioOutputDir || imageOutputDir)}
-              aria-label="Scan transcripts for placeholder quality"
+              aria-label="Scan transcripts to compute confidence"
             >
               {isScanningQuality ? <FaSpinner className="spin" /> : 'Check Quality'}
             </button>
-            <InfoTooltip text="Enter a minimum placeholder percentage (0–99) to highlight. The scan calculates the ratio of [unsure] and [blank] tokens in each files. Color codes: green = 0%, yellow = below the threshold, red = at or above the threshold." />
+            <InfoTooltip text="Enter the minimum acceptable confidence (0–100). Confidence is 100% when no [unsure]/[blank] markers are present, and 0% when all tokens are placeholders. Colors: green for ≥99%, yellow between the threshold and 99%, red below the threshold." />
           </div>
         </div>
-        <input
-          className="filter-input"
-          placeholder="Filter transcripts, subtitles…"
-          value={filter}
-          onChange={e => setFilter(e.target.value)}
-        />
+        <div style={{ marginTop: '0.75rem' }}>
+          <button
+            type="button"
+            className="btn filter-toggle"
+            aria-expanded={showFilters}
+            onClick={() => setShowFilters(prev => !prev)}
+            style={{
+              width: '100%',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              gap: '0.75rem',
+              padding: '0.55rem 0.9rem',
+              fontWeight: 500
+            }}
+          >
+            <span>{showFilters ? 'Hide Filters' : 'Show Filters'}</span>
+            <span
+              style={{
+                display: 'inline-block',
+                transform: showFilters ? 'rotate(90deg)' : 'rotate(0deg)',
+                transition: 'transform 0.2s ease',
+                fontSize: '1.25rem',
+                lineHeight: 1
+              }}
+            >
+              ›
+            </span>
+          </button>
+          {showFilters && (
+            <div
+              className="filter-panel"
+              style={{
+                marginTop: '0.75rem',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: '0.75rem',
+                background: 'rgba(21, 24, 34, 0.95)',
+                borderRadius: 12,
+                padding: '1rem',
+                boxShadow: '0 10px 20px rgba(0,0,0,0.25)',
+                border: '1px solid rgba(255,255,255,0.08)'
+              }}
+            >
+              <input
+                className="filter-input"
+                placeholder="Filter transcripts, subtitles…"
+                value={filter}
+                onChange={e => setFilter(e.target.value)}
+                style={{ width: '100%' }}
+              />
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                  gap: '0.75rem'
+                }}
+              >
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: '0.9rem' }}>
+                  <span>Type</span>
+                  <select
+                    value={fileTypeFilter}
+                    onChange={e => setFileTypeFilter(e.target.value as 'all' | 'transcript' | 'subtitle')}
+                    style={{ width: '100%', padding: '0.45rem 0.6rem' }}
+                  >
+                    <option value="all">All files</option>
+                    <option value="transcript">Transcripts (.txt)</option>
+                    <option value="subtitle">Subtitles (.srt)</option>
+                  </select>
+                </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: '0.9rem' }}>
+                  <span>Sort</span>
+                  <select
+                    value={sortOption}
+                    onChange={e => setSortOption(e.target.value as SortOption)}
+                    style={{ width: '100%', padding: '0.45rem 0.6rem' }}
+                  >
+                    <option value="name-asc">Alphabetical ↑ (default)</option>
+                    <option value="name-desc">Alphabetical ↓</option>
+                    <option value="confidence-desc">Confidence ↓</option>
+                    <option value="confidence-asc">Confidence ↑</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          )}
+        </div>
         <ul className="transcript-list">
           {filtered.map(t => (
             <li key={t.path} className="transcript-item">
@@ -684,11 +975,17 @@ export default function App() {
                 {t.name}
               </span>
               {qualityScores[t.name] && (() => {
-                const pct = qualityScores[t.name].percentage;
-                const color = pct === 0 ? 'green' : pct >= threshold ? 'red' : 'yellow';
+                const entry = qualityScores[t.name];
+                const confidence = entry.confidence;
+                const color =
+                  confidence < threshold ? 'red' : confidence >= 99 ? 'green' : 'yellow';
+                const display = confidence
+                  .toFixed(2)
+                  .replace(/\.00$/, '')
+                  .replace(/(\.\d)0$/, '$1');
                 return (
                   <span style={{ marginLeft: '0.5rem', color }}>
-                    {pct}%
+                    {display}%
                   </span>
                 );
               })()}

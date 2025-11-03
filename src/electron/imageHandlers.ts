@@ -15,7 +15,7 @@ const pythonCmd     = process.platform === 'win32' ? 'python' : 'python3';
 const scriptsDir    = isDev()
   ? path.join(process.cwd(), 'python')
   : path.join(process.resourcesPath, 'python');
-const preprocessPy  = path.join(scriptsDir, 'preprocess_to_jpeg.py');
+const preprocessPy  = path.join(scriptsDir, 'preprocess_to_png.py');
 const flashScript   = path.join(scriptsDir, 'image_transcribe.py');
 
 [preprocessPy, flashScript].forEach(p => {

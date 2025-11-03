@@ -227,6 +227,16 @@ body,
   background: rgba(78, 140, 255, 0.1);
 }
 
+.filter-toggle {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text-light);
+}
+
+.filter-toggle:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
 /* Logs panel */
 .logs {
   width: 90%;
@@ -376,6 +386,7 @@ body,
   align-items: center;
   gap: 1.5rem;
   text-align: left;
+  overflow-y: auto;
 }
 
 .settings-container h2 {

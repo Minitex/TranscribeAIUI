@@ -63,9 +63,9 @@ if (isDev()) {
 }
 
 const audioBin = path.join(scriptsDir, `audio_transcribe${ext}`);
-const preprocessFn = path.join(scriptsDir, `preprocess_to_jpeg${ext}`);
+const preprocessFn = path.join(scriptsDir, `preprocess_to_png${ext}`);
 const imageBin = path.join(scriptsDir, `image_transcribe${ext}`);
-const qualityScanScript = path.join(scriptsDir, `scan_transcription_quality${ext}`);
+const qualityScanScript = path.join(scriptsDir, `transcript_quality_check${ext}`);
 
 for (const p of [audioBin, preprocessFn, imageBin, qualityScanScript]) {
   if (!fs.existsSync(p)) {
@@ -121,6 +121,19 @@ ipcMain.handle('read-logs', async (_e, mode: string) => {
 
 ipcMain.handle('clear-logs', (_e, mode: string) =>
   fs.promises.writeFile(getLogPath(mode), '', 'utf-8')
+);
+
+ipcMain.handle(
+  'append-log',
+  async (_e, payload: { mode: string; message: string }) => {
+    const { mode, message } = payload || {};
+    const allowed = new Set(['audio', 'image', 'quality']);
+    if (!mode || !allowed.has(mode)) {
+      throw new Error(`Unsupported log mode: ${mode}`);
+    }
+    if (!message) return;
+    await fs.promises.appendFile(getLogPath(mode), `${message.endsWith('\n') ? message : `${message}\n`}`, 'utf-8');
+  }
 );
 
 ipcMain.handle('cancel-transcription', () => {
@@ -330,6 +343,7 @@ function createMainWindow() {
     height: Math.floor(workAreaSize.height * 0.9),
     minWidth: 1200,
     minHeight: 700,
+    backgroundColor: '#16161f',
     webPreferences: { nodeIntegration: true, contextIsolation: false }
   });
 
@@ -366,6 +380,7 @@ ipcMain.handle('open-settings', () => {
     parent,
     modal: true,
     resizable: false,
+    backgroundColor: '#16161f',
     webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
 
@@ -382,8 +397,9 @@ ipcMain.handle('open-settings', () => {
 
 ipcMain.handle('scan-quality', async (_e, folder: string, threshold: number) => {
   // clear any previous quality logs
-  await fs.promises.writeFile(getLogPath('quality'), '', 'utf-8');
-  let cmd = `"${qualityScanScript}" --folder "${folder}"`;
+  const qualityLog = getLogPath('quality');
+  await fs.promises.writeFile(qualityLog, '', 'utf-8');
+  let cmd = `"${qualityScanScript}" --folder "${folder}" --log "${qualityLog}"`;
   if (threshold != null) cmd += ` --threshold ${threshold}`;
   const stdout = await runCommand(cmd, 'quality');
   return JSON.parse(stdout);
