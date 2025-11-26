@@ -235,7 +235,7 @@ def main():
     generated_txts = []
 
     if total_duration > 3600.0 and not args.subtitles and not args.interview:
-        logging.info("[INFO] Splitting in half and transcribing parts…")
+        logging.info("[INFO] Splitting in half and transcribing parts...")
         half = total_duration / 2
 
         part1_mp3 = os.path.join(args.output_dir, f"{base}_part1.mp3")

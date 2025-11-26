@@ -4,12 +4,17 @@
   "files": [
     "dist-electron/**/*",
     "dist-react/**/*",
-    "python/dist/**/*"
+    "node_modules/**/*",
+    "package.json"
   ],
   "asarUnpack": [
-    "python/dist/**/*"
+    "node_modules/sharp/**/*",
+    "node_modules/ffmpeg-static/**/*"
   ],
   "icon": "./desktopIcon.png",
+  "publish": [
+    { "provider": "github", "owner": "Minitex", "repo": "TranscribeAIUI" }
+  ],
   "mac": { "target": ["dmg","zip"] },
   "linux": { "target": "AppImage" },
   "win":   { "target": ["nsis","portable"] }

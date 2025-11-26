@@ -47,6 +47,7 @@ export default function AudioTranscriber({
 }: AudioTranscriberProps) {
   const [interviewMode, setInterviewMode] = useState(false);
   const [generateSubtitles, setGenerateSubtitles] = useState(false);
+  const optionsDisabled = !inputPath || !outputDir;
 
   const handleInterviewChange = useCallback(() => {
     setInterviewMode(im => {
@@ -92,48 +93,51 @@ export default function AudioTranscriber({
         </div>
 
         <div className="options-row">
-          <label className="option-item">
-            <input
-              type="checkbox"
-              checked={interviewMode}
-              onChange={handleInterviewChange}
-            />
-            Interview mode
-            <InfoTooltip text="Formats transcript as Q&A with speaker labels." />
-          </label>
-          <label className="option-item">
-            <input
-              type="checkbox"
-              checked={generateSubtitles}
-              onChange={handleSubtitlesChange}
-            />
-            Generate subtitles
-            <InfoTooltip text="Generates an SRT subtitle file (SubRip Text) and a transcript file. Early-release: may have issues on recordings longer than 1 hour." />
-          </label>
+          <div className="action-buttons">
+            {!isTranscribing ? (
+              <button
+                type="button"
+                className="transcribe-btn"
+                onClick={start}
+                disabled={!inputPath || !outputDir}
+                aria-label="Start transcription"
+              >
+                <FaMicrophone /> Transcribe
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="cancel-btn"
+                onClick={onCancel}
+                aria-label="Cancel transcription"
+              >
+                <FaTimesCircle /> Cancel
+              </button>
+            )}
+          </div>
+          <div className="options-group">
+            <label className={`option-item${optionsDisabled ? ' disabled' : ''}`}>
+              <input
+                type="checkbox"
+                checked={interviewMode}
+                onChange={handleInterviewChange}
+                disabled={optionsDisabled}
+              />
+              Interview mode
+              <InfoTooltip text="Formats transcript as Q&A with speaker labels." />
+            </label>
+            <label className={`option-item${optionsDisabled ? ' disabled' : ''}`}>
+              <input
+                type="checkbox"
+                checked={generateSubtitles}
+                onChange={handleSubtitlesChange}
+                disabled={optionsDisabled}
+              />
+              Generate subtitles
+              <InfoTooltip text="Generates an SRT subtitle file (SubRip Text) and a transcript file. Early-release: may have issues on recordings longer than 1 hour." />
+            </label>
+          </div>
         </div>
-      </div>
-
-      <div className="action-buttons">
-        {!isTranscribing ? (
-          <button
-            type="button"
-            className="transcribe-btn"
-            onClick={start}
-            disabled={!inputPath || !outputDir}
-            aria-label="Start transcription"
-          >
-            <FaMicrophone /> Transcribe
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="cancel-btn"
-            onClick={onCancel}
-            aria-label="Cancel transcription"
-          >
-            <FaTimesCircle /> Cancel
-          </button>
-        )}
       </div>
     </>
   );

@@ -15,10 +15,9 @@ const pythonCmd     = process.platform === 'win32' ? 'python' : 'python3';
 const scriptsDir    = isDev()
   ? path.join(process.cwd(), 'python')
   : path.join(process.resourcesPath, 'python');
-const preprocessPy  = path.join(scriptsDir, 'preprocess_to_png.py');
 const flashScript   = path.join(scriptsDir, 'image_transcribe.py');
 
-[preprocessPy, flashScript].forEach(p => {
+[flashScript].forEach(p => {
   if (!fs.existsSync(p)) {
     dialog.showErrorBox(
       'Missing script',
@@ -42,14 +41,23 @@ function runCommand(cmd: string, mode: string): Promise<string> {
 
 async function runSingleImage(mode: string, inputPath: string, outputDir: string): Promise<string> {
   const base = path.basename(inputPath, path.extname(inputPath));
-  const pngOut = path.join(outputDir, `${base}.png`);
+  
+  // Use app data directory for temp files, similar to Mistral
+  const appDataPath = app.getPath('userData');
+  const tempDir = path.join(appDataPath, 'temp');
+  
+  // Create collection-style temp directory name
+  const inputDir = path.dirname(inputPath);
+  const collectionName = path.basename(inputDir);
+  const tempCollectionDir = path.join(tempDir, `_temp${collectionName}_gemini`);
+  
+  // Ensure temp directory exists
+  await fs.promises.mkdir(tempCollectionDir, { recursive: true });
+  
+  const pngOut = path.join(tempCollectionDir, `${base}.png`);
   let result = '';
 
-  await runCommand(
-    `"${pythonCmd}" "${preprocessPy}" --simple "${inputPath}" "${outputDir}"`,
-    mode
-  );
-
+  // Preprocessing is now handled directly by image_transcribe.py
   result = await runCommand(
     `"${pythonCmd}" "${flashScript}" "${pngOut}" "${outputDir}"`,
     mode
@@ -75,8 +83,26 @@ export function registerImageHandlers() {
     const files = await fs.promises.readdir(folder);
     const imgs  = files.filter(f => VALID_EXTS.includes(path.extname(f).toLowerCase()));
     const results: Record<string,string> = {};
-    for (const f of imgs) {
+    const collectionName = path.basename(folder);
+    
+    for (let i = 0; i < imgs.length; i++) {
+      const f = imgs[i];
       try {
+        // Send progress update with Mistral-style format
+        const window = BrowserWindow.getAllWindows()[0];
+        const processed = i + 1;
+        const total = imgs.length;
+        const percentage = Math.round((processed / total) * 100);
+        
+        if (window) {
+          window.webContents.send('transcription-progress', 
+            `${collectionName} - images processed ${processed}/${total} (${percentage}%)`, 
+            processed, 
+            total, 
+            `Processing ${f}...`
+          );
+        }
+        
         await runSingleImage('image', path.join(folder, f), outputDir);
         results[f] = 'OK';
       } catch (err: any) {

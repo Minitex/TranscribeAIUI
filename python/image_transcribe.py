@@ -2,6 +2,7 @@
 """
 Transcribe a single image using Gemini API, with document context.
 Requires IMAGE_PROMPT environment variable; will abort if missing.
+Now includes built-in preprocessing for efficiency.
 """
 
 import os
@@ -9,18 +10,70 @@ import sys
 import time
 import argparse
 import logging
+import tempfile
+import subprocess
+from pathlib import Path
 import PIL.Image
 import google.generativeai as genai
+from appdirs import user_data_dir
+
+# Import cv2 with comprehensive error handling for PyInstaller compatibility
+try:
+    import cv2
+except ImportError as e:
+    print(f"[ERR] OpenCV not available: {e}")
+    print("[ERR] Please install opencv-python: pip install opencv-python")
+    sys.exit(1)
+except Exception as e:
+    print(f"[ERR] Error importing cv2: {e}")
+    sys.exit(1)
 
 # Configuration constants
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-VALID_EXTS = ('.png', '.jpg', '.jpeg', '.tif', '.tiff')
+VALID_EXTS = ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.pdf')
 
 # Context folder (optional)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONTEXT_FOLDER = os.path.join(SCRIPT_DIR, "OcrDocumentContext")
+
+
+def preprocess_image_to_png(input_path: str, temp_dir: str) -> str:
+    """
+    Convert input image to grayscale PNG format for processing using cv2.
+    Returns the path to the converted PNG file.
+    """
+    if not os.path.isfile(input_path):
+        raise RuntimeError(f"Input file not found: {input_path}")
+    
+    # Generate output filename
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    output_path = os.path.join(temp_dir, f"{base_name}.png")
+    
+    # If already PNG, still process it to ensure consistency
+    try:
+        # Use cv2 for image processing like the original working code
+        image = cv2.imread(input_path)
+        if image is None:
+            raise RuntimeError(f"Unable to load image: {input_path}")
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Ensure temp directory exists (should already exist from main logic)
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Write PNG directly to temp_dir
+        success = cv2.imwrite(output_path, gray)
+        if not success:
+            raise RuntimeError(f"Failed to write processed image: {output_path}")
+            
+        print(f"[OK] Page preprocessed {output_path}")
+        return output_path
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to preprocess {input_path}: {e}")
 
 
 def load_contexts():
@@ -115,26 +168,44 @@ def main():
     success = False
     for attempt in range(MAX_RETRIES):
         try:
-            with PIL.Image.open(input_path) as img:
-                response = model.generate_content([prompt, img], stream=True)
-                if not response:
-                    raise ValueError("No response from API")
+            # Create temp directory in app data folder, not system temp
+            # Get the input file's collection name for temp folder
+            input_dir = os.path.dirname(input_path)
+            collection_name = os.path.basename(input_dir)
+            
+            # Use app data directory structure like main.ts
+            app_data_path = user_data_dir("TranscribeAI")
+            temp_dir = os.path.join(app_data_path, "temp", f"_temp{collection_name}_images_gemini")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            try:
+                processed_image_path = preprocess_image_to_png(input_path, temp_dir)
+                
+                with PIL.Image.open(processed_image_path) as img:
+                    response = model.generate_content([prompt, img], stream=True)
+                    if not response:
+                        raise ValueError("No response from API")
 
-                with open(output_path, "w", encoding="utf-8") as out_f:
-                    for chunk in response:
-                        out_f.write(chunk.text)
+                    with open(output_path, "w", encoding="utf-8") as out_f:
+                        for chunk in response:
+                            out_f.write(chunk.text)
 
-            if os.path.getsize(output_path) > 0:
-                print(f"[OK] Transcription saved: {output_path}")
+                if os.path.getsize(output_path) > 0:
+                    print(f"[OK] Transcription saved: {output_path}")
+                    success = True
+                    break
+                else:
+                    raise ValueError("Empty transcription file")
+                    
+            finally:
+                # Clean up only the temp preprocessed file, NOT the original
                 try:
-                    os.remove(input_path)
-                    print(f"[OK] Removed temp image: {input_path}")
-                except Exception as e:
-                    print(f"[WARN] Failed to remove temp image: {e}")
-                success = True
-                break
-            else:
-                raise ValueError("Empty transcription file")
+                    if 'processed_image_path' in locals() and os.path.exists(processed_image_path):
+                        os.remove(processed_image_path)
+                        print(f"[OK] Cleaned up temp processed image: {processed_image_path}")
+                except Exception as cleanup_error:
+                    print(f"[WARN] Could not clean up temp processed image: {cleanup_error}")
+                    
         except Exception as e:
             print(f"[ERR] ERROR (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES - 1:

@@ -1,6 +1,10 @@
 python-dotenv
 Pillow
 google-generativeai
+mistralai
+httpx
+appdirs
 opencv-python
 jinja2
 pyinstaller
+imageio-ffmpeg
