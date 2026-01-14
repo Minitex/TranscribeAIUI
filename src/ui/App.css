@@ -36,7 +36,7 @@ body,
 .sidebar {
   position: relative;
   width: 275px;
-  min-width: 275px;
+  min-width: 300px;
   background: var(--bg-secondary);
   padding: 1rem;
   display: flex;
@@ -115,6 +115,38 @@ body,
   color: #f00;
 }
 
+.transcript-context-menu {
+  position: fixed;
+  min-width: 160px;
+  background: #1d1d2b;
+  border: 1px solid #333;
+  border-radius: 8px;
+  padding: 0.35rem;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+  z-index: 2000;
+}
+
+.transcript-context-item {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 0.45rem 0.6rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.transcript-context-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.transcript-context-item:disabled {
+  color: #777;
+  cursor: not-allowed;
+}
+
 .sidebar-resizer {
   position: absolute;
   top: 0;
@@ -147,7 +179,7 @@ body,
 .logo {
   font-size: 2.6rem;
   color: var(--accent);
-  margin: 0 auto 1.25rem;
+  margin: 1.25rem auto 0rem;
   text-align: center;
   user-select: none;
 }
@@ -302,6 +334,7 @@ body,
   align-items: center;
 }
 
+.logs-export,
 .logs-clear {
   border: 1px solid rgba(255, 255, 255, 0.2);
   background: rgba(255, 255, 255, 0.05);
@@ -316,6 +349,7 @@ body,
   transition: background 0.2s, border-color 0.2s;
 }
 
+.logs-export:hover,
 .logs-clear:hover {
   background: rgba(255, 255, 255, 0.12);
   border-color: var(--accent);
@@ -385,7 +419,7 @@ body,
   right: 1rem;
   background: var(--accent);
   color: #fff;
-  padding: 0.75rem 1rem;
+  padding: 0.15rem 0.75rem;
   border-radius: 4px;
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
   font-size: 0.95rem;
@@ -488,7 +522,7 @@ body,
 /* Settings gear (cog) */
 .settings-gear {
   position: absolute;
-  top: 1rem;
+  top: 0;
   right: 1rem;
   font-size: 1.6rem;
   color: var(--accent);

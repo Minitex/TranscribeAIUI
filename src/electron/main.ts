@@ -172,6 +172,14 @@ function transcriptPathFor(
   return path.join(outputDir, relFolder, `${base}.txt`);
 }
 
+function csvEscape(value: string): string {
+  const text = `${value ?? ''}`;
+  if (/[",\n]/.test(text)) {
+    return `"${text.replace(/"/g, '""')}"`;
+  }
+  return text;
+}
+
 // ── IPC HANDLERS ──────────────────────────────────────────────────────────────
 ipcMain.handle('open-external', (_e, url: string) => shell.openExternal(url));
 ipcMain.handle('get-app-version', () => app.getVersion());
@@ -206,6 +214,49 @@ ipcMain.handle('list-transcripts-subtitles', async (_e, folder: string) => {
     .map(f => ({ name: f, path: path.join(folder, f) }));
 });
 
+ipcMain.handle(
+  'export-transcript-list',
+  async (_e, payload: {
+    mode?: string;
+    items?: { name: string; confidence?: number; reason?: string }[];
+    filters?: Record<string, unknown>;
+  }) => {
+    try {
+      const items = Array.isArray(payload?.items) ? payload?.items : [];
+      if (!items.length) {
+        return { canceled: true, error: 'No files to export' };
+      }
+      const modeLabel = (payload?.mode || 'transcripts').trim() || 'transcripts';
+      const defaultName = `transcribeai-${modeLabel}-list.csv`;
+      const { canceled, filePath } = await dialog.showSaveDialog({
+        defaultPath: path.join(app.getPath('downloads'), defaultName),
+        filters: [{ name: 'CSV', extensions: ['csv'] }]
+      });
+      if (canceled || !filePath) return { canceled: true };
+      const lines: string[] = [];
+      if (payload?.filters && typeof payload.filters === 'object') {
+        const filterLine = `# export_filters=${JSON.stringify(payload.filters)}`;
+        lines.push(filterLine);
+      }
+      lines.push('name,confidence,reason');
+      for (const item of items) {
+        const name = csvEscape(item?.name ?? '');
+        const confidence = csvEscape(
+          item?.confidence === undefined || item?.confidence === null
+            ? ''
+            : String(item.confidence)
+        );
+        const reason = csvEscape(item?.reason ?? '');
+        lines.push(`${name},${confidence},${reason}`);
+      }
+      await fs.promises.writeFile(filePath, `${lines.join('\n')}\n`, 'utf-8');
+      return { canceled: false, filePath, count: items.length };
+    } catch (error: any) {
+      return { canceled: true, error: error?.message || String(error) };
+    }
+  }
+);
+
 ipcMain.handle('open-transcript', (_e, file: string) => shell.openPath(file));
 
 ipcMain.handle('read-logs', async (_e, mode: string) => {
@@ -219,6 +270,32 @@ ipcMain.handle('read-logs', async (_e, mode: string) => {
 ipcMain.handle('clear-logs', (_e, mode: string) =>
   fs.promises.writeFile(getLogPath(mode), '', 'utf-8')
 );
+
+ipcMain.handle('export-logs', async (_e, payload: { mode?: string }) => {
+  try {
+    const mode = (payload?.mode || 'logs').trim() || 'logs';
+    let content = '';
+    try {
+      content = await fs.promises.readFile(getLogPath(mode), 'utf-8');
+    } catch {
+      content = '';
+    }
+    if (!content) {
+      return { canceled: true, error: 'No logs to export' };
+    }
+    const defaultName = `transcribeai-${mode}-logs.txt`;
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      defaultPath: path.join(app.getPath('downloads'), defaultName),
+      filters: [{ name: 'Text', extensions: ['txt', 'log'] }]
+    });
+    if (canceled || !filePath) return { canceled: true };
+    await fs.promises.writeFile(filePath, content, 'utf-8');
+    const count = content.split(/\r?\n/).filter(Boolean).length;
+    return { canceled: false, filePath, count };
+  } catch (error: any) {
+    return { canceled: true, error: error?.message || String(error) };
+  }
+});
 
 ipcMain.handle('clear-temp-files', async () => {
   try {
@@ -301,7 +378,7 @@ ipcMain.handle('delete-transcript', async (_e, filePath: string) => {
   }
 });
 
-// ── Updated run-transcription to pass flags to Python ──────────────────────────
+// ── Updated run-transcription to pass flags ──────────────────────────
 ipcMain.handle(
   'run-transcription',
   async (_e,
@@ -326,16 +403,20 @@ ipcMain.handle(
       }
     } catch {}
 
-    const apiKey = (store.get('apiKey') || '').trim();
-    if (!apiKey) throw new Error('API key not set. Please enter it in Settings.');
-    process.env.GOOGLE_API_KEY = apiKey;
-
     const win = BrowserWindow.getAllWindows()[0];
     const modelName = mode === 'audio'
       ? (store.get('audioModel') as string)
       : (store.get('imageModel') as string);
+    const useMistral = mode !== 'audio' && modelName?.toLowerCase().includes('mistral');
+    let geminiApiKey = '';
 
     if (mode === 'audio') {
+      geminiApiKey = (store.get('apiKey') || '').trim();
+      if (!geminiApiKey) {
+        throw new Error('Gemini API key not set. Please enter it in Settings.');
+      }
+      process.env.GOOGLE_API_KEY = geminiApiKey;
+
       const rawAudioPrompt = (promptArg || (store.get('audioPrompt') as string) || '').trim();
       if (!rawAudioPrompt) {
         const msg = 'Audio prompt not set. Aborting transcription.';
@@ -387,7 +468,7 @@ ipcMain.handle(
           await transcribeAudioGemini(file, {
             outputDir,
             modelName,
-            apiKey,
+            apiKey: geminiApiKey,
             rawPrompt: rawAudioPrompt,
             interviewMode,
             subtitles: generateSubtitles,
@@ -415,7 +496,6 @@ ipcMain.handle(
     } else {
       const imageModel = modelName || 'gemini-2.5-flash';
       const rawImagePrompt = ((store.get('imagePrompt') as string) || '').trim();
-      const useMistral = imageModel.toLowerCase().includes('mistral');
       const recursiveSelected = Boolean(extraOptions?.recursive);
       const batchSelected = Boolean(extraOptions?.batch);
       const batchSize = extraOptions?.batchSize || 10;
@@ -424,19 +504,19 @@ ipcMain.handle(
         const msg = 'Image prompt not set. Aborting transcription.';
         await fs.promises.appendFile(getLogPath('image'), `[ERR] ${msg}\n`);
         throw new Error(msg);
-          }
-          await fs.promises.appendFile(getLogPath('image'), `[INFO] Starting image transcription (${modelName})\n`, 'utf-8');
-          const appTempDir = path.join(app.getPath('userData'), 'temp');
-          await fs.promises.mkdir(appTempDir, { recursive: true }).catch(() => {});
-          if (!useMistral) {
-            const cacheDir = path.join(appTempDir, 'gemini_cache');
-            await fs.promises.mkdir(cacheDir, { recursive: true }).catch(() => {});
-            await fs.promises.appendFile(getLogPath('image'), `[INFO] Gemini temp images will be cached at: ${cacheDir}\n`, 'utf-8').catch(() => {});
-          } else {
-            const cacheDir = path.join(appTempDir, 'mistral_cache');
-            await fs.promises.mkdir(cacheDir, { recursive: true }).catch(() => {});
-            await fs.promises.appendFile(getLogPath('image'), `[INFO] Mistral temp images will be cached at: ${cacheDir}\n`, 'utf-8').catch(() => {});
-          }
+      }
+      await fs.promises.appendFile(getLogPath('image'), `[INFO] Starting image transcription (${modelName})\n`, 'utf-8');
+      const appTempDir = path.join(app.getPath('userData'), 'temp');
+      await fs.promises.mkdir(appTempDir, { recursive: true }).catch(() => {});
+      if (!useMistral) {
+        const cacheDir = path.join(appTempDir, 'gemini_cache');
+        await fs.promises.mkdir(cacheDir, { recursive: true }).catch(() => {});
+        await fs.promises.appendFile(getLogPath('image'), `[INFO] Gemini temp images will be cached at: ${cacheDir}\n`, 'utf-8').catch(() => {});
+      } else {
+        const cacheDir = path.join(appTempDir, 'mistral_cache');
+        await fs.promises.mkdir(cacheDir, { recursive: true }).catch(() => {});
+        await fs.promises.appendFile(getLogPath('image'), `[INFO] Mistral temp images will be cached at: ${cacheDir}\n`, 'utf-8').catch(() => {});
+      }
 
       const stat = await fs.promises.stat(inputPath);
 
@@ -630,6 +710,12 @@ ipcMain.handle(
         return `[OK] Processed ${workFiles.length} file(s) via Mistral OCR`;
       }
 
+      geminiApiKey = (store.get('apiKey') || '').trim();
+      if (!geminiApiKey) {
+        throw new Error('Gemini API key not set. Please enter it in Settings.');
+      }
+      process.env.GOOGLE_API_KEY = geminiApiKey;
+
       const rawPrompt = rawImagePrompt;
       const imageExtRe = /\.(png|jpe?g|tif{1,2})$/i;
       let files: string[];
@@ -723,9 +809,9 @@ ipcMain.handle(
           if (shouldUpdateProgress) {
             win.webContents.send('transcription-progress', progressLabel, processed, files.length, `Transcribing ${name}...`);
           }
-          // Call Gemini directly from TypeScript (no Python wrapper)
+          // Call Gemini directly from TypeScript
           try {
-            const out = await transcribeImageGemini(file, rawPrompt, imageModel, apiKey, {
+            const out = await transcribeImageGemini(file, rawPrompt, imageModel, geminiApiKey, {
               cacheDir: path.join(app.getPath('userData'), 'temp', 'gemini_cache'),
               tempRoot: path.join(app.getPath('userData'), 'temp'),
               logger: async (msg: string) => {

@@ -177,7 +177,7 @@ async function uploadAndTranscribe(
     displayName: path.basename(filePath)
   });
 
-  // Wait for the uploaded file to be marked ACTIVE (parity with python flow)
+  // Wait for the uploaded file to be marked ACTIVE
   const uploadedName =
     uploadResp?.file?.name ||
     (uploadResp as any)?.file?.id ||

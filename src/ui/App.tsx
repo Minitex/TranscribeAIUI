@@ -18,6 +18,8 @@ import {
   FaTrash,
   FaInfoCircle,
   FaSync,
+  FaDownload,
+  FaCopy,
 } from 'react-icons/fa';
 import './App.css';
 
@@ -39,6 +41,8 @@ const IMAGE_MODEL_OPTIONS = [
   'gemini-2.0-flash',
   'mistral-ocr-latest'
 ];
+
+const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.gif', '.pdf'];
 
 type QualityEntry = {
   confidence: number;
@@ -68,7 +72,7 @@ type ScanResultEntry = {
 type SortOption = 'name-asc' | 'name-desc' | 'confidence-desc' | 'confidence-asc';
 
 type PathPickerTarget = {
-  target: 'audio-input' | 'audio-output' | 'image-input' | 'image-output';
+  target: 'audio-input' | 'audio-output' | 'image-input' | 'image-output' | 'copy-images';
   allowFiles: boolean;
 };
 
@@ -705,6 +709,39 @@ function sortTranscripts(list: Transcript[]): Transcript[] {
   );
 }
 
+function resolveImageForTranscript(transcriptName: string, imageInputPath: string): string | null {
+  if (!imageInputPath) return null;
+  let baseDir = imageInputPath;
+  try {
+    if (fs.statSync(imageInputPath).isFile()) {
+      baseDir = pathModule.dirname(imageInputPath);
+    }
+  } catch {
+    return null;
+  }
+  const nameNoExt = transcriptName.replace(/\.(txt|srt)$/i, '');
+  const directCandidate = pathModule.join(baseDir, nameNoExt);
+  if (fs.existsSync(directCandidate)) return directCandidate;
+  for (const ext of IMAGE_EXTS) {
+    const candidate = pathModule.join(baseDir, `${nameNoExt}${ext}`);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function ensureUniquePath(destDir: string, baseName: string): string {
+  const ext = pathModule.extname(baseName);
+  const stem = ext ? baseName.slice(0, -ext.length) : baseName;
+  let candidate = pathModule.join(destDir, baseName);
+  let counter = 1;
+  while (fs.existsSync(candidate)) {
+    const nextName = `${stem}_${counter}${ext}`;
+    candidate = pathModule.join(destDir, nextName);
+    counter += 1;
+  }
+  return candidate;
+}
+
 // ─── Main App ───────────────────────────────────────────────────────────────────
 export default function App() {
   const isSettings = window.location.hash === '#/settings';
@@ -748,6 +785,11 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [showLogs, setShowLogs] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    transcript: Transcript;
+  } | null>(null);
   const [pathPicker, setPathPicker] = useState<PathPickerTarget | null>(null);
   const [fileTypeFilter, setFileTypeFilter] = useState<'all' | 'transcript' | 'subtitle'>('all');
   const [issueFilter, setIssueFilter] = useState<'all' | 'clean' | 'issues'>('all');
@@ -981,6 +1023,8 @@ export default function App() {
           return imageInputPath || imageOutputDir || os.homedir();
         case 'image-output':
           return imageOutputDir || imageInputPath || os.homedir();
+        case 'copy-images':
+          return imageOutputDir || imageInputPath || os.homedir();
         default:
           return os.homedir();
       }
@@ -1169,7 +1213,7 @@ export default function App() {
     [mode, audioTranscripts, imageTranscripts]
   );
 
-  // Handler to scan placeholder percentages via Python script
+  // Handler to scan placeholder percentages
   const scanQuality = useCallback(async () => {
     const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
     if (!dir) return;
@@ -1321,6 +1365,47 @@ export default function App() {
     });
   }, [audioTranscripts, imageTranscripts, mode]);
 
+  const clearTranscriptWarnings = useCallback((name: string) => {
+    setQualityScores(prev => {
+      const entry = prev[name];
+      if (!entry || !entry.issues || !entry.issues.length) return prev;
+      return { ...prev, [name]: { ...entry, issues: undefined } };
+    });
+    setScanResults(prev =>
+      prev.map(entry => (entry.file === name ? { ...entry, issues: undefined } : entry))
+    );
+  }, []);
+
+  const closeContextMenu = useCallback(() => setContextMenu(null), []);
+
+  const onTranscriptContextMenu = useCallback(
+    (event: React.MouseEvent, transcript: Transcript) => {
+      event.preventDefault();
+      setContextMenu({
+        x: event.clientX,
+        y: event.clientY,
+        transcript
+      });
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const handleClick = () => setContextMenu(null);
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setContextMenu(null);
+    };
+    window.addEventListener('click', handleClick);
+    window.addEventListener('scroll', handleClick, true);
+    window.addEventListener('keydown', handleKey);
+    return () => {
+      window.removeEventListener('click', handleClick);
+      window.removeEventListener('scroll', handleClick, true);
+      window.removeEventListener('keydown', handleKey);
+    };
+  }, [contextMenu]);
+
   const canRemediate = useMemo(
     () =>
       scanResults.some(
@@ -1415,6 +1500,89 @@ export default function App() {
     setShowLogs(s => !s);
   }, []);
 
+  const currentList = mode === 'audio' ? audioTranscripts : imageTranscripts;
+  const nameFilter = filter.toLowerCase();
+  const filtered = [...currentList]
+    .filter(t => t.name.toLowerCase().includes(nameFilter))
+    .filter(t => {
+      if (fileTypeFilter === 'all') return true;
+      const isSubtitle = t.name.toLowerCase().endsWith('.srt');
+      return fileTypeFilter === 'subtitle' ? isSubtitle : !isSubtitle;
+    })
+    .filter(t => {
+      if (issueFilter === 'all') return true;
+      const entry = qualityScores[t.name];
+      if (!entry) return false;
+      const hasIssues = Boolean(entry.issues && entry.issues.length);
+      return issueFilter === 'issues' ? hasIssues : !hasIssues;
+    })
+    .sort((a, b) => {
+      switch (sortOption) {
+        case 'name-asc':
+          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        case 'name-desc':
+          return b.name.localeCompare(a.name, undefined, { numeric: true, sensitivity: 'base' });
+        case 'confidence-asc': {
+          const aScore = qualityScores[a.name]?.confidence ?? Number.POSITIVE_INFINITY;
+          const bScore = qualityScores[b.name]?.confidence ?? Number.POSITIVE_INFINITY;
+          if (aScore !== bScore) return aScore - bScore;
+          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        }
+        case 'confidence-desc': {
+          const aScore = qualityScores[a.name]?.confidence ?? Number.NEGATIVE_INFINITY;
+          const bScore = qualityScores[b.name]?.confidence ?? Number.NEGATIVE_INFINITY;
+          if (aScore !== bScore) return bScore - aScore;
+          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        }
+        default:
+          return 0;
+      }
+    });
+
+  const copyImagesToDestination = useCallback(
+    async (destDir: string) => {
+      try {
+        const sourcePaths = filtered.map(item => item.path);
+        if (!sourcePaths.length) {
+          setToast('No files found for the current list.');
+          setTimeout(() => setToast(null), 6000);
+          return;
+        }
+        let copied = 0;
+        let skipped = 0;
+        for (const src of sourcePaths) {
+          try {
+            const target = ensureUniquePath(destDir, pathModule.basename(src));
+            await fs.promises.copyFile(src, target);
+            copied += 1;
+          } catch {
+            skipped += 1;
+          }
+        }
+        const parts = [`Copied ${copied} file${copied === 1 ? '' : 's'}`];
+        if (skipped) parts.push(`${skipped} skipped`);
+        setToast(parts.join(' • '));
+        setTimeout(() => setToast(null), 6000);
+      } catch (error: any) {
+        setToast(`❌ Copy failed: ${error?.message || error}`);
+        setTimeout(() => setToast(null), 6000);
+      }
+    },
+    [filtered, imageInputPath]
+  );
+
+  const copyImagesToFolder = useCallback(() => {
+    if (!filtered.length) {
+      setToast('No files to copy');
+      setTimeout(() => setToast(null), 6000);
+      return;
+    }
+    setPathPicker({
+      target: 'copy-images',
+      allowFiles: false
+    });
+  }, [filtered, imageInputPath]);
+
   const handlePathPickerSelect = useCallback(
     async (selection: { path: string; isDirectory: boolean }) => {
       if (!pathPicker) return;
@@ -1434,12 +1602,16 @@ export default function App() {
           if (!selection.isDirectory) return;
           await applyOutputSelection(selection.path, 'image');
           break;
+        case 'copy-images':
+          if (!selection.isDirectory) return;
+          await copyImagesToDestination(selection.path);
+          break;
         default:
           break;
       }
       setPathPicker(null);
     },
-    [applyOutputSelection, pathPicker]
+    [applyOutputSelection, copyImagesToDestination, pathPicker]
   );
 
   const closePathPicker = useCallback(() => setPathPicker(null), []);
@@ -1554,49 +1726,137 @@ export default function App() {
   }, []);
 
   const openTranscript = useCallback((p: string) => ipcRenderer.invoke('open-transcript', p), []);
+  const openImageForTranscript = useCallback(
+    async (transcript: Transcript) => {
+      if (!imageInputPath) {
+        setToast('Set an image input folder first.');
+        setTimeout(() => setToast(null), 6000);
+        return;
+      }
+      const imagePath = resolveImageForTranscript(transcript.name, imageInputPath);
+      if (!imagePath) {
+        setToast(`No matching image found for ${transcript.name}`);
+        setTimeout(() => setToast(null), 6000);
+        return;
+      }
+      try {
+        const err = await ipcRenderer.invoke('open-transcript', imagePath);
+        if (err) {
+          setToast(`❌ ${err}`);
+          setTimeout(() => setToast(null), 6000);
+        }
+      } catch (error: any) {
+        setToast(`❌ Failed to open image: ${error?.message || error}`);
+        setTimeout(() => setToast(null), 6000);
+      }
+    },
+    [imageInputPath]
+  );
   const clearLogs = useCallback(async () => {
     await ipcRenderer.invoke('clear-logs', mode);
     setLogs('');
   }, [mode]);
-
-  const currentList = mode === 'audio' ? audioTranscripts : imageTranscripts;
-  const nameFilter = filter.toLowerCase();
-  const filtered = [...currentList]
-    .filter(t => t.name.toLowerCase().includes(nameFilter))
-    .filter(t => {
-      if (fileTypeFilter === 'all') return true;
-      const isSubtitle = t.name.toLowerCase().endsWith('.srt');
-      return fileTypeFilter === 'subtitle' ? isSubtitle : !isSubtitle;
-    })
-    .filter(t => {
-      if (issueFilter === 'all') return true;
-      const entry = qualityScores[t.name];
-      if (!entry) return false;
-      const hasIssues = Boolean(entry.issues && entry.issues.length);
-      return issueFilter === 'issues' ? hasIssues : !hasIssues;
-    })
-    .sort((a, b) => {
-      switch (sortOption) {
-        case 'name-asc':
-          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        case 'name-desc':
-          return b.name.localeCompare(a.name, undefined, { numeric: true, sensitivity: 'base' });
-        case 'confidence-asc': {
-          const aScore = qualityScores[a.name]?.confidence ?? Number.POSITIVE_INFINITY;
-          const bScore = qualityScores[b.name]?.confidence ?? Number.POSITIVE_INFINITY;
-          if (aScore !== bScore) return aScore - bScore;
-          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        }
-        case 'confidence-desc': {
-          const aScore = qualityScores[a.name]?.confidence ?? Number.NEGATIVE_INFINITY;
-          const bScore = qualityScores[b.name]?.confidence ?? Number.NEGATIVE_INFINITY;
-          if (aScore !== bScore) return bScore - aScore;
-          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        }
-        default:
-          return 0;
+  const exportLogs = useCallback(async () => {
+    if (!logs || !logs.trim()) {
+      setToast('No logs to export');
+      setTimeout(() => setToast(null), 6000);
+      return;
+    }
+    try {
+      const result = await ipcRenderer.invoke('export-logs', { mode }) as {
+        canceled?: boolean;
+        filePath?: string;
+        count?: number;
+        error?: string;
+      };
+      if (result?.canceled) return;
+      if (result?.error) {
+        setToast(`❌ ${result.error}`);
+        setTimeout(() => setToast(null), 6000);
+        return;
       }
-    });
+      const count = result?.count;
+      setToast(
+        typeof count === 'number'
+          ? `Exported ${count} log line${count === 1 ? '' : 's'}`
+          : 'Exported logs'
+      );
+      setTimeout(() => setToast(null), 6000);
+    } catch (error: any) {
+      setToast(`❌ Export failed: ${error?.message || error}`);
+      setTimeout(() => setToast(null), 6000);
+    }
+  }, [logs, mode]);
+
+  const contextIssues = contextMenu
+    ? qualityScores[contextMenu.transcript.name]?.issues
+    : undefined;
+  const canClearContextWarning = Boolean(contextIssues && contextIssues.length);
+  const canViewContextImage = Boolean(imageInputPath);
+
+  const exportTranscriptList = useCallback(async () => {
+    if (!filtered.length) {
+      setToast('No files to export');
+      setTimeout(() => setToast(null), 6000);
+      return;
+    }
+    try {
+      const outputDir = mode === 'audio' ? audioOutputDir : imageOutputDir;
+      const result = await ipcRenderer.invoke('export-transcript-list', {
+        mode,
+        items: filtered.map(item => {
+          const entry = qualityScores[item.name];
+          const confidence = entry?.confidence;
+          const issues = entry?.issues?.length ? entry.issues.join('; ') : '';
+          return {
+            name: item.name,
+            confidence,
+            reason: issues
+          };
+        }),
+        filters: {
+          mode,
+          outputDir,
+          search: filter,
+          fileType: fileTypeFilter,
+          issues: issueFilter,
+          sort: sortOption,
+          total: currentList.length,
+          exported: filtered.length
+        }
+      }) as { canceled?: boolean; filePath?: string; count?: number; error?: string };
+      if (result?.canceled) return;
+      if (result?.error) {
+        setToast(`❌ ${result.error}`);
+        setTimeout(() => setToast(null), 6000);
+        return;
+      }
+      const count = result?.count ?? filtered.length;
+      setToast(`Exported ${count} file${count === 1 ? '' : 's'}`);
+      setTimeout(() => setToast(null), 6000);
+    } catch (error: any) {
+      setToast(`❌ Export failed: ${error?.message || error}`);
+      setTimeout(() => setToast(null), 6000);
+    }
+  }, [
+    filtered,
+    mode,
+    filter,
+    fileTypeFilter,
+    issueFilter,
+    sortOption,
+    currentList.length,
+    audioOutputDir,
+    imageOutputDir,
+    qualityScores
+  ]);
+
+  const resetFilters = useCallback(() => {
+    setFilter('');
+    setFileTypeFilter('all');
+    setIssueFilter('all');
+    setSortOption('name-asc');
+  }, []);
 
   if (isSettings) {
     return (
@@ -1618,7 +1878,7 @@ export default function App() {
 
   return (
     <div className={`app-shell${isResizing ? ' resizing' : ''}`}>
-      <div style={{ position: 'fixed', top: 12, right: 12, zIndex: 20 }}>
+      <div style={{ position: 'fixed', top: 50, right: 12, zIndex: 20 }}>
         <FaCog className="settings-gear" onClick={() => ipcRenderer.invoke('open-settings')} />
         {newVersionAvailable && (
           <span
@@ -1752,17 +2012,40 @@ export default function App() {
                 border: '1px solid rgba(255,255,255,0.08)'
               }}
             >
-              <input
-                className="filter-input"
-                placeholder="Filter transcripts, subtitles…"
-                value={filter}
-                onChange={e => setFilter(e.target.value)}
-                style={{ width: '100%' }}
-              />
+              <div style={{ display: 'flex', alignItems: 'stretch', gap: '0.5rem' }}>
+                <input
+                  className="filter-input"
+                  placeholder="Filter transcripts, subtitles…"
+                  value={filter}
+                  onChange={e => setFilter(e.target.value)}
+                  style={{ width: '100%', marginBottom: 0, height: '32px' }}
+                />
+                <button
+                  type="button"
+                  onClick={resetFilters}
+                  title="Reset filters and sorting to defaults"
+                  aria-label="Reset filters and sorting to defaults"
+                  style={{
+                    padding: 0,
+                    background: 'rgba(255,255,255,0.06)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    borderRadius: '4px',
+                    color: 'var(--text-light)',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    height: '32px',
+                    width: '32px'
+                  }}
+                >
+                  <FaUndo size={14} />
+                </button>
+              </div>
               <div
                 style={{
                   display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                  gridTemplateColumns: '1fr',
                   gap: '0.75rem'
                 }}
               >
@@ -1815,7 +2098,7 @@ export default function App() {
           padding: '0.75rem 0',
           borderTop: '1px solid rgba(255,255,255,0.08)',
           marginTop: '0.75rem',
-          gap: '0.5rem'
+          gap: '0.25rem'
         }}>
           <span style={{
             fontSize: '0.9rem',
@@ -1846,8 +2129,28 @@ export default function App() {
           >
             <FaSync size={12} />
           </button>
+          <span style={{ marginLeft: 'auto' }} />
+          <button
+            className="btn"
+            onClick={exportTranscriptList}
+            style={{
+              padding: '0.4rem 0.6rem',
+              fontSize: '0.85rem',
+              background: 'rgba(255,255,255,0.1)',
+              border: '1px solid rgba(255,255,255,0.2)',
+              borderRadius: '6px',
+              color: 'var(--text)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.3rem',
+              transition: 'all 0.2s ease'
+            }}
+            title="Export this list as CSV"
+          >
+            <FaDownload size={12} /> Export
+          </button>
         </div>
-        
         <ul className="transcript-list">
           {filtered.map(t => {
             const entry = qualityScores[t.name];
@@ -1869,7 +2172,11 @@ export default function App() {
               );
             }
             return (
-              <li key={t.path} className="transcript-item">
+              <li
+                key={t.path}
+                className="transcript-item"
+                onContextMenu={(event) => onTranscriptContextMenu(event, t)}
+              >
                 <div className="transcript-main">
                   {issueSummary && (
                     <span
@@ -1898,6 +2205,58 @@ export default function App() {
             );
           })}
         </ul>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: '0.75rem' }}>
+          <button
+            className="btn"
+            onClick={copyImagesToFolder}
+            style={{
+              padding: '0.6rem 0.8rem',
+              width: '100%',
+              fontSize: '0.85rem',
+              background: 'rgba(255,255,255,0.1)',
+              border: '1px solid rgba(255,255,255,0.2)',
+              borderRadius: '6px',
+              color: 'var(--text)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: '0.4rem',
+              transition: 'all 0.2s ease'
+            }}
+            title="Copy the files shown in this list to a folder you choose"
+          >
+            <FaCopy size={12} /> Copy to Folder
+          </button>
+        </div>
+        {contextMenu && (
+          <div
+            className="transcript-context-menu"
+            style={{ top: contextMenu.y, left: contextMenu.x }}
+            role="menu"
+          >
+            <button
+              className="transcript-context-item"
+              onClick={() => {
+                openImageForTranscript(contextMenu.transcript);
+                closeContextMenu();
+              }}
+              disabled={!canViewContextImage}
+            >
+              View image
+            </button>
+            <button
+              className="transcript-context-item"
+              onClick={() => {
+                clearTranscriptWarnings(contextMenu.transcript.name);
+                closeContextMenu();
+              }}
+              disabled={!canClearContextWarning}
+            >
+              Clear warning
+            </button>
+          </div>
+        )}
         <div className="sidebar-resizer" onMouseDown={onMouseDown} />
       </aside>
 
@@ -1976,6 +2335,17 @@ export default function App() {
                 {showLogs ? <FaChevronUp /> : <FaChevronDown />}
               </span>
               <button
+                className="logs-export"
+                onClick={e => {
+                  e.stopPropagation();
+                  exportLogs();
+                }}
+                title="Export logs"
+                aria-label="Export logs"
+              >
+                <FaDownload />
+              </button>
+              <button
                 className="logs-clear"
                 onClick={e => {
                   e.stopPropagation();
@@ -2002,7 +2372,8 @@ export default function App() {
               'audio-input': 'Select Audio Input',
               'audio-output': 'Select Audio Output Folder',
               'image-input': 'Select Image Input',
-              'image-output': 'Select Image Output Folder'
+              'image-output': 'Select Image Output Folder',
+              'copy-images': 'Select Destination Folder'
             }[pathPicker.target]
           }
           allowFileSelection={pathPicker.allowFiles}

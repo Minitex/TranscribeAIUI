@@ -20,10 +20,9 @@
 
 ## Technologies
 
-- **Electron**: Main process for file I/O, spawning Python/CLI binaries, and IPC  
+- **Electron**: Main process for file I/O and IPC  
 - **React + TypeScript**: Renderer UI, bundled with Vite for fast HMR  
 - **Vite**: Modern build tool for instant feedback and optimized production builds  
-- **Python CLI**: Native binaries handle image prep & OCR  
 - **google-generativeai SDK**: Interfaces with LLMs for high-quality transcription  
 - **electron-store**: Simple JSON storage for your Gemini API key
 

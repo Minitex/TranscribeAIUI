@@ -170,7 +170,16 @@ function looksLikeIntro(segment: string): boolean {
   const hasTranscriptionWord = ['transcription', 'transcribe', 'transcribed'].some(w => lower.includes(w));
   const hasTextContext = ['text from the image', 'text from this image', 'the text from the', 'the text of the'].some(w => lower.includes(w));
   const hasColon = lower.endsWith(':');
-  if (!(hasTranscriptionWord || hasTextContext || hasColon)) return false;
+  const hasShortColonLead =
+    hasColon &&
+    trimmed.length <= 60 &&
+    (lower.startsWith('here is') ||
+      lower.startsWith("here's") ||
+      lower.startsWith('this is') ||
+      lower.startsWith('your transcript') ||
+      lower.startsWith('transcription') ||
+      lower.startsWith('transcript'));
+  if (!(hasTranscriptionWord || hasTextContext || hasShortColonLead)) return false;
   if ([...tokens].some(t => INTRO_LEADS.has(t)) || ['here is', 'this is', 'your transcript', 'let me', 'allow me', 'i will', "i'm going to", 'providing you with', 'presenting'].some(p => lower.includes(p))) {
     return true;
   }

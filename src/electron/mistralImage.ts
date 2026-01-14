@@ -6,6 +6,16 @@ let currentController: AbortController | null = null;
 let currentReject: ((err: any) => void) | null = null;
 
 const SUPPORTED_EXTS = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.gif']);
+const MAX_ERROR_SNIPPET = 500;
+
+function sanitizeMistralErrorText(errText: string): string {
+  if (!errText) return '';
+  const trimmed = errText.trim();
+  if (!trimmed) return '';
+  const scrubbed = trimmed.replace(/[A-Za-z0-9+/=]{200,}/g, '[base64 omitted]');
+  if (scrubbed.length <= MAX_ERROR_SNIPPET) return scrubbed;
+  return `${scrubbed.slice(0, MAX_ERROR_SNIPPET)}…`;
+}
 
 function abortError() {
   const err: any = new Error('terminated by user');
@@ -229,7 +239,7 @@ async function uploadFileToMistral(
   });
 
   if (!resp.ok) {
-    const errText = await resp.text().catch(() => '');
+    const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
     const err: any = new Error(`Mistral file upload failed: ${resp.status} ${resp.statusText} ${errText}`);
     err.status = resp.status;
     throw err;
@@ -245,20 +255,51 @@ async function uploadFileToMistral(
 
 async function getSignedUrl(fileId: string, apiKey: string, signal?: AbortSignal): Promise<string> {
   if (signal?.aborted) throw abortError();
-  const resp = await fetch(`https://api.mistral.ai/v1/files/${fileId}/url`, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-    signal
-  });
-  if (!resp.ok) {
-    const errText = await resp.text().catch(() => '');
-    const err: any = new Error(`Mistral signed URL failed: ${resp.status} ${resp.statusText} ${errText}`);
-    err.status = resp.status;
-    throw err;
+  
+  const maxRetries = 3;
+  const baseDelayMs = 1000;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    if (signal?.aborted) throw abortError();
+    
+    try {
+      const resp = await fetch(`https://api.mistral.ai/v1/files/${fileId}/url`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal
+      });
+      
+      if (resp.ok) {
+        const json = await resp.json();
+        const url = json?.url;
+        if (!url) throw new Error('Mistral signed URL response missing url');
+        return url;
+      }
+      
+      if (resp.status === 404 && attempt < maxRetries - 1) {
+        const delay = baseDelayMs * Math.pow(2, attempt);
+        await sleep(delay, signal);
+        continue;
+      }
+      
+      const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
+      const err: any = new Error(`Mistral signed URL failed: ${resp.status} ${resp.statusText} ${errText}`);
+      err.status = resp.status;
+      throw err;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw error;
+      }
+      
+      if (attempt === maxRetries - 1) {
+        throw error;
+      }
+      
+      const delay = baseDelayMs * Math.pow(2, attempt);
+      await sleep(delay, signal);
+    }
   }
-  const json = await resp.json();
-  const url = json?.url;
-  if (!url) throw new Error('Mistral signed URL response missing url');
-  return url;
+  
+  throw new Error(`Failed to get signed URL after ${maxRetries} attempts`);
 }
 
 async function createBatchJob(
@@ -284,7 +325,7 @@ async function createBatchJob(
   });
 
   if (!resp.ok) {
-    const errText = await resp.text().catch(() => '');
+    const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
     const err: any = new Error(`Mistral batch job creation failed: ${resp.status} ${resp.statusText} ${errText}`);
     err.status = resp.status;
     throw err;
@@ -299,7 +340,7 @@ async function fetchBatchJob(jobId: string, apiKey: string, signal?: AbortSignal
     signal
   });
   if (!resp.ok) {
-    const errText = await resp.text().catch(() => '');
+    const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
     const err: any = new Error(`Mistral batch status failed: ${resp.status} ${resp.statusText} ${errText}`);
     err.status = resp.status;
     throw err;
@@ -314,7 +355,7 @@ async function downloadFileContent(fileId: string, apiKey: string, signal?: Abor
     signal
   });
   if (!resp.ok) {
-    const errText = await resp.text().catch(() => '');
+    const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
     const err: any = new Error(`Mistral file download failed: ${resp.status} ${resp.statusText} ${errText}`);
     err.status = resp.status;
     throw err;
@@ -366,7 +407,7 @@ export async function transcribeImageMistral(
       });
 
       if (!resp.ok) {
-        const errText = await resp.text().catch(() => '');
+        const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
         const err: any = new Error(`Mistral OCR failed: ${resp.status} ${resp.statusText} ${errText}`);
         err.status = resp.status;
         throw err;
@@ -517,6 +558,10 @@ export async function transcribeImageMistralBatch(
         await log(`Uploading ${path.basename(prep.filePath)}...`);
         const { id } = await uploadFileToMistral(prep.uploadPath, apiKey, 'ocr', useSignal);
         await log(`Uploaded ${path.basename(prep.filePath)} as ${id}`);
+        
+        // Small delay to allow Mistral to process the uploaded file before requesting signed URL
+        await sleep(500, useSignal);
+        
         const signedUrl = await getSignedUrl(id, apiKey, useSignal);
         uploads.push({
           customId: prep.customId,
