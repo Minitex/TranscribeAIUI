@@ -69,6 +69,8 @@ type ScanEntry = {
   placeholder_ratio: number;
   placeholder_count: number;
   token_count: number;
+  blank_transcript?: boolean;
+  non_whitespace_chars?: number;
   repetition_ratio: number;
   remove_intro_text?: string;
   remove_outro_text?: string;
@@ -81,6 +83,16 @@ type ScanEntry = {
 };
 
 export type ScanOutput = { all: ScanEntry[]; over?: ScanEntry[] };
+export type ScanProgress = {
+  processed: number;
+  total: number;
+  file: string;
+  blankCount: number;
+};
+
+export type ScanQualityOptions = {
+  onProgress?: (progress: ScanProgress) => void | Promise<void>;
+};
 
 function escapeForCharClass(str: string) {
   return str.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
@@ -380,6 +392,11 @@ function computePlaceholderStats(text: string) {
   return { ratio: count / total, count, total };
 }
 
+function countNonWhitespaceChars(text: string): number {
+  if (!text) return 0;
+  return text.replace(/\s+/g, '').length;
+}
+
 function computeRepetitionRatio(text: string): number {
   if (!text) return 0;
   const lines = text.split(/\r?\n/).map(ln => ln.trim().toLowerCase()).filter(Boolean);
@@ -419,18 +436,30 @@ function detectMarkdownArtifacts(text: string) {
   return artifacts;
 }
 
-export async function scanQualityFolder(folder: string, threshold?: number): Promise<ScanOutput> {
+export async function scanQualityFolder(
+  folder: string,
+  threshold?: number,
+  options: ScanQualityOptions = {}
+): Promise<ScanOutput> {
   const dirEntries = await fs.promises.readdir(folder).catch(() => []);
   const txtFiles = dirEntries.filter(f => f.toLowerCase().endsWith('.txt'));
   const all: ScanEntry[] = [];
   const over: ScanEntry[] = [];
+  const sortedFiles = txtFiles.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+  const totalFiles = sortedFiles.length;
+  let processed = 0;
+  let blankCount = 0;
 
-  for (const name of txtFiles.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }))) {
+  for (const name of sortedFiles) {
     const fullPath = path.join(folder, name);
     let text: string;
     try {
       text = await fs.promises.readFile(fullPath, 'utf-8');
     } catch {
+      processed += 1;
+      if (options.onProgress) {
+        await options.onProgress({ processed, total: totalFiles, file: name, blankCount });
+      }
       continue;
     }
     const markdownArtifacts = detectMarkdownArtifacts(text);
@@ -439,9 +468,13 @@ export async function scanQualityFolder(folder: string, threshold?: number): Pro
     const repetitionRatio = computeRepetitionRatio(cleaned);
     const aiFlags = detectAiBoilerplate(cleaned);
     const rareStats = computeRareTokenStats(cleaned);
+    const nonWhitespaceChars = countNonWhitespaceChars(cleaned);
+    const blankTranscript = nonWhitespaceChars === 0;
     const aiPenalty = aiFlags.length ? 0.05 : 0;
     const rarePenalty = Math.min(rareStats.ratio, 0.1);
-    const confidence = (1 - Math.min(1, placeholderStats.ratio + repetitionRatio + aiPenalty + rarePenalty)) * 100;
+    const confidence = blankTranscript
+      ? 0
+      : (1 - Math.min(1, placeholderStats.ratio + repetitionRatio + aiPenalty + rarePenalty)) * 100;
     const repetitionFlag = repetitionRatio >= 0.2;
 
     const entry: ScanEntry = {
@@ -450,8 +483,10 @@ export async function scanQualityFolder(folder: string, threshold?: number): Pro
       placeholder_ratio: Number(placeholderStats.ratio.toFixed(4)),
       placeholder_count: placeholderStats.count,
       token_count: placeholderStats.total,
+      non_whitespace_chars: nonWhitespaceChars,
       repetition_ratio: Number(repetitionRatio.toFixed(4))
     };
+    if (blankTranscript) entry.blank_transcript = true;
     if (introText) entry.remove_intro_text = trimChars(introText, LEADING_STRIP + TRAILING_STRIP);
     if (outroText) entry.remove_outro_text = trimChars(outroText, LEADING_STRIP + TRAILING_STRIP);
     if (repetitionFlag) entry.repetition_detected = true;
@@ -463,6 +498,9 @@ export async function scanQualityFolder(folder: string, threshold?: number): Pro
     }
 
     const issues: string[] = [];
+    if (blankTranscript) {
+      issues.push('Transcript appears blank (no readable text found)');
+    }
     if (introText?.trim()) {
       const snippet = introText.trim().replace(/\s+/g, ' ');
       issues.push(`Intro chatter detected: "${snippet.slice(0, 80)}${snippet.length > 80 ? '…' : ''}"`);
@@ -488,8 +526,13 @@ export async function scanQualityFolder(folder: string, threshold?: number): Pro
     if (issues.length) entry.issues = issues;
 
     all.push(entry);
+    if (blankTranscript) blankCount += 1;
     if (threshold != null && confidence <= threshold) {
       over.push(entry);
+    }
+    processed += 1;
+    if (options.onProgress) {
+      await options.onProgress({ processed, total: totalFiles, file: name, blankCount });
     }
   }
 

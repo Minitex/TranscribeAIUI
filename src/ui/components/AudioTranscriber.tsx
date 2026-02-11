@@ -16,6 +16,8 @@ interface AudioTranscriberProps {
   isTranscribing: boolean;
   onSelectInput(): void;
   onSelectOutput(): void;
+  onClearInput(): void;
+  onClearOutput(): void;
   onTranscribe(interviewMode: boolean, generateSubtitles: boolean): void;
   onCancel(): void;
 }
@@ -42,6 +44,8 @@ export default function AudioTranscriber({
   isTranscribing,
   onSelectInput,
   onSelectOutput,
+  onClearInput,
+  onClearOutput,
   onTranscribe,
   onCancel
 }: AudioTranscriberProps) {
@@ -72,24 +76,48 @@ export default function AudioTranscriber({
           <button type="button" onClick={onSelectInput} aria-label="Select input audio">
             <FaFileAudio />
           </button>
-          <input
-            readOnly
-            value={inputPath}
-            placeholder="Select audio file or folder…"
-            aria-label="Input audio path"
-          />
+          <div className="path-input-wrapper">
+            <input
+              readOnly
+              value={inputPath}
+              placeholder="Select audio file or folder…"
+              aria-label="Input audio path"
+            />
+            <button
+              type="button"
+              onClick={onClearInput}
+              aria-label="Clear input audio path"
+              disabled={!inputPath}
+              title="Clear input path"
+              className="clear-path-btn"
+            >
+              <FaTimesCircle />
+            </button>
+          </div>
         </div>
 
         <div className="field-row">
           <button type="button" onClick={onSelectOutput} aria-label="Select output folder">
             <FaFolderOpen />
           </button>
-          <input
-            readOnly
-            value={outputDir}
-            placeholder="Select output folder…"
-            aria-label="Output directory"
-          />
+          <div className="path-input-wrapper">
+            <input
+              readOnly
+              value={outputDir}
+              placeholder="Select output folder…"
+              aria-label="Output directory"
+            />
+            <button
+              type="button"
+              onClick={onClearOutput}
+              aria-label="Clear output folder"
+              disabled={!outputDir}
+              title="Clear output path"
+              className="clear-path-btn"
+            >
+              <FaTimesCircle />
+            </button>
+          </div>
         </div>
 
         <div className="options-row">

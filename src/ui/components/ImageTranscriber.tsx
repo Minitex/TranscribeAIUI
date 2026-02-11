@@ -3,9 +3,9 @@ import React from 'react';
 import {
   FaFileImage,
   FaFolderOpen,
+  FaListUl,
   FaMicrophone,
-  FaTimesCircle,
-  FaQuestionCircle
+  FaTimesCircle
 } from 'react-icons/fa';
 
 interface ImageTranscriberProps {
@@ -17,28 +17,25 @@ interface ImageTranscriberProps {
   batchEnabled: boolean;
   batchSize: number;
   inputIsDirectory: boolean;
+  batchStats: {
+    uploaded: number;
+    processing: number;
+    completed: number;
+    failed: number;
+    total: number;
+  } | null;
   onSelectInput(): void;
   onSelectOutput(): void;
+  onClearInput(): void;
+  onClearOutput(): void;
   onToggleRecursive(): void;
   onToggleBatch(): void;
   onBatchSizeChange(size: number): void;
+  onOpenBatchQueue(): void;
+  queueCollectionCount: number;
   onTranscribe(): void;
   onCancel(): void;
 }
-
-const InfoTooltip: React.FC<{ text: string }> = ({ text }) => {
-  const [visible, setVisible] = React.useState(false);
-  return (
-    <div
-      className="tooltip-wrapper"
-      onMouseEnter={() => setVisible(true)}
-      onMouseLeave={() => setVisible(false)}
-    >
-      <FaQuestionCircle size={14} />
-      {visible && <div className="tooltip-box">{text}</div>}
-    </div>
-  );
-};
 
 // Smart batch size increment/decrement logic
 const getBatchSizeIncrement = (currentSize: number): number => {
@@ -67,11 +64,16 @@ export default function ImageTranscriber({
   batchEnabled,
   batchSize,
   inputIsDirectory,
+  batchStats,
   onSelectInput,
   onSelectOutput,
+  onClearInput,
+  onClearOutput,
   onToggleRecursive,
   onToggleBatch,
   onBatchSizeChange,
+  onOpenBatchQueue,
+  queueCollectionCount,
   onTranscribe,
   onCancel
 }: ImageTranscriberProps) {
@@ -82,21 +84,45 @@ export default function ImageTranscriber({
           <button onClick={onSelectInput}>
             <FaFileImage />
           </button>
-          <input
-            readOnly
-            value={inputPath}
-            placeholder="Select image folder…"
-          />
+          <div className="path-input-wrapper">
+            <input
+              readOnly
+              value={inputPath}
+              placeholder="Select image folder…"
+            />
+            <button
+              type="button"
+              onClick={onClearInput}
+              aria-label="Clear image input path"
+              disabled={!inputPath}
+              title="Clear input path"
+              className="clear-path-btn"
+            >
+              <FaTimesCircle />
+            </button>
+          </div>
         </div>
         <div className="field-row">
           <button onClick={onSelectOutput}>
             <FaFolderOpen />
           </button>
-          <input
-            readOnly
-            value={outputDir}
-            placeholder="Select output folder…"
-          />
+          <div className="path-input-wrapper">
+            <input
+              readOnly
+              value={outputDir}
+              placeholder="Select output folder…"
+            />
+            <button
+              type="button"
+              onClick={onClearOutput}
+              aria-label="Clear image output folder"
+              disabled={!outputDir}
+              title="Clear output path"
+              className="clear-path-btn"
+            >
+              <FaTimesCircle />
+            </button>
+          </div>
         </div>
       </div>
 
@@ -126,75 +152,72 @@ export default function ImageTranscriber({
                 disabled={!inputIsDirectory || isTranscribing}
               />
               Batch mode
-              <InfoTooltip text="Process in batches within a folder." />
             </label>
             {batchEnabled && (
-              <div className="option-item batch-size-controls" style={{ opacity: inputIsDirectory ? 1 : 0.6 }}>
-                <span style={{ marginRight: '0.75rem', fontWeight: 500 }}>Batch size:</span>
-                <div style={{ 
-                  display: 'flex', 
-                  alignItems: 'center', 
-                  gap: '0.4rem',
-                  background: 'rgba(255,255,255,0.05)',
-                  padding: '0.3rem 0.5rem',
-                  borderRadius: '6px',
-                  border: '1px solid rgba(255,255,255,0.1)',
-                  height: '2.2rem'
-                }}>
-                  <button
-                    onClick={() => onBatchSizeChange(getPrevBatchSize(batchSize))}
-                    disabled={batchSize <= 10 || !inputIsDirectory || isTranscribing}
-                    style={{
-                      background: batchSize <= 10 ? 'rgba(255,255,255,0.1)' : 'var(--accent)',
-                      border: 'none',
-                      color: batchSize <= 10 ? 'rgba(255,255,255,0.5)' : '#fff',
-                      width: '1.6rem',
-                      height: '1.6rem',
-                      borderRadius: '4px',
-                      cursor: batchSize <= 10 ? 'not-allowed' : 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      fontWeight: 600,
-                      fontSize: '0.9rem',
-                      transition: 'all 0.2s ease'
-                    }}
-                  >
-                    −
-                  </button>
-                  <span style={{ 
-                    minWidth: '3.5rem', 
-                    textAlign: 'center', 
-                    display: 'inline-block',
-                    fontWeight: 600,
-                    fontSize: '0.9rem',
-                    color: 'var(--text-light)'
-                  }}>
-                    {batchSize}
-                  </span>
-                  <button
-                    onClick={() => onBatchSizeChange(getNextBatchSize(batchSize))}
-                    disabled={batchSize >= 500 || !inputIsDirectory || isTranscribing}
-                    style={{
-                      background: batchSize >= 500 ? 'rgba(255,255,255,0.1)' : 'var(--accent)',
-                      border: 'none',
-                      color: batchSize >= 500 ? 'rgba(255,255,255,0.5)' : '#fff',
-                      width: '1.6rem',
-                      height: '1.6rem',
-                      borderRadius: '4px',
-                      cursor: batchSize >= 500 ? 'not-allowed' : 'pointer',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      fontWeight: 600,
-                      fontSize: '0.9rem',
-                      transition: 'all 0.2s ease'
-                    }}
-                  >
-                    +
-                  </button>
+              <div className="batch-controls-inline" style={{ opacity: inputIsDirectory ? 1 : 0.6 }}>
+                <div className="batch-size-controls">
+                  <span className="batch-size-label">Size</span>
+                  <div className="batch-size-main">
+                    <button
+                      type="button"
+                      className="batch-step-btn"
+                      onClick={() => onBatchSizeChange(getPrevBatchSize(batchSize))}
+                      disabled={batchSize <= 10 || !inputIsDirectory || isTranscribing}
+                      aria-label="Decrease batch size"
+                    >
+                      −
+                    </button>
+                    <span className="batch-size-current">{batchSize}</span>
+                    <button
+                      type="button"
+                      className="batch-step-btn"
+                      onClick={() => onBatchSizeChange(getNextBatchSize(batchSize))}
+                      disabled={batchSize >= 500 || !inputIsDirectory || isTranscribing}
+                      aria-label="Increase batch size"
+                    >
+                      +
+                    </button>
+                  </div>
                 </div>
-                <InfoTooltip text="Processes a folder in batches (non-recursive). Adjust size to balance throughput vs. request size." />
+                {inputIsDirectory && (
+                  <div className="batch-mini-stats">
+                    <div className="batch-mini-stat">
+                      <span>Uploaded</span>
+                      <strong>{batchStats?.uploaded ?? 0}</strong>
+                    </div>
+                    <div className="batch-mini-stat">
+                      <span>Processing</span>
+                      <strong>{batchStats?.processing ?? 0}</strong>
+                    </div>
+                    <div className="batch-mini-stat">
+                      <span>Completed</span>
+                      <strong>{batchStats?.completed ?? 0}</strong>
+                    </div>
+                    {(batchStats?.failed ?? 0) > 0 && (
+                      <div className="batch-mini-stat failed">
+                        <span>Failed</span>
+                        <strong>{batchStats?.failed ?? 0}</strong>
+                      </div>
+                    )}
+                  </div>
+                )}
+                {inputIsDirectory && (
+                  <button
+                    type="button"
+                    className="batch-queue-open-btn"
+                    onClick={onOpenBatchQueue}
+                    disabled={isTranscribing}
+                    aria-label="Open saved Mistral batch queue"
+                  >
+                    <FaListUl className="batch-queue-icon" aria-hidden="true" />
+                    <span className="batch-queue-tooltip" role="tooltip">Open batch queue</span>
+                    {queueCollectionCount > 0 && (
+                      <span className="batch-queue-count-badge" aria-label={`${queueCollectionCount} saved collections`}>
+                        {queueCollectionCount > 99 ? '99+' : queueCollectionCount}
+                      </span>
+                    )}
+                  </button>
+                )}
               </div>
             )}
           </div>

@@ -2,8 +2,15 @@ import { app, BrowserWindow, ipcMain, dialog, shell, screen } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import { transcribeImageGemini, cancelGeminiRequest } from './geminiImage.js';
-import { transcribeImageMistral, transcribeImageMistralBatch, cancelMistralRequest, isMistralSupported } from './mistralImage.js';
-import { transcribeAudioGemini, cancelAudioRequest } from './audioTranscribe.js';
+import {
+  transcribeImageMistral,
+  submitMistralBatchJob,
+  fetchMistralBatchJobStatus,
+  downloadMistralBatchResults,
+  cancelMistralRequest,
+  isMistralSupported
+} from './mistralImage.js';
+import { transcribeAudioGemini, transcribeAudioMistral, cancelAudioRequest } from './audioTranscribe.js';
 import { scanQualityFolder } from './qualityCheck.js';
 import Store from 'electron-store';
 import { isDev } from './util.js';
@@ -22,6 +29,11 @@ interface StoreSchema {
   imagePrompt?: string;
   mistralApiKey?: string;
   folderFavorites?: string[];
+  audioInputPath?: string;
+  audioOutputDir?: string;
+  imageInputPath?: string;
+  imageOutputDir?: string;
+  activeMode?: 'audio' | 'image';
 }
 const store = new Store<StoreSchema>();
 
@@ -172,6 +184,257 @@ function transcriptPathFor(
   return path.join(outputDir, relFolder, `${base}.txt`);
 }
 
+interface MistralBatchJobRecord {
+  id: string;
+  inputPath: string;
+  outputDir: string;
+  modelName: string;
+  files: string[];
+  batchOrder: number;
+  createdAtMs: number;
+  status: string;
+  totalRequests: number;
+  succeededRequests: number;
+  failedRequests: number;
+  outputFileId: string | null;
+  lastProgressCount: number;
+  lastProgressAtMs: number;
+  writtenAtMs: number | null;
+  lastError: string | null;
+}
+
+interface MistralBatchStateFile {
+  version: number;
+  jobs: MistralBatchJobRecord[];
+}
+
+interface MistralBatchFolderStats {
+  inputPath: string;
+  uploaded: number;
+  processing: number;
+  completed: number;
+  failed: number;
+  total: number;
+}
+
+interface MistralBatchQueueRow extends MistralBatchFolderStats {
+  outputDir: string;
+  modelName: string;
+  oldestPendingStartMs: number | null;
+  checkBackAtMs: number | null;
+}
+
+const MISTRAL_BATCH_STATE_VERSION = 1;
+const MISTRAL_BATCH_AVG_COMPLETION_MS = 2 * 60 * 60 * 1000;
+
+function getMistralBatchStatePath(cacheDir: string): string {
+  return path.join(cacheDir, 'batch-jobs.json');
+}
+
+function normalizeTimestamp(value: unknown, fallback: number): number {
+  const num = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function normalizeCount(value: unknown): number {
+  const num = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(num) || num < 0) return 0;
+  return Math.floor(num);
+}
+
+function normalizeJobRecord(raw: any): MistralBatchJobRecord | null {
+  if (!raw || typeof raw !== 'object') return null;
+  if (typeof raw.id !== 'string' || !raw.id.trim()) return null;
+  if (typeof raw.inputPath !== 'string' || typeof raw.outputDir !== 'string') return null;
+  const createdAtMs = normalizeTimestamp(raw.createdAtMs, Date.now());
+  const lastProgressCount = normalizeCount(raw.lastProgressCount);
+  const totalRequests = Math.max(normalizeCount(raw.totalRequests), 0);
+  const succeededRequests = normalizeCount(raw.succeededRequests);
+  const failedRequests = normalizeCount(raw.failedRequests);
+  const lastProgressAtFallback = createdAtMs;
+  return {
+    id: raw.id.trim(),
+    inputPath: raw.inputPath,
+    outputDir: raw.outputDir,
+    modelName: typeof raw.modelName === 'string' ? raw.modelName : '',
+    files: Array.isArray(raw.files) ? raw.files.filter((item: unknown): item is string => typeof item === 'string') : [],
+    batchOrder: Math.max(normalizeCount(raw.batchOrder), 1),
+    createdAtMs,
+    status: typeof raw.status === 'string' ? raw.status : 'QUEUED',
+    totalRequests,
+    succeededRequests,
+    failedRequests,
+    outputFileId: typeof raw.outputFileId === 'string' && raw.outputFileId ? raw.outputFileId : null,
+    lastProgressCount,
+    lastProgressAtMs: normalizeTimestamp(raw.lastProgressAtMs, lastProgressAtFallback),
+    writtenAtMs: raw.writtenAtMs === null || raw.writtenAtMs === undefined
+      ? null
+      : normalizeTimestamp(raw.writtenAtMs, createdAtMs),
+    lastError: typeof raw.lastError === 'string' && raw.lastError ? raw.lastError : null
+  };
+}
+
+async function readMistralBatchState(cacheDir: string): Promise<MistralBatchStateFile> {
+  const statePath = getMistralBatchStatePath(cacheDir);
+  try {
+    const text = await fs.promises.readFile(statePath, 'utf-8');
+    const parsed = JSON.parse(text);
+    const rawJobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+    const jobs: MistralBatchJobRecord[] = rawJobs
+      .map((entry: unknown) => normalizeJobRecord(entry))
+      .filter((entry: MistralBatchJobRecord | null): entry is MistralBatchJobRecord => Boolean(entry));
+    return {
+      version: Number(parsed?.version) === MISTRAL_BATCH_STATE_VERSION
+        ? MISTRAL_BATCH_STATE_VERSION
+        : MISTRAL_BATCH_STATE_VERSION,
+      jobs
+    };
+  } catch {
+    return { version: MISTRAL_BATCH_STATE_VERSION, jobs: [] };
+  }
+}
+
+async function writeMistralBatchState(cacheDir: string, state: MistralBatchStateFile): Promise<void> {
+  const statePath = getMistralBatchStatePath(cacheDir);
+  await fs.promises.mkdir(cacheDir, { recursive: true }).catch(() => {});
+  await fs.promises.writeFile(
+    statePath,
+    JSON.stringify({ version: MISTRAL_BATCH_STATE_VERSION, jobs: state.jobs }, null, 2),
+    'utf-8'
+  );
+}
+
+function partitionFiles(files: string[], chunkSize: number): string[][] {
+  const normalizedChunkSize = Math.max(1, Math.floor(chunkSize));
+  const chunks: string[][] = [];
+  for (let i = 0; i < files.length; i += normalizedChunkSize) {
+    chunks.push(files.slice(i, i + normalizedChunkSize));
+  }
+  return chunks;
+}
+
+function isTerminalBatchStatus(status: string): boolean {
+  return status === 'SUCCESS' || status === 'FAILED' || status === 'CANCELLED';
+}
+
+function shouldResumeBatchJob(job: MistralBatchJobRecord): boolean {
+  if (job.writtenAtMs !== null) return false;
+  return job.status === 'QUEUED' || job.status === 'RUNNING' || job.status === 'SUCCESS';
+}
+
+function matchesBatchScope(
+  job: MistralBatchJobRecord,
+  inputPath: string,
+  outputDir: string,
+  modelName: string
+): boolean {
+  return (
+    path.resolve(job.inputPath) === path.resolve(inputPath) &&
+    path.resolve(job.outputDir) === path.resolve(outputDir) &&
+    job.modelName === modelName
+  );
+}
+
+function sortBatchJobsInOrder(a: MistralBatchJobRecord, b: MistralBatchJobRecord): number {
+  if (a.createdAtMs !== b.createdAtMs) return a.createdAtMs - b.createdAtMs;
+  if (a.batchOrder !== b.batchOrder) return a.batchOrder - b.batchOrder;
+  return a.id.localeCompare(b.id, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function matchesInputScope(job: MistralBatchJobRecord, inputPath: string): boolean {
+  return path.resolve(job.inputPath) === path.resolve(inputPath);
+}
+
+function matchesStatsScope(
+  job: MistralBatchJobRecord,
+  inputPath: string,
+  outputDir?: string,
+  modelName?: string
+): boolean {
+  if (!matchesInputScope(job, inputPath)) return false;
+  if (outputDir && path.resolve(job.outputDir) !== path.resolve(outputDir)) return false;
+  if (modelName && job.modelName !== modelName) return false;
+  return true;
+}
+
+function computeMistralBatchStats(
+  jobs: MistralBatchJobRecord[],
+  inputPath: string
+): MistralBatchFolderStats {
+  let uploaded = 0;
+  let processing = 0;
+  let completed = 0;
+  let failed = 0;
+
+  for (const job of jobs) {
+    if (job.writtenAtMs !== null) {
+      completed += 1;
+      continue;
+    }
+    if (job.status === 'FAILED' || job.status === 'CANCELLED') {
+      failed += 1;
+      continue;
+    }
+    if (job.status === 'QUEUED') {
+      uploaded += 1;
+      continue;
+    }
+    processing += 1;
+  }
+
+  return {
+    inputPath,
+    uploaded,
+    processing,
+    completed,
+    failed,
+    total: jobs.length
+  };
+}
+
+function formatLocalDateTime(timestampMs: number): string {
+  return new Date(timestampMs).toLocaleString();
+}
+
+function buildMistralBatchQueueRows(jobs: MistralBatchJobRecord[]): MistralBatchQueueRow[] {
+  const groups = new Map<string, MistralBatchJobRecord[]>();
+  for (const job of jobs) {
+    const key = `${path.resolve(job.inputPath)}::${path.resolve(job.outputDir)}::${job.modelName}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.push(job);
+    } else {
+      groups.set(key, [job]);
+    }
+  }
+
+  const rows: MistralBatchQueueRow[] = [];
+  for (const groupedJobs of groups.values()) {
+    if (!groupedJobs.length) continue;
+    groupedJobs.sort(sortBatchJobsInOrder);
+    const sample = groupedJobs[0];
+    const pending = groupedJobs.filter(job => shouldResumeBatchJob(job));
+    const oldestPendingStartMs = pending.length ? pending[0].createdAtMs : null;
+    const stats = computeMistralBatchStats(groupedJobs, sample.inputPath);
+    rows.push({
+      ...stats,
+      outputDir: sample.outputDir,
+      modelName: sample.modelName,
+      oldestPendingStartMs,
+      checkBackAtMs: oldestPendingStartMs === null
+        ? null
+        : oldestPendingStartMs + MISTRAL_BATCH_AVG_COMPLETION_MS
+    });
+  }
+
+  return rows.sort((a, b) => {
+    const aKey = a.oldestPendingStartMs ?? Number.MAX_SAFE_INTEGER;
+    const bKey = b.oldestPendingStartMs ?? Number.MAX_SAFE_INTEGER;
+    if (aKey !== bKey) return aKey - bKey;
+    return a.inputPath.localeCompare(b.inputPath, undefined, { numeric: true, sensitivity: 'base' });
+  });
+}
+
 function csvEscape(value: string): string {
   const text = `${value ?? ''}`;
   if (/[",\n]/.test(text)) {
@@ -205,6 +468,91 @@ ipcMain.handle('set-folder-favorites', (_e, favorites: string[]) => {
   if (!Array.isArray(favorites)) return;
   const sanitized = favorites.filter(item => typeof item === 'string' && item.trim());
   store.set('folderFavorites', sanitized);
+});
+
+ipcMain.handle('get-audio-input-path', () => store.get('audioInputPath') || '');
+ipcMain.handle('set-audio-input-path', (_e, value: string) => {
+  if (typeof value !== 'string') return;
+  store.set('audioInputPath', value);
+});
+ipcMain.handle('get-audio-output-dir', () => store.get('audioOutputDir') || '');
+ipcMain.handle('set-audio-output-dir', (_e, value: string) => {
+  if (typeof value !== 'string') return;
+  store.set('audioOutputDir', value);
+});
+ipcMain.handle('get-image-input-path', () => store.get('imageInputPath') || '');
+ipcMain.handle('set-image-input-path', (_e, value: string) => {
+  if (typeof value !== 'string') return;
+  store.set('imageInputPath', value);
+});
+ipcMain.handle('get-image-output-dir', () => store.get('imageOutputDir') || '');
+ipcMain.handle('set-image-output-dir', (_e, value: string) => {
+  if (typeof value !== 'string') return;
+  store.set('imageOutputDir', value);
+});
+
+ipcMain.handle(
+  'get-mistral-batch-stats',
+  async (
+    _e,
+    payload: { inputPath?: string; outputDir?: string; modelName?: string }
+  ): Promise<MistralBatchFolderStats> => {
+    const rawInputPath = typeof payload?.inputPath === 'string' ? payload.inputPath.trim() : '';
+    if (!rawInputPath) {
+      return { inputPath: '', uploaded: 0, processing: 0, completed: 0, failed: 0, total: 0 };
+    }
+
+    const inputPath = path.resolve(rawInputPath);
+    const outputDir = typeof payload?.outputDir === 'string' && payload.outputDir.trim()
+      ? path.resolve(payload.outputDir.trim())
+      : undefined;
+    const modelName = typeof payload?.modelName === 'string' && payload.modelName.trim()
+      ? payload.modelName.trim()
+      : undefined;
+
+    const cacheDir = path.join(app.getPath('userData'), 'temp', 'mistral_cache');
+    const state = await readMistralBatchState(cacheDir);
+    const scoped = state.jobs.filter(job => matchesStatsScope(job, inputPath, outputDir, modelName));
+    return computeMistralBatchStats(scoped, inputPath);
+  }
+);
+
+ipcMain.handle('get-mistral-batch-queue', async (): Promise<MistralBatchQueueRow[]> => {
+  const cacheDir = path.join(app.getPath('userData'), 'temp', 'mistral_cache');
+  const state = await readMistralBatchState(cacheDir);
+  return buildMistralBatchQueueRows(state.jobs);
+});
+
+ipcMain.handle(
+  'select-mistral-batch-folder',
+  async (
+    _e,
+    payload: { inputPath?: string; outputDir?: string }
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const rawInputPath = typeof payload?.inputPath === 'string' ? payload.inputPath.trim() : '';
+    const rawOutputDir = typeof payload?.outputDir === 'string' ? payload.outputDir.trim() : '';
+    if (!rawInputPath || !rawOutputDir) {
+      return { ok: false, error: 'Missing input/output folder path.' };
+    }
+
+    const inputPath = path.resolve(rawInputPath);
+    const outputDir = path.resolve(rawOutputDir);
+
+    store.set('imageInputPath', inputPath);
+    store.set('imageOutputDir', outputDir);
+    store.set('activeMode', 'image');
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('mistral-batch-folder-selected', inputPath, outputDir);
+    }
+    return { ok: true };
+  }
+);
+
+ipcMain.handle('get-active-mode', () => store.get('activeMode') || '');
+ipcMain.handle('set-active-mode', (_e, value: string) => {
+  if (value !== 'audio' && value !== 'image') return;
+  store.set('activeMode', value);
 });
 
 ipcMain.handle('list-transcripts-subtitles', async (_e, folder: string) => {
@@ -337,7 +685,7 @@ ipcMain.handle('cancel-transcription', () => {
 
 ipcMain.handle('select-input-file', async (_e, mode: string = 'audio') => {
   const filters: Electron.FileFilter[] = mode === 'audio'
-    ? [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'm4a'] }]
+    ? [{ name: 'Audio Files', extensions: ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg'] }]
     : [{ name: 'Image & PDF', extensions: ['png', 'jpg', 'jpeg', 'tif', 'tiff', 'pdf'] }];
   const properties: Electron.OpenDialogOptions['properties'] =
     mode === 'audio' ? ['openFile', 'openDirectory'] : ['openFile', 'openDirectory'];
@@ -407,21 +755,42 @@ ipcMain.handle(
     const modelName = mode === 'audio'
       ? (store.get('audioModel') as string)
       : (store.get('imageModel') as string);
-    const useMistral = mode !== 'audio' && modelName?.toLowerCase().includes('mistral');
+    const modelNameLower = (modelName || '').toLowerCase();
+    const useMistral = mode !== 'audio' && modelNameLower.includes('mistral');
+    const useVoxtralAudio = mode === 'audio' && modelNameLower.includes('voxtral');
     let geminiApiKey = '';
+    let mistralApiKey = '';
 
     if (mode === 'audio') {
-      geminiApiKey = (store.get('apiKey') || '').trim();
-      if (!geminiApiKey) {
-        throw new Error('Gemini API key not set. Please enter it in Settings.');
+      if (useVoxtralAudio) {
+        mistralApiKey = (store.get('mistralApiKey') || '').trim();
+        if (!mistralApiKey) {
+          throw new Error('Mistral API key not set. Please enter it in Settings.');
+        }
+      } else {
+        geminiApiKey = (store.get('apiKey') || '').trim();
+        if (!geminiApiKey) {
+          throw new Error('Gemini API key not set. Please enter it in Settings.');
+        }
+        process.env.GOOGLE_API_KEY = geminiApiKey;
       }
-      process.env.GOOGLE_API_KEY = geminiApiKey;
 
       const rawAudioPrompt = (promptArg || (store.get('audioPrompt') as string) || '').trim();
-      if (!rawAudioPrompt) {
+      if (!rawAudioPrompt && !useVoxtralAudio) {
         const msg = 'Audio prompt not set. Aborting transcription.';
         await fs.promises.appendFile(getLogPath('audio'), `[ERR] ${msg}\n`);
         throw new Error(msg);
+      }
+      const audioMistralCacheDir = useVoxtralAudio
+        ? path.join(app.getPath('userData'), 'temp', 'mistral_cache', 'audio')
+        : '';
+      if (useVoxtralAudio) {
+        await fs.promises.mkdir(audioMistralCacheDir, { recursive: true }).catch(() => {});
+        await fs.promises.appendFile(
+          getLogPath('audio'),
+          `[INFO] Mistral temp audio files will be cached at: ${audioMistralCacheDir}\n`,
+          'utf-8'
+        ).catch(() => {});
       }
 
       // support single file or directory of audio files
@@ -430,7 +799,7 @@ ipcMain.handle(
         const stat = await fs.promises.stat(inputPath);
         if (stat.isDirectory()) {
           const names = (await fs.promises.readdir(inputPath))
-            .filter(f => /\.(mp3|wav|m4a)$/i.test(f))
+            .filter(f => /\.(mp3|wav|m4a|aac|flac|ogg)$/i.test(f))
             .sort((a, b) =>
               a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
             );
@@ -465,18 +834,34 @@ ipcMain.handle(
             activeAudioAbort.abort();
             throw new Error('terminated by user');
           }
-          await transcribeAudioGemini(file, {
-            outputDir,
-            modelName,
-            apiKey: geminiApiKey,
-            rawPrompt: rawAudioPrompt,
-            interviewMode,
-            subtitles: generateSubtitles,
-            signal: activeAudioAbort.signal,
-            logger: async (msg: string) => {
-              await fs.promises.appendFile(getLogPath('audio'), `${msg}\n`, 'utf-8').catch(() => {});
-            }
-          });
+          if (useVoxtralAudio) {
+            await transcribeAudioMistral(file, {
+              outputDir,
+              modelName,
+              apiKey: mistralApiKey,
+              rawPrompt: rawAudioPrompt,
+              interviewMode,
+              subtitles: generateSubtitles,
+              tempDir: audioMistralCacheDir,
+              signal: activeAudioAbort.signal,
+              logger: async (msg: string) => {
+                await fs.promises.appendFile(getLogPath('audio'), `${msg}\n`, 'utf-8').catch(() => {});
+              }
+            });
+          } else {
+            await transcribeAudioGemini(file, {
+              outputDir,
+              modelName,
+              apiKey: geminiApiKey,
+              rawPrompt: rawAudioPrompt,
+              interviewMode,
+              subtitles: generateSubtitles,
+              signal: activeAudioAbort.signal,
+              logger: async (msg: string) => {
+                await fs.promises.appendFile(getLogPath('audio'), `${msg}\n`, 'utf-8').catch(() => {});
+              }
+            });
+          }
           win.webContents.send('transcription-progress', name, i + 1, audioFiles.length, 'Done');
           await fs.promises.appendFile(getLogPath('audio'), `[OK] ${name}\n`, 'utf-8');
         } catch (err: any) {
@@ -484,9 +869,12 @@ ipcMain.handle(
           win.webContents.send('transcription-progress', name, i + 1, audioFiles.length,
             cancelled ? 'Cancelled' : 'Error'
           );
+          if (cancelled) {
+            await fs.promises.appendFile(getLogPath('audio'), `[WARN] ${name}: Cancelled by user\n`, 'utf-8').catch(() => {});
+            throw new Error('terminated by user');
+          }
           const detail = err?.message || err?.toString?.() || 'Unknown error';
           await fs.promises.appendFile(getLogPath('audio'), `[ERR] ${name}: ${detail}\n`, 'utf-8').catch(() => {});
-          if (cancelled) throw new Error('terminated by user');
           throw err;
         }
       }
@@ -530,6 +918,7 @@ ipcMain.handle(
         }
 
         const normalizedOutputDir = path.resolve(outputDir);
+        const normalizedInputPath = path.resolve(inputPath);
         const appTempDir = path.join(app.getPath('userData'), 'temp');
         const cacheDir = path.join(appTempDir, 'mistral_cache');
         await fs.promises.mkdir(cacheDir, { recursive: true }).catch(() => {});
@@ -563,129 +952,114 @@ ipcMain.handle(
           ? files.filter(f => !fs.existsSync(transcriptPathFor(f, inputPath, baseIsFile, normalizedOutputDir)))
           : files;
         if (!workFiles.length) {
+          if (batchSelected) {
+            const state = await readMistralBatchState(cacheDir);
+            const nextJobs = state.jobs.filter(
+              job => !matchesBatchScope(job, normalizedInputPath, normalizedOutputDir, modelName)
+            );
+            if (nextJobs.length !== state.jobs.length) {
+              state.jobs = nextJobs;
+              await writeMistralBatchState(cacheDir, state);
+              await logInfo('Removed cached batch-job stats for completed folder.');
+            }
+          }
           return `[OK] All transcripts already exist for ${files.length} file(s)`;
         }
 
         let processedCount = 0;
         const totalWork = workFiles.length;
+        if (batchSelected) {
+          const activeFileSet = new Set(workFiles.map(file => path.resolve(file)));
+          const unresolvedFiles = new Set(workFiles.map(file => path.resolve(file)));
 
-        const processChunk = async (chunk: string[], chunkIndex: number, totalChunks: number) => {
-          if (batchSelected) {
-            try {
-              if (cancelRequested) {
-                cancelMistralRequest();
-                throw new Error('terminated by user');
-              }
-              await logInfo(`Starting batch ${chunkIndex}/${totalChunks} with ${chunk.length} file(s)`);
-              const pending = chunk.filter(file => {
-                const txtOut = transcriptPathFor(file, inputPath, baseIsFile, normalizedOutputDir);
-                return !fs.existsSync(txtOut);
-              });
+          const makeBatchProgressLabel = (jobIndex: number, totalJobs: number): string => {
+            const percentage = totalWork > 0 ? Math.round((processedCount / totalWork) * 100) : 100;
+            return `${collectionName} - batch job ${jobIndex}/${totalJobs} - images processed ${processedCount}/${totalWork} (${percentage}%)`;
+          };
+          const markResolved = (filePath: string) => {
+            const abs = path.resolve(filePath);
+            if (!unresolvedFiles.has(abs)) return;
+            unresolvedFiles.delete(abs);
+            processedCount = totalWork - unresolvedFiles.size;
+          };
 
-              const baseLabel = `${collectionName} - batch ${chunkIndex}/${totalChunks} - images processed ${processedCount}/${totalWork} (${Math.round((processedCount / totalWork) * 100)}%)`;
-              window?.webContents.send(
-                'transcription-progress',
-                baseLabel,
-                processedCount,
-                files.length,
-                pending.length ? `Submitting batch ${chunkIndex}/${totalChunks}...` : 'Skipped'
-              );
+          let state = await readMistralBatchState(cacheDir);
+          const scopedJobs = state.jobs
+            .filter(job => matchesBatchScope(job, normalizedInputPath, normalizedOutputDir, modelName))
+            .sort(sortBatchJobsInOrder);
+          const trackedFiles = new Set(
+            scopedJobs
+              .filter(job => shouldResumeBatchJob(job))
+              .flatMap(job => job.files.map(file => path.resolve(file)))
+          );
+          const filesToSubmit = workFiles.filter(file => !trackedFiles.has(path.resolve(file)));
+          const newChunks = partitionFiles(filesToSubmit, batchSize);
+          let nextBatchOrder = scopedJobs.reduce((maxValue, job) => Math.max(maxValue, job.batchOrder), 0);
 
-              if (cancelRequested) {
-                cancelMistralRequest();
-                throw new Error('terminated by user');
-              }
-
-              let batchResults = new Map<string, string>();
-              if (pending.length) {
-                batchResults = await transcribeImageMistralBatch(pending, mistralKey, modelName, {
-                  baseInput: inputPath,
-                  logger: logInfo,
-                  cacheDir,
-                  tempRoot: path.join(app.getPath('userData'), 'temp')
-                });
-              }
-              await logInfo(`Batch ${chunkIndex}/${totalChunks} completed (received ${batchResults.size} result(s))`);
-
-              for (const file of chunk) {
-                if (cancelRequested) {
-                  cancelMistralRequest();
-                  throw new Error('terminated by user');
-                }
-                const name = path.basename(file);
-                const txtOut = transcriptPathFor(file, inputPath, baseIsFile, normalizedOutputDir);
-
-                processedCount += 1;
-                const percentage = Math.round((processedCount / totalWork) * 100);
-                const progressLabel = `${collectionName} - batch ${chunkIndex}/${totalChunks} - images processed ${processedCount}/${totalWork} (${percentage}%)`;
-
-                if (fs.existsSync(txtOut)) {
-                  window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, 'Skipped');
-                  continue;
-                }
-
-                window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, `Writing ${name}...`);
-                const relKey = baseIsFile
-                  ? path.basename(file)
-                  : path.relative(inputPath, file).split(path.sep).join('/');
-                const text = batchResults.get(relKey);
-
-                if (typeof text !== 'string') {
-                  const msg = `Missing OCR result for ${relKey}`;
-                  await fs.promises.appendFile(getLogPath('image'), `[ERR] ${name} - ${msg}\n`, 'utf-8').catch(() => {});
-                  window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, 'Error');
-                  throw new Error(msg);
-                }
-
-                await fs.promises.writeFile(txtOut, text, 'utf-8');
-                window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, 'Done');
-                await fs.promises.appendFile(getLogPath('image'), `[OK] ${name}\n`, 'utf-8');
-              }
-
-              return;
-            } catch (err: any) {
-              const cancelled = cancelRequested || err?.cancelled || err?.name === 'AbortError';
-              const msg = cancelled ? 'Cancelled' : `Error: ${err?.message || err}`;
-              await fs.promises.appendFile(getLogPath('image'), `[ERR] batch ${chunkIndex} - ${msg}\n`, 'utf-8').catch(() => {});
-              if (cancelled) {
-                cancelMistralRequest();
-                throw new Error('terminated by user');
-              }
-              throw err;
-            }
+          if (newChunks.length) {
+            await logInfo(`Submitting ${newChunks.length} batch job(s) before one status check...`);
+          } else {
+            await logInfo('No new batch jobs to submit. Resuming existing queued/running jobs.');
           }
 
-          for (let i = 0; i < chunk.length; i++) {
+          for (let idx = 0; idx < newChunks.length; idx++) {
             if (cancelRequested) {
               cancelMistralRequest();
               throw new Error('terminated by user');
             }
-            const file = chunk[i];
-            const name = path.basename(file);
-            const txtOut = transcriptPathFor(file, inputPath, baseIsFile, normalizedOutputDir);
 
-            processedCount += 1;
-            const percentage = Math.round((processedCount / totalWork) * 100);
-            const progressLabel = batchSelected
-              ? `${collectionName} - batch ${chunkIndex}/${totalChunks} - images processed ${processedCount}/${totalWork} (${percentage}%)`
-              : `${collectionName} - images processed ${processedCount}/${totalWork} (${percentage}%)`;
+            const chunk = newChunks[idx].map(file => path.resolve(file));
+            nextBatchOrder += 1;
+            const queueLabel = makeBatchProgressLabel(idx + 1, newChunks.length);
+            window?.webContents.send(
+              'transcription-progress',
+              queueLabel,
+              processedCount,
+              totalWork,
+              `Submitting batch ${idx + 1}/${newChunks.length} (${chunk.length} file(s))...`
+            );
+            await logInfo(`Submitting batch ${idx + 1}/${newChunks.length} with ${chunk.length} file(s)`);
 
-            if (fs.existsSync(txtOut)) {
-              window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, 'Skipped');
-              continue;
-            }
-
-            window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, `Transcribing ${name}...`);
             try {
-              const text = await transcribeImageMistral(file, mistralKey, modelName);
-              await fs.promises.writeFile(txtOut, text, 'utf-8');
-              window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, 'Done');
-              await fs.promises.appendFile(getLogPath('image'), `[OK] ${name}\n`, 'utf-8');
+              const submission = await submitMistralBatchJob(chunk, mistralKey, modelName, {
+                baseInput: inputPath,
+                logger: logInfo,
+                cacheDir,
+                tempRoot: path.join(app.getPath('userData'), 'temp')
+              });
+              const nowMs = Date.now();
+              const record: MistralBatchJobRecord = {
+                id: submission.jobId,
+                inputPath: normalizedInputPath,
+                outputDir: normalizedOutputDir,
+                modelName,
+                files: chunk,
+                batchOrder: nextBatchOrder,
+                createdAtMs: nowMs,
+                status: 'QUEUED',
+                totalRequests: Math.max(submission.totalRequests, chunk.length),
+                succeededRequests: 0,
+                failedRequests: 0,
+                outputFileId: null,
+                lastProgressCount: 0,
+                lastProgressAtMs: nowMs,
+                writtenAtMs: null,
+                lastError: null
+              };
+              state.jobs.push(record);
+              await writeMistralBatchState(cacheDir, state);
+              window?.webContents.send(
+                'transcription-progress',
+                queueLabel,
+                processedCount,
+                totalWork,
+                `Queued batch ${idx + 1}/${newChunks.length} (job ${submission.jobId})`
+              );
+              await logInfo(`Queued batch job ${submission.jobId} (${chunk.length} request(s))`);
             } catch (err: any) {
               const cancelled = cancelRequested || err?.cancelled || err?.name === 'AbortError';
               const msg = cancelled ? 'Cancelled' : `Error: ${err?.message || err}`;
-              await fs.promises.appendFile(getLogPath('image'), `[ERR] ${name} - ${msg}\n`, 'utf-8').catch(() => {});
-              window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, cancelled ? 'Cancelled' : 'Error');
+              await fs.promises.appendFile(getLogPath('image'), `[ERR] batch submit ${idx + 1} - ${msg}\n`, 'utf-8').catch(() => {});
               if (cancelled) {
                 cancelMistralRequest();
                 throw new Error('terminated by user');
@@ -693,18 +1067,271 @@ ipcMain.handle(
               throw err;
             }
           }
-        };
 
-        if (batchSelected && stat.isDirectory()) {
-          const chunks: string[][] = [];
-          for (let i = 0; i < workFiles.length; i += batchSize) {
-            chunks.push(workFiles.slice(i, i + batchSize));
+          const persistJobUpdate = async (job: MistralBatchJobRecord) => {
+            const existingIndex = state.jobs.findIndex(entry => entry.id === job.id);
+            if (existingIndex >= 0) {
+              state.jobs[existingIndex] = job;
+            } else {
+              state.jobs.push(job);
+            }
+            await writeMistralBatchState(cacheDir, state);
+          };
+
+          const moveScopedQueuedJobsToProcessing = async (): Promise<number> => {
+            let movedCount = 0;
+            const nowMs = Date.now();
+            state.jobs = state.jobs.map(entry => {
+              if (!matchesBatchScope(entry, normalizedInputPath, normalizedOutputDir, modelName)) return entry;
+              if (entry.writtenAtMs !== null) return entry;
+              if (entry.status !== 'QUEUED') return entry;
+              movedCount += 1;
+              return {
+                ...entry,
+                status: 'RUNNING',
+                lastProgressAtMs: entry.lastProgressAtMs > 0 ? entry.lastProgressAtMs : nowMs
+              };
+            });
+            if (movedCount > 0) {
+              await writeMistralBatchState(cacheDir, state);
+            }
+            return movedCount;
+          };
+
+          const jobsToProcess = state.jobs
+            .filter(job => matchesBatchScope(job, normalizedInputPath, normalizedOutputDir, modelName))
+            .filter(job => shouldResumeBatchJob(job))
+            .map(job => ({
+              ...job,
+              files: job.files.map(file => path.resolve(file)).filter(file => activeFileSet.has(file))
+            }))
+            .filter(job => job.files.length > 0)
+            .sort(sortBatchJobsInOrder);
+
+          if (!jobsToProcess.length) {
+            state.jobs = state.jobs.filter(
+              job => !matchesBatchScope(job, normalizedInputPath, normalizedOutputDir, modelName)
+            );
+            await writeMistralBatchState(cacheDir, state);
+            await logInfo('Removed cached batch-job stats for completed folder.');
+            return `[OK] All transcripts already exist for ${files.length} file(s)`;
           }
-          for (let c = 0; c < chunks.length; c++) {
-            await processChunk(chunks[c], c + 1, chunks.length);
+
+          let completedJobsThisRun = 0;
+          while (true) {
+            const pendingJobs = state.jobs
+              .filter(entry => matchesBatchScope(entry, normalizedInputPath, normalizedOutputDir, modelName))
+              .filter(entry => shouldResumeBatchJob(entry))
+              .map(entry => ({
+                ...entry,
+                files: entry.files.map(file => path.resolve(file)).filter(file => activeFileSet.has(file))
+              }))
+              .filter(entry => entry.files.length > 0)
+              .sort(sortBatchJobsInOrder);
+
+            if (!pendingJobs.length) {
+              state.jobs = state.jobs.filter(
+                entry => !matchesBatchScope(entry, normalizedInputPath, normalizedOutputDir, modelName)
+              );
+              await writeMistralBatchState(cacheDir, state);
+              await logInfo('All batch jobs completed. Removed cached batch-job stats for this folder.');
+              if (completedJobsThisRun > 0) {
+                return `[OK] Completed ${completedJobsThisRun} batch job(s) in this run and finished batch queue for ${collectionName}.`;
+              }
+              return `[OK] Finished batch queue for ${collectionName}.`;
+            }
+
+            let targetJobIndex = pendingJobs.findIndex(entry =>
+              entry.files.some(file => unresolvedFiles.has(path.resolve(file)))
+            );
+            if (targetJobIndex < 0) {
+              for (const pendingJob of pendingJobs) {
+                if (pendingJob.writtenAtMs !== null) continue;
+                await persistJobUpdate({
+                  ...pendingJob,
+                  writtenAtMs: Date.now(),
+                  status: 'SUCCESS',
+                  lastError: null
+                });
+              }
+              state.jobs = state.jobs.filter(
+                entry => !matchesBatchScope(entry, normalizedInputPath, normalizedOutputDir, modelName)
+              );
+              await writeMistralBatchState(cacheDir, state);
+              await logInfo('All batch jobs already had outputs. Removed cached batch-job stats for this folder.');
+              return `[OK] All transcripts already exist for ${files.length} file(s)`;
+            }
+
+            let job = pendingJobs[targetJobIndex];
+            const jobPosition = targetJobIndex + 1;
+            const totalJobs = pendingJobs.length;
+            const unresolvedInJob = job.files.filter(file => unresolvedFiles.has(path.resolve(file)));
+
+            if (cancelRequested) {
+              cancelMistralRequest();
+              throw new Error('terminated by user');
+            }
+
+            const polled = await fetchMistralBatchJobStatus(job.id, mistralKey);
+            const doneRequests = polled.succeededRequests + polled.failedRequests;
+            const totalRequests = Math.max(polled.totalRequests, job.totalRequests, unresolvedInJob.length, 1);
+            const nowMs = Date.now();
+            const progressed = doneRequests > job.lastProgressCount;
+            const nextProgressAtMs = progressed ? nowMs : (job.lastProgressAtMs > 0 ? job.lastProgressAtMs : nowMs);
+            job = {
+              ...job,
+              status: polled.status,
+              totalRequests,
+              succeededRequests: polled.succeededRequests,
+              failedRequests: polled.failedRequests,
+              outputFileId: polled.outputFileId,
+              lastProgressCount: progressed ? doneRequests : job.lastProgressCount,
+              lastProgressAtMs: nextProgressAtMs
+            };
+            await persistJobUpdate(job);
+            const movedToProcessing = await moveScopedQueuedJobsToProcessing();
+            if (movedToProcessing > 0) {
+              if (job.status === 'QUEUED') {
+                job = { ...job, status: 'RUNNING' };
+              }
+              await logInfo(`Moved ${movedToProcessing} queued batch job(s) to processing after oldest-job check.`);
+            }
+
+            const progressLabel = makeBatchProgressLabel(jobPosition, totalJobs);
+            const statusMessage = `Checking oldest batch ${jobPosition}/${totalJobs} - ${job.status} ${doneRequests}/${totalRequests}`;
+            window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, statusMessage);
+            await logInfo(`Checked batch job ${job.id} once: status=${job.status} ${doneRequests}/${totalRequests}`);
+
+            if (!isTerminalBatchStatus(job.status)) {
+              const checkBackAt = job.createdAtMs + MISTRAL_BATCH_AVG_COMPLETION_MS;
+              const checkBackLabel = formatLocalDateTime(checkBackAt);
+              const msg = completedJobsThisRun > 0
+                ? `Completed ${completedJobsThisRun} batch job(s) in this run. Next pending job ${job.id} is ${job.status} (${doneRequests}/${totalRequests}). Check back at ${checkBackLabel}.`
+                : `Batch job ${job.id} is still ${job.status} (${doneRequests}/${totalRequests}). Check back at ${checkBackLabel}.`;
+              window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, msg);
+              await logInfo(msg);
+              return `[INFO] ${msg}`;
+            }
+
+            if (job.status !== 'SUCCESS') {
+              const msg = `Batch job ${job.id} ended with status ${job.status}.`;
+              job = { ...job, lastError: msg };
+              await persistJobUpdate(job);
+              await fs.promises.appendFile(getLogPath('image'), `[ERR] ${msg}\n`, 'utf-8').catch(() => {});
+              throw new Error(msg);
+            }
+            if (!job.outputFileId) {
+              const msg = `Batch job ${job.id} succeeded but output file id is missing.`;
+              job = { ...job, lastError: msg };
+              await persistJobUpdate(job);
+              await fs.promises.appendFile(getLogPath('image'), `[ERR] ${msg}\n`, 'utf-8').catch(() => {});
+              throw new Error(msg);
+            }
+
+            window?.webContents.send(
+              'transcription-progress',
+              progressLabel,
+              processedCount,
+              totalWork,
+              `Downloading results for oldest batch ${jobPosition}/${totalJobs}...`
+            );
+            const batchResults = await downloadMistralBatchResults(job.outputFileId, mistralKey);
+            await logInfo(`Downloaded ${batchResults.size} result(s) for batch job ${job.id}`);
+
+            for (const file of unresolvedInJob) {
+              if (cancelRequested) {
+                cancelMistralRequest();
+                throw new Error('terminated by user');
+              }
+              const absFile = path.resolve(file);
+              if (!unresolvedFiles.has(absFile)) continue;
+
+              const name = path.basename(file);
+              const txtOut = transcriptPathFor(file, inputPath, baseIsFile, normalizedOutputDir);
+              markResolved(file);
+              const percentage = totalWork > 0 ? Math.round((processedCount / totalWork) * 100) : 100;
+              const writeLabel = `${collectionName} - batch job ${jobPosition}/${totalJobs} - images processed ${processedCount}/${totalWork} (${percentage}%)`;
+
+              if (fs.existsSync(txtOut)) {
+                window?.webContents.send('transcription-progress', writeLabel, processedCount, totalWork, 'Skipped');
+                continue;
+              }
+
+              window?.webContents.send('transcription-progress', writeLabel, processedCount, totalWork, `Writing ${name}...`);
+              const relKey = baseIsFile
+                ? path.basename(file)
+                : path.relative(inputPath, file).split(path.sep).join('/');
+              const text = batchResults.get(relKey);
+              if (typeof text !== 'string') {
+                const msg = `Missing OCR result for ${relKey}`;
+                await fs.promises.appendFile(getLogPath('image'), `[ERR] ${name} - ${msg}\n`, 'utf-8').catch(() => {});
+                window?.webContents.send('transcription-progress', writeLabel, processedCount, totalWork, 'Error');
+                throw new Error(msg);
+              }
+
+              await fs.promises.mkdir(path.dirname(txtOut), { recursive: true }).catch(() => {});
+              await fs.promises.writeFile(txtOut, text, 'utf-8');
+              window?.webContents.send('transcription-progress', writeLabel, processedCount, totalWork, 'Done');
+              await fs.promises.appendFile(getLogPath('image'), `[OK] ${name}\n`, 'utf-8');
+            }
+
+            job = { ...job, writtenAtMs: Date.now(), lastError: null };
+            await persistJobUpdate(job);
+            completedJobsThisRun += 1;
+
+            const remainingJobs = state.jobs
+              .filter(entry => matchesBatchScope(entry, normalizedInputPath, normalizedOutputDir, modelName))
+              .filter(entry => shouldResumeBatchJob(entry))
+              .sort(sortBatchJobsInOrder);
+            if (!remainingJobs.length) {
+              state.jobs = state.jobs.filter(
+                entry => !matchesBatchScope(entry, normalizedInputPath, normalizedOutputDir, modelName)
+              );
+              await writeMistralBatchState(cacheDir, state);
+              await logInfo('All batch jobs completed. Removed cached batch-job stats for this folder.');
+              return `[OK] Completed ${completedJobsThisRun} batch job(s) in this run and finished batch queue for ${collectionName}.`;
+            }
+
+            await logInfo(`Completed batch job ${job.id}. Checking next oldest pending batch immediately...`);
           }
-        } else {
-          await processChunk(workFiles, 1, 1);
+        }
+
+        for (let i = 0; i < workFiles.length; i++) {
+          if (cancelRequested) {
+            cancelMistralRequest();
+            throw new Error('terminated by user');
+          }
+          const file = workFiles[i];
+          const name = path.basename(file);
+          const txtOut = transcriptPathFor(file, inputPath, baseIsFile, normalizedOutputDir);
+
+          processedCount += 1;
+          const percentage = Math.round((processedCount / totalWork) * 100);
+          const progressLabel = `${collectionName} - images processed ${processedCount}/${totalWork} (${percentage}%)`;
+
+          if (fs.existsSync(txtOut)) {
+            window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, 'Skipped');
+            continue;
+          }
+
+          window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, `Transcribing ${name}...`);
+          try {
+            const text = await transcribeImageMistral(file, mistralKey, modelName);
+            await fs.promises.mkdir(path.dirname(txtOut), { recursive: true }).catch(() => {});
+            await fs.promises.writeFile(txtOut, text, 'utf-8');
+            window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, 'Done');
+            await fs.promises.appendFile(getLogPath('image'), `[OK] ${name}\n`, 'utf-8');
+          } catch (err: any) {
+            const cancelled = cancelRequested || err?.cancelled || err?.name === 'AbortError';
+            const msg = cancelled ? 'Cancelled' : `Error: ${err?.message || err}`;
+            await fs.promises.appendFile(getLogPath('image'), `[ERR] ${name} - ${msg}\n`, 'utf-8').catch(() => {});
+            window?.webContents.send('transcription-progress', progressLabel, processedCount, totalWork, cancelled ? 'Cancelled' : 'Error');
+            if (cancelled) {
+              cancelMistralRequest();
+              throw new Error('terminated by user');
+            }
+            throw err;
+          }
         }
 
         return `[OK] Processed ${workFiles.length} file(s) via Mistral OCR`;
@@ -920,10 +1547,51 @@ ipcMain.handle('open-settings', () => {
   child.center();
 });
 
+ipcMain.handle('open-batch-queue', () => {
+  const parent = BrowserWindow.getAllWindows()[0];
+  const parentBounds = parent.getBounds();
+
+  const width = Math.floor(parentBounds.width * 0.72);
+  const height = Math.floor(parentBounds.height * 0.7);
+
+  const child = new BrowserWindow({
+    width,
+    height,
+    minWidth: Math.floor(parentBounds.width * 0.5),
+    minHeight: Math.floor(parentBounds.height * 0.5),
+    parent,
+    modal: true,
+    resizable: true,
+    backgroundColor: '#16161f',
+    webPreferences: { nodeIntegration: true, contextIsolation: false },
+  });
+
+  if (isDev()) {
+    child.loadURL('http://localhost:5123/#/batch-queue');
+  } else {
+    const indexPath = path.join(app.getAppPath(), 'dist-react', 'index.html');
+    const indexURL = pathToFileURL(indexPath).toString() + '#/batch-queue';
+    child.loadURL(indexURL);
+  }
+
+  child.center();
+});
+
 ipcMain.handle('scan-quality', async (_e, folder: string, threshold: number) => {
   // clear any previous quality logs
   const qualityLog = getLogPath('quality');
   await fs.promises.writeFile(qualityLog, '', 'utf-8');
-  const result = await scanQualityFolder(folder, threshold);
+  const result = await scanQualityFolder(folder, threshold, {
+    onProgress: async ({ processed, total, file, blankCount }) => {
+      const percent = total > 0 ? Math.round((processed / total) * 100) : 100;
+      _e.sender.send('quality-scan-progress', {
+        processed,
+        total,
+        percent,
+        file,
+        blankCount
+      });
+    }
+  });
   return result;
 });

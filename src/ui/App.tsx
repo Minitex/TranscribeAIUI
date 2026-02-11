@@ -28,11 +28,11 @@ const fs = (window as any).require('fs') as typeof import('fs');
 const os = (window as any).require('os') as typeof import('os');
 const pathModule = (window as any).require('path') as typeof import('path');
 
-// ─── Model options ─────────────────────────────────────────────────────────────
 const AUDIO_MODEL_OPTIONS = [
   'gemini-2.5-pro',
   'gemini-2.5-flash',
-  'gemini-2.0-flash'
+  'gemini-2.0-flash',
+  'voxtral-mini-latest'
 ];
 
 const IMAGE_MODEL_OPTIONS = [
@@ -46,6 +46,8 @@ const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.gif', '.
 
 type QualityEntry = {
   confidence: number;
+  blankTranscript?: boolean;
+  nonWhitespaceChars?: number;
   removeIntroText?: string;
   removeOutroText?: string;
   issues?: string[];
@@ -59,6 +61,8 @@ type QualityEntry = {
 type ScanResultEntry = {
   file: string;
   confidence: number;
+  blank_transcript?: boolean;
+  non_whitespace_chars?: number;
   remove_intro_text?: string;
   remove_outro_text?: string;
   issues?: string[];
@@ -74,6 +78,22 @@ type SortOption = 'name-asc' | 'name-desc' | 'confidence-desc' | 'confidence-asc
 type PathPickerTarget = {
   target: 'audio-input' | 'audio-output' | 'image-input' | 'image-output' | 'copy-images';
   allowFiles: boolean;
+};
+
+type MistralBatchStats = {
+  inputPath: string;
+  uploaded: number;
+  processing: number;
+  completed: number;
+  failed: number;
+  total: number;
+};
+
+type MistralBatchQueueRow = MistralBatchStats & {
+  outputDir: string;
+  modelName: string;
+  oldestPendingStartMs: number | null;
+  checkBackAtMs: number | null;
 };
 
 type SettingsProps = {
@@ -171,7 +191,6 @@ const stripMarkdownArtifacts = (content: string) => {
   return endsWithNewline ? `${trimmed}\n` : trimmed;
 };
 
-// Simple tooltip component
 const InfoTooltip: React.FC<{ text: string }> = ({ text }) => {
   const [visible, setVisible] = useState(false);
   return (
@@ -226,7 +245,6 @@ const InfoTooltip: React.FC<{ text: string }> = ({ text }) => {
   );
 };
 
-// ─── Settings View ──────────────────────────────────────────────────────────────
 function SettingsView({
   currentVersion,
   latestVersion,
@@ -334,7 +352,6 @@ function SettingsView({
       localStorage.setItem('imagePrompt', imagePrompt);
     }
 
-    // show saved feedback instead of closing
     setSaved(true);
     setTimeout(() => setSaved(false), 2500);
   };
@@ -368,8 +385,8 @@ function SettingsView({
     {
       id: 'mistral',
       label: 'Mistral API Key',
-      placeholder: 'Only needed for Mistral OCR',
-      helper: 'Required to use Mistral OCR.',
+      placeholder: 'Required for Mistral OCR and Voxtral audio',
+      helper: 'Required to use Mistral OCR and Voxtral audio transcription.',
       value: mistralKey,
       onChange: setMistralKey
     }
@@ -507,17 +524,21 @@ function SettingsView({
           >
             <div className="model-group">
               <label htmlFor="audio-model">Audio Model</label>
-              <select
-                id="audio-model"
-                value={audioModel}
-                onChange={e => setAudioModel(e.target.value)}
-              >
-                {AUDIO_MODEL_OPTIONS.map(option => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
+              <div className="model-select">
+                <select
+                  id="audio-model"
+                  className="model-select-input"
+                  value={audioModel}
+                  onChange={e => setAudioModel(e.target.value)}
+                >
+                  {AUDIO_MODEL_OPTIONS.map(option => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+                <FaChevronDown className="model-select-caret" aria-hidden="true" />
+              </div>
             </div>
             <div className="prompt-group">
               <div
@@ -564,17 +585,21 @@ function SettingsView({
           >
             <div className="model-group">
               <label htmlFor="image-model">Image Model</label>
-              <select
-                id="image-model"
-                value={imageModel}
-                onChange={e => setImageModel(e.target.value)}
-              >
-                {IMAGE_MODEL_OPTIONS.map(option => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
+              <div className="model-select">
+                <select
+                  id="image-model"
+                  className="model-select-input"
+                  value={imageModel}
+                  onChange={e => setImageModel(e.target.value)}
+                >
+                  {IMAGE_MODEL_OPTIONS.map(option => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+                <FaChevronDown className="model-select-caret" aria-hidden="true" />
+              </div>
             </div>
             <div className="prompt-group">
               <div
@@ -702,7 +727,6 @@ function SettingsView({
   );
 }
 
-// ─── UTILITY: SORT transcripts alphanumerically ────────────────────────────────
 function sortTranscripts(list: Transcript[]): Transcript[] {
   return [...list].sort((a, b) =>
     a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
@@ -742,24 +766,206 @@ function ensureUniquePath(destDir: string, baseName: string): string {
   return candidate;
 }
 
-// ─── Main App ───────────────────────────────────────────────────────────────────
+function BatchQueueView() {
+  const [rows, setRows] = useState<MistralBatchQueueRow[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [selectedKey, setSelectedKey] = useState('');
+
+  const loadRows = useCallback(async (showLoading = false) => {
+    if (showLoading) setLoading(true);
+    try {
+      const queue = await ipcRenderer.invoke('get-mistral-batch-queue') as MistralBatchQueueRow[];
+      setRows(Array.isArray(queue) ? queue : []);
+      setError('');
+    } catch (err: any) {
+      setRows([]);
+      setError(err?.message || 'Failed to load batch queue.');
+    } finally {
+      if (showLoading) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadRows(true);
+    const onFocus = () => {
+      void loadRows(false);
+    };
+    const intervalId = window.setInterval(() => {
+      void loadRows(false);
+    }, 5000);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [loadRows]);
+
+  const selectFolder = useCallback(
+    async (row: MistralBatchQueueRow) => {
+      const key = `${row.inputPath}::${row.outputDir}`;
+      setSelectedKey(key);
+      setError('');
+      try {
+        const result = await ipcRenderer.invoke('select-mistral-batch-folder', {
+          inputPath: row.inputPath,
+          outputDir: row.outputDir
+        }) as { ok?: boolean; error?: string };
+        if (!result?.ok) {
+          setError(result?.error || 'Failed to select queue item.');
+          return;
+        }
+        window.close();
+      } catch (err: any) {
+        setError(err?.message || 'Failed to select queue item.');
+      } finally {
+        setSelectedKey('');
+      }
+    },
+    []
+  );
+
+  const formatTime = (timestampMs: number | null) => {
+    if (!timestampMs) return '—';
+    return new Date(timestampMs).toLocaleString();
+  };
+
+  const summary = useMemo(() => {
+    return rows.reduce(
+      (acc, row) => {
+        acc.uploaded += row.uploaded;
+        acc.processing += row.processing;
+        acc.completed += row.completed;
+        acc.failed += row.failed;
+        return acc;
+      },
+      { uploaded: 0, processing: 0, completed: 0, failed: 0 }
+    );
+  }, [rows]);
+
+  return (
+    <div className="settings-container batch-queue-page">
+      <h2 className="batch-queue-title">Mistral Batch Queue</h2>
+      <div className="settings-scroll">
+        {!!rows.length && (
+          <div className="batch-queue-summary">
+            <div className="batch-queue-summary-card">
+              <span>Collections</span>
+              <strong>{rows.length}</strong>
+            </div>
+            <div className="batch-queue-summary-card">
+              <span>Uploaded</span>
+              <strong>{summary.uploaded}</strong>
+            </div>
+            <div className="batch-queue-summary-card">
+              <span>Processing</span>
+              <strong>{summary.processing}</strong>
+            </div>
+            <div className="batch-queue-summary-card">
+              <span>Completed</span>
+              <strong>{summary.completed}</strong>
+            </div>
+          </div>
+        )}
+
+        {error && <div className="batch-queue-error">{error}</div>}
+
+        {!rows.length && !loading && (
+          <div className="batch-queue-empty">
+            No saved batch folders.
+          </div>
+        )}
+
+        <div className="batch-queue-list">
+          {rows.map(row => {
+            const key = `${row.inputPath}::${row.outputDir}`;
+            const selecting = selectedKey === key;
+            return (
+              <button
+                key={key}
+                type="button"
+                onClick={() => selectFolder(row)}
+                disabled={selecting}
+                className="batch-queue-item"
+                title="Load this folder pair in Image mode"
+              >
+                <div className="batch-queue-item-top">
+                  <span className="batch-queue-model">{row.modelName}</span>
+                  <span className="batch-queue-open-hint">
+                    {selecting ? 'Opening…' : 'Click to open'}
+                  </span>
+                </div>
+                <div className="batch-queue-path-row">
+                  <span>Input</span>
+                  <code>{row.inputPath}</code>
+                </div>
+                <div className="batch-queue-path-row">
+                  <span>Output</span>
+                  <code>{row.outputDir}</code>
+                </div>
+                <div className="batch-queue-pill-row">
+                  <span className="batch-queue-pill uploaded">{`Uploaded ${row.uploaded}`}</span>
+                  <span className="batch-queue-pill processing">{`Processing ${row.processing}`}</span>
+                  <span className="batch-queue-pill completed">{`Completed ${row.completed}`}</span>
+                  {row.failed > 0 && <span className="batch-queue-pill failed">{`Failed ${row.failed}`}</span>}
+                </div>
+                <div className="batch-queue-times">
+                  <div>
+                    <span>Oldest start</span>
+                    <strong>{formatTime(row.oldestPendingStartMs)}</strong>
+                  </div>
+                  <div>
+                    <span>Check back</span>
+                    <strong>{formatTime(row.checkBackAtMs)}</strong>
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+
+        {!!rows.length && summary.failed > 0 && (
+          <div className="batch-queue-footnote">
+            Failed jobs remain in the queue until retried or cleared from temp files.
+          </div>
+        )}
+      </div>
+      <div className="settings-buttons batch-queue-actions">
+        <div className="batch-queue-help-tooltip">
+          <button
+            type="button"
+            className="batch-queue-help-trigger"
+            aria-label="Why are my batches taking so long to process?"
+          >
+            <FaInfoCircle size={13} />
+            <span>Why are my batches taking so long to process?</span>
+          </button>
+          <div className="batch-queue-help-box" role="tooltip">
+            Batch processing is designed for non-urgent work and runs when servers have spare capacity. Batches typically complete in around 2 hours, but can take up to 24 hours. In the meantime, you can work on another image collection and check back later.
+          </div>
+        </div>
+        <button className="btn cancel" onClick={() => window.close()}>
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const isSettings = window.location.hash === '#/settings';
+  const isBatchQueue = window.location.hash === '#/batch-queue';
 
-  // ─ Sidebar resizing ─────────────────────────────────
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
 
-  // ─ Mode toggle ──────────────────────────────────────
   const [mode, setMode] = useState<'audio' | 'image'>('audio');
 
-  // ─ Audio state ──────────────────────────────────────
   const [audioInputPath, setAudioInputPath] = useState('');
   const [audioOutputDir, setAudioOutputDir] = useState('');
   const [audioTranscripts, setAudioTranscripts] = useState<Transcript[]>([]);
 
-  // ─ Image state ──────────────────────────────────────
   const [imageModelName, setImageModelName] = useState<string>(
     localStorage.getItem('imageModel') || IMAGE_MODEL_OPTIONS[0]
   );
@@ -769,8 +975,9 @@ export default function App() {
   const [imageRecursive, setImageRecursive] = useState(false);
   const [imageBatchSize, setImageBatchSize] = useState<number>(50);
   const [imageBatchEnabled, setImageBatchEnabled] = useState(false);
+  const [mistralBatchStats, setMistralBatchStats] = useState<MistralBatchStats | null>(null);
+  const [mistralQueueCollectionCount, setMistralQueueCollectionCount] = useState(0);
 
-  // Quality scan state
   const [threshold, setThreshold] = useState<number>(85);
   const [qualityScores, setQualityScores] = useState<Record<string, QualityEntry>>({});
 
@@ -778,7 +985,6 @@ export default function App() {
   const [isRemediating, setIsRemediating] = useState(false);
   const [scanResults, setScanResults] = useState<ScanResultEntry[]>([]);
 
-  // ─ Shared UI ───────────────────────────────────────
   const [filter, setFilter] = useState('');
   const [logs, setLogs] = useState('');
   const [status, setStatus] = useState('');
@@ -797,6 +1003,8 @@ export default function App() {
   const [showFilters, setShowFilters] = useState(false);
   const [folderFavorites, setFolderFavorites] = useState<string[]>([]);
   const favoritesLoadedRef = useRef(false);
+  const pathsLoadedRef = useRef(false);
+  const modeLoadedRef = useRef(false);
   const [currentVersion, setCurrentVersion] = useState('');
   const [latestVersion, setLatestVersion] = useState('');
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -814,6 +1022,30 @@ export default function App() {
       return false;
     }
   }, [imageInputPath]);
+  const refreshMistralBatchStats = useCallback(async () => {
+    if (!imageInputPath || !imageInputIsDirectory || !isMistralImageModel) {
+      setMistralBatchStats(null);
+      return;
+    }
+    try {
+      const stats = await ipcRenderer.invoke('get-mistral-batch-stats', {
+        inputPath: imageInputPath,
+        outputDir: imageOutputDir || undefined,
+        modelName: imageModelName
+      }) as MistralBatchStats;
+      setMistralBatchStats(stats);
+    } catch {
+      setMistralBatchStats(null);
+    }
+  }, [imageInputPath, imageInputIsDirectory, imageOutputDir, imageModelName, isMistralImageModel]);
+  const refreshMistralQueueCollectionCount = useCallback(async () => {
+    try {
+      const rows = await ipcRenderer.invoke('get-mistral-batch-queue') as MistralBatchQueueRow[];
+      setMistralQueueCollectionCount(Array.isArray(rows) ? rows.length : 0);
+    } catch {
+      setMistralQueueCollectionCount(0);
+    }
+  }, []);
 
   const fetchCurrentVersion = useCallback(() => {
     ipcRenderer
@@ -865,6 +1097,16 @@ export default function App() {
   }, [currentVersion, latestVersion]);
 
   useEffect(() => {
+    refreshMistralBatchStats();
+  }, [refreshMistralBatchStats]);
+
+  useEffect(() => {
+    refreshMistralQueueCollectionCount();
+    window.addEventListener('focus', refreshMistralQueueCollectionCount);
+    return () => window.removeEventListener('focus', refreshMistralQueueCollectionCount);
+  }, [refreshMistralQueueCollectionCount]);
+
+  useEffect(() => {
   if (!isMistralImageModel) {
       setImageRecursive(false);
       setImageBatchEnabled(false);
@@ -881,6 +1123,137 @@ export default function App() {
       setImageBatchEnabled(true);
     }
   }, [imageInputIsDirectory, isMistralImageModel]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const readLocal = () => {
+      try {
+        return (localStorage.getItem('activeMode') as 'audio' | 'image' | null) || '';
+      } catch {
+        return '';
+      }
+    };
+    const setIfValid = (value: unknown) => {
+      if (cancelled) return;
+      if (value === 'audio' || value === 'image') {
+        setMode(value);
+        return;
+      }
+      const fallback = readLocal();
+      if (fallback === 'audio' || fallback === 'image') {
+        setMode(fallback);
+      }
+    };
+    const loadMode = async () => {
+      try {
+        const stored = await ipcRenderer.invoke('get-active-mode');
+        setIfValid(stored);
+      } catch {
+        setIfValid(undefined);
+      } finally {
+        if (!cancelled) {
+          modeLoadedRef.current = true;
+        }
+      }
+    };
+    loadMode();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!modeLoadedRef.current) return;
+    const persist = async () => {
+      try {
+        await ipcRenderer.invoke('set-active-mode', mode);
+      } catch {
+      }
+      try {
+        localStorage.setItem('activeMode', mode);
+      } catch {
+      }
+    };
+    persist();
+  }, [mode]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const readLocal = (key: string) => {
+      try {
+        return localStorage.getItem(key) || '';
+      } catch {
+        return '';
+      }
+    };
+    const resolveValue = (value: unknown, key: string) => {
+      if (typeof value === 'string' && value) return value;
+      return readLocal(key);
+    };
+    const loadPaths = async () => {
+      let hydrated = false;
+      try {
+        const [audioInput, audioOutput, imageInput, imageOutput] = await Promise.all([
+          ipcRenderer.invoke('get-audio-input-path'),
+          ipcRenderer.invoke('get-audio-output-dir'),
+          ipcRenderer.invoke('get-image-input-path'),
+          ipcRenderer.invoke('get-image-output-dir')
+        ]);
+        if (!cancelled) {
+          setAudioInputPath(resolveValue(audioInput, 'audioInputPath'));
+          setAudioOutputDir(resolveValue(audioOutput, 'audioOutputDir'));
+          setImageInputPath(resolveValue(imageInput, 'imageInputPath'));
+          setImageOutputDir(resolveValue(imageOutput, 'imageOutputDir'));
+          hydrated = true;
+        }
+      } catch {
+      } finally {
+        if (!cancelled) {
+          if (!hydrated) {
+            setAudioInputPath(readLocal('audioInputPath'));
+            setAudioOutputDir(readLocal('audioOutputDir'));
+            setImageInputPath(readLocal('imageInputPath'));
+            setImageOutputDir(readLocal('imageOutputDir'));
+          }
+          pathsLoadedRef.current = true;
+        }
+      }
+    };
+    loadPaths();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!pathsLoadedRef.current) return;
+    const persist = async () => {
+      try {
+        await ipcRenderer.invoke('set-audio-input-path', audioInputPath);
+      } catch {
+      }
+      try {
+        await ipcRenderer.invoke('set-audio-output-dir', audioOutputDir);
+      } catch {
+      }
+      try {
+        await ipcRenderer.invoke('set-image-input-path', imageInputPath);
+      } catch {
+      }
+      try {
+        await ipcRenderer.invoke('set-image-output-dir', imageOutputDir);
+      } catch {
+      }
+      try {
+        localStorage.setItem('audioInputPath', audioInputPath);
+        localStorage.setItem('audioOutputDir', audioOutputDir);
+        localStorage.setItem('imageInputPath', imageInputPath);
+        localStorage.setItem('imageOutputDir', imageOutputDir);
+      } catch {
+      }
+    };
+    persist();
+  }, [audioInputPath, audioOutputDir, imageInputPath, imageOutputDir]);
 
   useEffect(() => {
     let cancelled = false;
@@ -903,7 +1276,6 @@ export default function App() {
           hydrated = true;
         }
       } catch {
-        // fall back to local storage
       } finally {
         if (!cancelled) {
           if (!hydrated) {
@@ -928,12 +1300,10 @@ export default function App() {
       try {
         await ipcRenderer.invoke('set-folder-favorites', folderFavorites);
       } catch {
-        // ignore store errors
       }
       try {
         localStorage.setItem('folderFavorites', JSON.stringify(folderFavorites));
       } catch {
-        // ignore storage errors
       }
     };
     persist();
@@ -961,27 +1331,22 @@ export default function App() {
     return () => window.removeEventListener('focus', loadImageModel);
   }, [imageInputIsDirectory]);
 
-  // Load logs whenever mode changes
   useEffect(() => {
     ipcRenderer.invoke('read-logs', mode).then(setLogs);
   }, [mode]);
 
-  // Auto-refresh logs and transcripts during transcription
   useEffect(() => {
     if (!isTranscribing) return;
 
     const refreshInterval = setInterval(async () => {
       try {
-        // Refresh logs
         const logs = await ipcRenderer.invoke('read-logs', mode);
         setLogs(logs);
 
-        // Refresh transcript list for image mode
         if (mode === 'image' && imageOutputDir) {
           const list = await ipcRenderer.invoke('list-transcripts-subtitles', imageOutputDir) as Transcript[];
           setImageTranscripts(sortTranscripts(list));
         }
-        // Refresh transcript list for audio mode
         else if (mode === 'audio' && audioOutputDir) {
           const list = await ipcRenderer.invoke('list-transcripts-subtitles', audioOutputDir) as Transcript[];
           setAudioTranscripts(sortTranscripts(list));
@@ -994,7 +1359,6 @@ export default function App() {
     return () => clearInterval(refreshInterval);
   }, [isTranscribing, mode, imageOutputDir, audioOutputDir]);
 
-  // Auto-scroll logs to bottom when content changes during transcription
   useEffect(() => {
     if (!isTranscribing || !logs) return;
     
@@ -1008,7 +1372,6 @@ export default function App() {
       }
     };
     
-    // Small delay to ensure DOM has updated
     setTimeout(scrollToBottom, 100);
   }, [logs, isTranscribing]);
 
@@ -1066,10 +1429,34 @@ export default function App() {
     [normalizeFavoritePath]
   );
 
-  // Handle progress events
+  const clearAudioInputPath = useCallback(() => {
+    setAudioInputPath('');
+  }, []);
+
+  const clearAudioOutputDir = useCallback(() => {
+    setAudioOutputDir('');
+    setAudioTranscripts([]);
+  }, []);
+
+  const clearImageInputPath = useCallback(() => {
+    setImageInputPath('');
+    setMistralBatchStats(null);
+  }, []);
+
+  const clearImageOutputDir = useCallback(() => {
+    setImageOutputDir('');
+    setImageTranscripts([]);
+  }, []);
+
   useEffect(() => {
-    const handler = (_: any, file: string, _idx: number, _total: number, _msg: string) => {
-      setStatus(file);
+    const handler = (_: any, file: string, _idx: number, _total: number, msg: string) => {
+      const label = (file || '').trim();
+      const detail = (msg || '').trim();
+      setStatus(label && detail ? `${label} | ${detail}` : (label || detail));
+      if (mode === 'image') {
+        refreshMistralBatchStats();
+        refreshMistralQueueCollectionCount();
+      }
       ipcRenderer.invoke('read-logs', mode).then(setLogs);
       const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
       if (dir) {
@@ -1087,7 +1474,31 @@ export default function App() {
     return () => {
       ipcRenderer.removeListener('transcription-progress', handler);
     };
-  }, [mode, audioOutputDir, imageOutputDir]);
+  }, [mode, audioOutputDir, imageOutputDir, refreshMistralBatchStats, refreshMistralQueueCollectionCount]);
+
+  useEffect(() => {
+    const handler = async (_: any, nextInputPath: string, nextOutputDir: string) => {
+      if (typeof nextInputPath === 'string') {
+        setImageInputPath(nextInputPath);
+      }
+      if (typeof nextOutputDir === 'string') {
+        setImageOutputDir(nextOutputDir);
+        try {
+          const list = await ipcRenderer.invoke('list-transcripts-subtitles', nextOutputDir) as Transcript[];
+          setImageTranscripts(sortTranscripts(list));
+        } catch {
+          setImageTranscripts([]);
+        }
+      }
+      setMode('image');
+      setStatus(`Loaded queue folder ${pathModule.basename(nextInputPath || '')}`);
+      refreshMistralQueueCollectionCount();
+    };
+    ipcRenderer.on('mistral-batch-folder-selected', handler);
+    return () => {
+      ipcRenderer.removeListener('mistral-batch-folder-selected', handler);
+    };
+  }, [refreshMistralQueueCollectionCount]);
 
   const refreshTranscriptList = useCallback(async () => {
     const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
@@ -1213,11 +1624,31 @@ export default function App() {
     [mode, audioTranscripts, imageTranscripts]
   );
 
-  // Handler to scan placeholder percentages
   const scanQuality = useCallback(async () => {
     const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
     if (!dir) return;
     setIsScanningQuality(true);
+    setStatus('ℹ️ Checking quality...');
+    const progressHandler = (
+      _: any,
+      payload: {
+        processed?: number;
+        total?: number;
+        percent?: number;
+        file?: string;
+        blankCount?: number;
+      }
+    ) => {
+      const processed = Math.max(0, Number(payload?.processed || 0));
+      const total = Math.max(0, Number(payload?.total || 0));
+      const percent = Math.max(0, Math.min(100, Number(payload?.percent ?? (total > 0 ? Math.round((processed / total) * 100) : 100))));
+      const fileLabel = typeof payload?.file === 'string' && payload.file ? pathModule.basename(payload.file) : '';
+      const blankCount = Math.max(0, Number(payload?.blankCount || 0));
+      const blankPart = blankCount > 0 ? ` • blank ${blankCount}` : '';
+      const filePart = fileLabel ? ` • ${fileLabel}` : '';
+      setStatus(`ℹ️ Checking quality ${processed}/${total} (${percent}%)${blankPart}${filePart}`);
+    };
+    ipcRenderer.on('quality-scan-progress', progressHandler);
     try {
       const result: { all: ScanResultEntry[] } = await ipcRenderer.invoke(
         'scan-quality',
@@ -1229,6 +1660,8 @@ export default function App() {
       const map = entries.reduce<Record<string, QualityEntry>>((acc, entry) => {
         acc[entry.file] = {
           confidence: entry.confidence,
+          blankTranscript: Boolean(entry.blank_transcript),
+          nonWhitespaceChars: typeof entry.non_whitespace_chars === 'number' ? entry.non_whitespace_chars : undefined,
           removeIntroText: entry.remove_intro_text,
           removeOutroText: entry.remove_outro_text,
           issues: entry.issues,
@@ -1241,10 +1674,19 @@ export default function App() {
         return acc;
       }, {});
       setQualityScores(map);
+      const blankCount = entries.filter(entry => Boolean(entry.blank_transcript)).length;
+      const flaggedCount = entries.filter(entry => Array.isArray(entry.issues) && entry.issues.length > 0).length;
+      const summaryParts = [`Quality check complete (${entries.length} file${entries.length === 1 ? '' : 's'})`];
+      if (blankCount > 0) summaryParts.push(`${blankCount} blank`);
+      if (flaggedCount > 0) summaryParts.push(`${flaggedCount} flagged`);
+      setStatus(`✅ ${summaryParts.join(' • ')}`);
     } catch (err) {
       console.error(err);
       setScanResults([]);
+      const message = err instanceof Error ? err.message : 'Failed to scan quality';
+      setStatus(`❌ ${message}`);
     } finally {
+      ipcRenderer.removeListener('quality-scan-progress', progressHandler);
       setIsScanningQuality(false);
     }
   }, [mode, audioOutputDir, imageOutputDir, threshold]);
@@ -1339,7 +1781,6 @@ export default function App() {
     }
   }, [mode, audioOutputDir, imageOutputDir, scanResults, cleanupWrappers]);
 
-  // Clear previous quality scores when output folder or mode changes
   useEffect(() => {
     setQualityScores({});
     setScanResults([]);
@@ -1417,7 +1858,6 @@ export default function App() {
     [scanResults]
   );
 
-  // Sidebar drag/resizing
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (!isResizing) return;
@@ -1495,6 +1935,10 @@ export default function App() {
       allowFiles: false
     });
   }, [mode]);
+
+  const openBatchQueueWindow = useCallback(() => {
+    ipcRenderer.invoke('open-batch-queue');
+  }, []);
 
   const toggleLogs = useCallback(() => {
     setShowLogs(s => !s);
@@ -1616,14 +2060,12 @@ export default function App() {
 
   const closePathPicker = useCallback(() => setPathPicker(null), []);
 
-  // ─── Transcribe Audio ─────────────────────────────────────────────────────
   const transcribeAudio = useCallback(
     async (interviewMode: boolean, generateSubtitles: boolean) => {
       if (!audioInputPath || !audioOutputDir) return;
       setStatus('');
       setIsTranscribing(true);
 
-      // choose prompt based on flags
       let promptToUse = DEFAULT_AUDIO_PROMPT;
       if (generateSubtitles) {
         promptToUse = SUBTITLE_AUDIO_PROMPT;
@@ -1675,7 +2117,7 @@ export default function App() {
     setStatus('');
     setIsTranscribing(true);
     try {
-      await ipcRenderer.invoke(
+      const result = await ipcRenderer.invoke(
         'run-transcription',
         'image',
         imageInputPath,
@@ -1684,18 +2126,21 @@ export default function App() {
         false,
         false,
         { recursive: false, batch: imageBatchEnabled, batchSize: imageBatchSize }
-      );
+      ) as string;
       
-      // Force refresh the transcript list and logs after batch completion
       if (imageOutputDir) {
         const list = await ipcRenderer.invoke('list-transcripts-subtitles', imageOutputDir) as Transcript[];
         setImageTranscripts(sortTranscripts(list));
       }
       const logs = await ipcRenderer.invoke('read-logs', 'image');
       setLogs(logs);
-      
-      setStatus('✅ Batch complete');
-      setToast('✅ Done');
+
+      const normalized = typeof result === 'string' ? result.trim() : '';
+      const detail = normalized.replace(/^\[[A-Z]+\]\s*/, '');
+      const isInfo = normalized.startsWith('[INFO]');
+      const statusText = detail || 'Done';
+      setStatus(isInfo ? `ℹ️ ${statusText}` : `✅ ${statusText}`);
+      setToast(isInfo ? `ℹ️ ${statusText}` : '✅ Done');
       setTimeout(() => setToast(null), 6000);
     } catch (err: any) {
       const cancelled = err.message?.includes('terminated');
@@ -1708,6 +2153,8 @@ export default function App() {
         setTimeout(() => setToast(null), 6000);
       }
     } finally {
+      await refreshMistralBatchStats();
+      await refreshMistralQueueCollectionCount();
       setIsTranscribing(false);
     }
   }, [
@@ -1716,7 +2163,9 @@ export default function App() {
     imageBatchEnabled,
     imageBatchSize,
     imageRecursive,
-    imageInputIsDirectory
+    imageInputIsDirectory,
+    refreshMistralBatchStats,
+    refreshMistralQueueCollectionCount
   ]);
 
   const cancel = useCallback(async () => {
@@ -1876,6 +2325,16 @@ export default function App() {
     );
   }
 
+  if (isBatchQueue) {
+    return (
+      <div className={`app-shell${isResizing ? ' resizing' : ''}`}>
+        <main className="content" style={{ padding: 0 }}>
+          <BatchQueueView />
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className={`app-shell${isResizing ? ' resizing' : ''}`}>
       <div style={{ position: 'fixed', top: 50, right: 12, zIndex: 20 }}>
@@ -1884,8 +2343,8 @@ export default function App() {
           <span
             style={{
               position: 'absolute',
-              top: 8,
-              right: 8,
+              top: -10,
+              right: 6,
               background: '#ff4d4f',
               color: '#fff',
               width: 16,
@@ -1921,11 +2380,9 @@ export default function App() {
                     step={1}
                     value={threshold}
                     onKeyDown={e => {
-                      // Prevent invalid chars: no e, +, -, .
                       if (['e','E','+','-','.'].includes(e.key)) e.preventDefault();
                     }}
                     onChange={e => {
-                      // Strip leading zeros (unless single zero)
                       let raw = e.target.value;
                       raw = raw.replace(/^0+(?=\d)/, '');
                       let v = parseInt(raw, 10);
@@ -1947,7 +2404,7 @@ export default function App() {
                 >
                   {isScanningQuality ? <FaSpinner className="spin" /> : 'Check Quality'}
                 </button>
-                <InfoTooltip text="Enter the minimum acceptable confidence (0–100). Confidence is 100% when no [unsure]/[blank] markers are present, and 0% when all tokens are placeholders. Colors: green for ≥99%, yellow between the threshold and 99%, red below the threshold." />
+                <InfoTooltip text="Enter the minimum acceptable confidence (0–100). Confidence is 100% when no [unsure]/[blank] markers are present, and 0% when all tokens are placeholders. Empty transcripts are marked as Blank and treated as 0% confidence. Colors: green for ≥99%, yellow between the threshold and 99%, red below the threshold." />
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <button
@@ -2158,18 +2615,26 @@ export default function App() {
             const issueSummary = issues?.length ? `• ${issues.join('\n• ')}` : null;
             let confidenceNode: React.ReactNode = null;
             if (entry) {
-              const confidence = entry.confidence;
-              const color =
-                confidence < threshold ? 'red' : confidence >= 99 ? 'green' : 'yellow';
-              const display = confidence
-                .toFixed(2)
-                .replace(/\.00$/, '')
-                .replace(/(\.\d)0$/, '$1');
-              confidenceNode = (
-                <span className="transcript-score" style={{ color }} title={`Confidence ${display}%`}>
-                  {display}%
-                </span>
-              );
+              if (entry.blankTranscript) {
+                confidenceNode = (
+                  <span className="transcript-score transcript-score-blank" title="Transcript appears blank">
+                    Blank
+                  </span>
+                );
+              } else {
+                const confidence = entry.confidence;
+                const color =
+                  confidence < threshold ? 'red' : confidence >= 99 ? 'green' : 'yellow';
+                const display = confidence
+                  .toFixed(2)
+                  .replace(/\.00$/, '')
+                  .replace(/(\.\d)0$/, '$1');
+                confidenceNode = (
+                  <span className="transcript-score" style={{ color }} title={`Confidence ${display}%`}>
+                    {display}%
+                  </span>
+                );
+              }
             }
             return (
               <li
@@ -2268,7 +2733,7 @@ export default function App() {
           onClick={() => setMode(m => (m === 'audio' ? 'image' : 'audio'))}
         >
           <div className={mode === 'audio' ? 'label active' : 'label'}>Audio</div>
-          <div className={mode === 'image' ? 'label active' : 'label'}>Image/Page</div>
+          <div className={mode === 'image' ? 'label active' : 'label'}>Image</div>
           <div className="toggle-thumb" />
         </div>
 
@@ -2279,6 +2744,8 @@ export default function App() {
             isTranscribing={isTranscribing}
             onSelectInput={selectInput}
             onSelectOutput={selectOutput}
+            onClearInput={clearAudioInputPath}
+            onClearOutput={clearAudioOutputDir}
             onTranscribe={transcribeAudio}
             onCancel={cancel}
           />
@@ -2292,11 +2759,16 @@ export default function App() {
             batchEnabled={imageBatchEnabled}
             batchSize={imageBatchSize}
             inputIsDirectory={imageInputIsDirectory}
+            batchStats={mistralBatchStats}
             onSelectInput={selectInput}
             onSelectOutput={selectOutput}
+            onClearInput={clearImageInputPath}
+            onClearOutput={clearImageOutputDir}
             onToggleRecursive={() => setImageRecursive(v => !v)}
             onToggleBatch={() => setImageBatchEnabled(v => !v)}
             onBatchSizeChange={(size: number) => setImageBatchSize(size)}
+            onOpenBatchQueue={openBatchQueueWindow}
+            queueCollectionCount={mistralQueueCollectionCount}
             onTranscribe={transcribeImage}
             onCancel={cancel}
           />
