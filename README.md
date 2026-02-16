@@ -16,7 +16,7 @@ It is designed for people who want a simple setup and need to transcribe many fi
 
 <p align="center">
   <a href="https://github.com/Minitex/TranscribeAIUI/stargazers">
-    <img src="./starring.gif" alt="How to star this repository" width="520">
+    <img src="./starring.gif" alt="How to star this repository" width="900">
   </a>
 </p>
 
@@ -44,9 +44,9 @@ You need at least one API key:
 - **Gemini**: Slightly better image accuracy in many cases, so it is a strong OCR choice when precision matters most.
 - Many users add both keys: use Mistral when speed matters and Gemini when image accuracy matters most.
 
-More model support is coming soon.
+More AI model support is coming soon.
 
-## Install (Simple)
+## Install
 
 1. Open the [latest release](https://github.com/Minitex/TranscribeAIUI/releases/latest).
 2. Download your installer:
@@ -98,17 +98,12 @@ For subtitle files (`.srt`):
 
 This project uses the MIT License. See [`LICENSE`](LICENSE).
 
-## Screenshots
+## Screenshot
 
 <table align="center">
   <tr>
     <td>
-      <img src="transcribeAIMainView.jpeg" alt="TranscribeAI Main Interface" width="600">
-    </td>
-  </tr>
-  <tr>
-    <td>
-      <img src="transcribeAISettingsView.jpeg" alt="TranscribeAI Settings" width="600">
+      <img src="transcribeAIMainView.png" alt="TranscribeAI Main Interface" width="900">
     </td>
   </tr>
 </table>
