@@ -53,6 +53,23 @@ body,
   background: #2a2a3d;
   border: 1px solid #333;
   border-radius: 4px;
+  color: #fff !important;
+  caret-color: #fff;
+}
+
+.filter-input::placeholder,
+.filter-input::-webkit-input-placeholder,
+.filter-input::-ms-input-placeholder,
+.filter-input:-ms-input-placeholder {
+  color: #8f8fa3 !important;
+  opacity: 1;
+}
+
+.filter-input:focus::placeholder,
+.filter-input:focus::-webkit-input-placeholder,
+.filter-input:focus::-ms-input-placeholder,
+.filter-input:focus:-ms-input-placeholder {
+  color: transparent !important;
 }
 
 .transcript-list {
@@ -81,10 +98,25 @@ body,
 
 .transcript-name {
   flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: baseline;
+  max-width: 100%;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.transcript-name-start {
+  min-width: 0;
+  flex: 0 1 auto;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  cursor: pointer;
+}
+
+.transcript-name-end {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .transcript-score {

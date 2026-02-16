@@ -6,70 +6,97 @@
   </tr>
 </table>
 
-**TranscribeAI** is a cross-platform desktop app that uses Large Language Models to transcribe audio files and scanned images/pages. It features:
+**TranscribeAI** helps you turn audio files and image scans into text, fast.
 
-- **LLM-powered transcription** (e.g. Google Gemini via `google-generativeai`)
-- **Resumable image workflows** (skips already-done files, cleans up partial outputs)
-- **Real-time logs & progress** in the UI
-- **Persistent settings** (stores your API key with `electron-store`)
-- **Drag-resizable, searchable sidebar** for managing transcripts
+It is designed for people who want a simple setup and need to transcribe many files quickly.
 
-> **Note:** A “headless” version (no UI) is also available and can be integrated into your own system—see  
-> https://github.com/Minitex/TranscribeAI  
+## Stay Tuned
 
+⭐️ Star our repository to stay up-to-date with exciting new features and improvements! Get instant notifications for new releases!
 
-## Technologies
+<p align="center">
+  <a href="https://github.com/Minitex/TranscribeAIUI/stargazers">
+    <img src="./starring.gif" alt="How to star this repository" width="520">
+  </a>
+</p>
 
-- **Electron**: Main process for file I/O and IPC  
-- **React + TypeScript**: Renderer UI, bundled with Vite for fast HMR  
-- **Vite**: Modern build tool for instant feedback and optimized production builds  
-- **google-generativeai SDK**: Interfaces with LLMs for high-quality transcription  
-- **electron-store**: Simple JSON storage for your Gemini API key
+**Latest downloads:** [Releases page](https://github.com/Minitex/TranscribeAIUI/releases/latest)
 
+## What You Can Do
 
-## Setup & Installation
+- Transcribe **audio files** to text.
+- Transcribe **images and PDFs** to text.
+- Run a **Quality Check** to flag possible issues.
+- Use **Remediate** for safe cleanups (intro/outro chatter, markdown artifacts, encoded entities).
+- Get clear warnings for subtitle timestamp issues so you can review those sections manually.
+- Track everything in real-time with progress and logs.
 
-1. **Obtain your API keys**
-   - **Gemini (required for audio/Gemini OCR):** Sign in to AI Studio and create a key at the [Google AI Studio API Key Console](https://aistudio.google.com/app/apikey?_gl=1*im4t83*_ga*MTM3ODUyOTU5Ny4xMTM5NDc4MjA0*_ga_P1DBVKWT6V*MTc0NjQ1NDYyNC4xMi4xLjE3NDY0NTQ2MzguNDYuMC4xNjUyODg3NDI). Copy the generated key.
-   - **Mistral (only for Mistral OCR):** Create an API key in your Mistral account—follow the Mistral quickstart at [docs.mistral.ai/getting-started/quickstart](https://docs.mistral.ai/getting-started/quickstart).
+## Before You Start
 
-2. **Download TranscribeAI**
-   - Go to the [TranscribeAI Releases page](https://github.com/Minitex/TranscribeAIUI/releases).  
-   - Choose the installer for your OS:  
-     - **macOS:** `.dmg`  
-     - **Windows:** `.exe`  
-     - **Linux:** `.AppImage` or `.tar.gz`  
-   - Download and run the installer. Because TranscribeAI is an open-source project and we don’t bundle a paid code-signing certificate, you may see a security warning the first time you run it:  
-     - **macOS Gatekeeper** (“Unidentified Developer” or "damaged and can't be opened"): open **System Preferences → Security & Privacy**, then click **Open Anyway** next to the TranscribeAI entry.  
-     - **Windows SmartScreen** (“Windows protected your PC”): click **More info**, then **Run anyway**.  
-   - Follow the installer prompts to complete installation.
+You need at least one API key:
 
-3. **Configure your API key(s)**
-   - Launch **TranscribeAI**.
-   - Click the **gear icon** in the top-right corner to open Settings.
-   - Paste your Google Gemini API key into the “API Key” field.
-   - If you plan to use Mistral OCR, paste your Mistral API key into the “Mistral API Key” field.
-   - Click **Save**.
+- **Mistral key** (recommended; very fast, great for batch jobs): [Mistral quickstart](https://docs.mistral.ai/getting-started/quickstart)
+- **Gemini key** (optional; slightly better image accuracy on many files): [Get Gemini API key](https://ai.google.dev/gemini-api/docs/api-key)
 
-4. **Run your first transcription**
-   - Click the file picker button to select an audio file or image folder, then choose the output folder for your transcripts.
-   - Click **Transcribe** to begin transcription.
-   - Monitor progress and logs in real time.
+### Gemini vs Mistral (Quick Guide)
 
-### Using Mistral OCR (including batch mode)
-- In Settings, enter your Mistral API key (leave Gemini key as well if you use Gemini features).
-- In the Image tab, pick the `mistral-ocr-latest` model.
-- Select an input folder of images/PDFs and an output folder.
-- Enable **Batch mode** to process files in batches, then start transcription. The app will call Mistral’s batch OCR and write outputs to your chosen folder.
-- Adjust **Batch size** with the +/− controls (default 50, range 10–500) to balance throughput vs. request size.
-- Note: single-image Mistral OCR calls are free; batch OCR requires a paid Mistral account.
+- **Mistral**: Very fast, especially when processing large folders in batches. Audio results are also very good.
+- **Gemini**: Slightly better image accuracy in many cases, so it is a strong OCR choice when precision matters most.
+- Many users add both keys: use Mistral when speed matters and Gemini when image accuracy matters most.
 
-## Updating to a New Version
-- **macOS:** Download the latest `.dmg` from Releases, open it, and drag the app to **Applications**. Choose “Replace” if prompted. If Gatekeeper blocks, right-click → **Open** once.
-- **Windows:** Download the new installer `.exe` from Releases and run it; it overwrites the existing install.
-  *Tip: after first launch, right-click the TranscribeAI icon on the taskbar → **Pin to taskbar** so it’s easy to find next time.*
-- **Linux (AppImage):** Download the new `*.AppImage`, `chmod +x` if needed, and replace your old AppImage file.
-- **No uninstall needed:** Install over the top; your existing data and settings remain.
+More model support is coming soon.
+
+## Install (Simple)
+
+1. Open the [latest release](https://github.com/Minitex/TranscribeAIUI/releases/latest).
+2. Download your installer:
+   - macOS: `.dmg`
+   - Windows: `.exe`
+   - Linux: `.AppImage` or `.tar.gz`
+3. Run the installer.
+
+If your system shows a first-run security warning:
+
+- macOS: open Privacy/Security and choose **Open Anyway**
+- Windows: choose **More info** then **Run anyway**
+
+## First-Time Setup
+
+1. Open TranscribeAI.
+2. Click the **gear icon** (top-right) to open Settings.
+3. Paste your API key(s).
+4. Click **Save**.
+
+## Basic Use
+
+1. Choose mode: **Audio** or **Image**.
+2. Select input file/folder.
+3. Select output folder.
+4. Click **Transcribe**.
+5. Watch progress in the logs.
+
+## Quality Check
+
+- Click **Check Quality** to score your transcript/subtitle files.
+- Lower scores mean the app found more potential issues.
+- Hover a score to see the penalty breakdown (why it scored lower).
+- Red warning dots mean “review needed.”
+
+For subtitle files (`.srt`):
+
+- The app flags timestamp format/order/range issues.
+- It shows cue numbers so you can quickly find where to listen and fix.
+- Timestamp fixes are **manual review** (not auto-adjusted).
+
+## Updating
+
+- Use the [latest release](https://github.com/Minitex/TranscribeAIUI/releases/latest).
+- Install over your current version.
+- Your existing settings and data remain.
+
+## License
+
+This project uses the MIT License. See [`LICENSE`](LICENSE).
 
 ## Screenshots
 

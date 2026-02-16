@@ -44,18 +44,60 @@ const IMAGE_MODEL_OPTIONS = [
 
 const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.gif', '.pdf'];
 
+type QualityIssueCode =
+  | 'blank_transcript'
+  | 'intro_chatter'
+  | 'outro_chatter'
+  | 'repetition'
+  | 'markdown_image'
+  | 'markdown_link'
+  | 'markdown_code'
+  | 'ai_boilerplate'
+  | 'rare_tokens'
+  | 'encoded_html_entities'
+  | 'srt_timestamp_parse'
+  | 'srt_timestamp_noncanonical'
+  | 'srt_timestamp_missing_hour'
+  | 'srt_timestamp_range'
+  | 'srt_timestamp_overlap';
+
+type QualityIssueDetail = {
+  code: QualityIssueCode;
+  message: string;
+};
+
 type QualityEntry = {
   confidence: number;
   blankTranscript?: boolean;
   nonWhitespaceChars?: number;
   removeIntroText?: string;
   removeOutroText?: string;
+  issueDetails?: QualityIssueDetail[];
   issues?: string[];
   placeholderCount?: number;
   placeholderRatio?: number;
   tokenCount?: number;
   repetitionRatio?: number;
   markdownArtifacts?: string[];
+  htmlAmpCount?: number;
+  htmlEntityCount?: number;
+  htmlEntityCounts?: Record<string, number>;
+  srtInvalidTimestampCount?: number;
+  srtInvalidRangeCount?: number;
+  srtOverlapCount?: number;
+  srtNoncanonicalTimestampCount?: number;
+  srtMissingHourTimestampCount?: number;
+  scoreBreakdown?: {
+    placeholderPenalty: number;
+    repetitionPenalty: number;
+    aiPenalty: number;
+    rareTokenPenalty: number;
+    wrapperPenalty: number;
+    markdownPenalty: number;
+    encodedEntityPenalty: number;
+    srtTimestampPenalty: number;
+    totalPenalty: number;
+  };
 };
 
 type ScanResultEntry = {
@@ -65,12 +107,32 @@ type ScanResultEntry = {
   non_whitespace_chars?: number;
   remove_intro_text?: string;
   remove_outro_text?: string;
+  issue_details?: QualityIssueDetail[];
   issues?: string[];
   placeholder_count?: number;
   placeholder_ratio?: number;
   token_count?: number;
   repetition_ratio?: number;
   markdown_artifacts?: string[];
+  html_amp_count?: number;
+  html_entity_count?: number;
+  html_entity_counts?: Record<string, number>;
+  srt_invalid_timestamp_count?: number;
+  srt_invalid_range_count?: number;
+  srt_overlap_count?: number;
+  srt_noncanonical_timestamp_count?: number;
+  srt_missing_hour_timestamp_count?: number;
+  score_breakdown?: {
+    placeholder_penalty: number;
+    repetition_penalty: number;
+    ai_penalty: number;
+    rare_token_penalty: number;
+    wrapper_penalty: number;
+    markdown_penalty: number;
+    encoded_entity_penalty: number;
+    srt_timestamp_penalty: number;
+    total_penalty: number;
+  };
 };
 
 type SortOption = 'name-asc' | 'name-desc' | 'confidence-desc' | 'confidence-asc';
@@ -766,6 +828,125 @@ function ensureUniquePath(destDir: string, baseName: string): string {
   return candidate;
 }
 
+function splitTranscriptNameForMiddleEllipsis(name: string): { start: string; end: string } {
+  if (!name) return { start: '', end: '' };
+  const ext = pathModule.extname(name);
+  const minTail = ext && ext.length < name.length ? ext.length : 0;
+  const desiredTail = Math.min(
+    28,
+    Math.max(minTail + 10, 16),
+    Math.max(name.length - 1, 1)
+  );
+  if (name.length <= desiredTail + 8) {
+    return { start: name, end: '' };
+  }
+  return {
+    start: name.slice(0, name.length - desiredTail),
+    end: name.slice(name.length - desiredTail)
+  };
+}
+
+const HTML_ENTITY_DECODERS: Array<{
+  entity: string;
+  pattern: RegExp;
+  replacement: string;
+}> = [
+  { entity: '&amp;', pattern: /&amp;/gi, replacement: '&' },
+  { entity: '&quot;', pattern: /&quot;/gi, replacement: '"' },
+  { entity: '&#39;', pattern: /&#39;/g, replacement: "'" },
+  { entity: '&lt;', pattern: /&lt;/gi, replacement: '<' },
+  { entity: '&gt;', pattern: /&gt;/gi, replacement: '>' },
+  { entity: '&nbsp;', pattern: /&nbsp;/gi, replacement: ' ' }
+];
+
+function decodeKnownHtmlEntities(content: string): {
+  decoded: string;
+  total: number;
+  counts: Record<string, number>;
+} {
+  let decoded = content;
+  let total = 0;
+  const counts: Record<string, number> = {};
+  for (const descriptor of HTML_ENTITY_DECODERS) {
+    const matches = decoded.match(descriptor.pattern);
+    const count = matches ? matches.length : 0;
+    if (count > 0) {
+      decoded = decoded.replace(descriptor.pattern, descriptor.replacement);
+      counts[descriptor.entity] = count;
+      total += count;
+    }
+  }
+  return { decoded, total, counts };
+}
+
+function formatPenaltyPercent(value: number): string {
+  return `${(Math.max(0, value) * 100).toFixed(1)}%`;
+}
+
+function buildConfidenceTitle(entry: QualityEntry, display: string): string {
+  if (!entry.scoreBreakdown) {
+    return `Confidence ${display}%`;
+  }
+  const breakdown = entry.scoreBreakdown;
+  return [
+    `Confidence ${display}%`,
+    'Penalty breakdown:',
+    `Placeholder: ${formatPenaltyPercent(breakdown.placeholderPenalty)}`,
+    `Repetition: ${formatPenaltyPercent(breakdown.repetitionPenalty)}`,
+    `Wrapper: ${formatPenaltyPercent(breakdown.wrapperPenalty)}`,
+    `Markdown: ${formatPenaltyPercent(breakdown.markdownPenalty)}`,
+    `Encoded entities: ${formatPenaltyPercent(breakdown.encodedEntityPenalty)}`,
+    `AI boilerplate: ${formatPenaltyPercent(breakdown.aiPenalty)}`,
+    `Rare tokens: ${formatPenaltyPercent(breakdown.rareTokenPenalty)}`,
+    `SRT timestamps: ${formatPenaltyPercent(breakdown.srtTimestampPenalty)}`,
+    `Total: ${formatPenaltyPercent(breakdown.totalPenalty)}`
+  ].join('\n');
+}
+
+type RemediationActions = {
+  clearIntro: boolean;
+  clearOutro: boolean;
+  clearMarkdown: boolean;
+  clearEntities: boolean;
+};
+
+function getRemediationActions(entry: ScanResultEntry): RemediationActions {
+  return {
+    clearIntro: Boolean(entry.remove_intro_text),
+    clearOutro: Boolean(entry.remove_outro_text),
+    clearMarkdown: Boolean(entry.markdown_artifacts && entry.markdown_artifacts.length),
+    clearEntities: Number(entry.html_entity_count ?? entry.html_amp_count ?? 0) > 0
+  };
+}
+
+function hasRemediationActions(actions: RemediationActions): boolean {
+  return (
+    actions.clearIntro ||
+    actions.clearOutro ||
+    actions.clearMarkdown ||
+    actions.clearEntities
+  );
+}
+
+function getIssueCodesToClear(actions: RemediationActions): Set<QualityIssueCode> {
+  const codes = new Set<QualityIssueCode>();
+  if (actions.clearIntro) codes.add('intro_chatter');
+  if (actions.clearOutro) codes.add('outro_chatter');
+  if (actions.clearMarkdown) {
+    codes.add('markdown_image');
+    codes.add('markdown_link');
+    codes.add('markdown_code');
+  }
+  if (actions.clearEntities) {
+    codes.add('encoded_html_entities');
+  }
+  return codes;
+}
+
+function isScanEntryRemediable(entry: ScanResultEntry): boolean {
+  return hasRemediationActions(getRemediationActions(entry));
+}
+
 function BatchQueueView() {
   const [rows, setRows] = useState<MistralBatchQueueRow[]>([]);
   const [loading, setLoading] = useState(false);
@@ -986,6 +1167,7 @@ export default function App() {
   const [scanResults, setScanResults] = useState<ScanResultEntry[]>([]);
 
   const [filter, setFilter] = useState('');
+  const [isFilterFocused, setIsFilterFocused] = useState(false);
   const [logs, setLogs] = useState('');
   const [status, setStatus] = useState('');
   const [toast, setToast] = useState<string | null>(null);
@@ -1517,8 +1699,13 @@ export default function App() {
     }
   }, [mode, audioOutputDir, imageOutputDir]);
 
+  useEffect(() => {
+    if (isSettings || isBatchQueue) return;
+    void refreshTranscriptList();
+  }, [isSettings, isBatchQueue, refreshTranscriptList]);
+
   const cleanupWrappers = useCallback(
-    async (entries: ScanResultEntry[], dir: string) => {
+    async (entries: ScanResultEntry[], dir: string): Promise<string[]> => {
       let transcripts = mode === 'audio' ? audioTranscripts : imageTranscripts;
       if (!transcripts.length) {
         try {
@@ -1535,7 +1722,7 @@ export default function App() {
           }
         } catch (error) {
           console.error('Failed to load transcripts for cleanup', error);
-          return;
+          return [];
         }
       }
       const lookup = new Map(transcripts.map(t => [t.name, t.path]));
@@ -1546,13 +1733,16 @@ export default function App() {
         intro?: string;
         outro?: string;
         markdownArtifacts?: string[];
+        decodedEntityCounts?: Record<string, number>;
+        decodedEntityTotal?: number;
       }> = [];
       await Promise.all(
         entries.map(async entry => {
           const intro = entry.remove_intro_text;
           const outro = entry.remove_outro_text;
           const hasMarkdown = Boolean(entry.markdown_artifacts && entry.markdown_artifacts.length);
-          if (!intro && !outro && !hasMarkdown) return;
+          const hasEncodedEntities = Number(entry.html_entity_count ?? entry.html_amp_count ?? 0) > 0;
+          if (!intro && !outro && !hasMarkdown && !hasEncodedEntities) return;
           const filePath = lookup.get(entry.file);
           if (!filePath) return;
 
@@ -1562,6 +1752,14 @@ export default function App() {
             if (hasMarkdown) {
               cleaned = stripMarkdownArtifacts(cleaned);
             }
+            let decodedEntityTotal = 0;
+            let decodedEntityCounts: Record<string, number> | undefined;
+            if (hasEncodedEntities) {
+              const decoded = decodeKnownHtmlEntities(cleaned);
+              cleaned = decoded.decoded;
+              decodedEntityTotal = decoded.total;
+              decodedEntityCounts = decoded.total > 0 ? decoded.counts : undefined;
+            }
             if (cleaned === original) return;
             await fs.promises.writeFile(filePath, cleaned, 'utf-8');
             cleanedFiles.push({
@@ -1569,7 +1767,9 @@ export default function App() {
               path: filePath,
               intro: intro?.trim(),
               outro: outro?.trim(),
-              markdownArtifacts: hasMarkdown ? entry.markdown_artifacts : undefined
+              markdownArtifacts: hasMarkdown ? entry.markdown_artifacts : undefined,
+              decodedEntityTotal: decodedEntityTotal || undefined,
+              decodedEntityCounts
             });
           } catch (error) {
             console.error('Failed to strip wrappers from', filePath, error);
@@ -1579,7 +1779,7 @@ export default function App() {
 
       if (cleanedFiles.length) {
         const logLines = cleanedFiles
-          .map(({ path, intro, outro, markdownArtifacts }) => {
+          .map(({ path, intro, outro, markdownArtifacts, decodedEntityCounts, decodedEntityTotal }) => {
             const parts: string[] = [];
             if (intro) {
               const snippet = intro.replace(/\s+/g, ' ');
@@ -1592,6 +1792,12 @@ export default function App() {
             if (markdownArtifacts && markdownArtifacts.length) {
               const kinds = markdownArtifacts.join(', ');
               parts.push(`[OUT] [OK] Stripped markdown artifacts (${kinds}).`);
+            }
+            if (decodedEntityTotal && decodedEntityCounts) {
+              const details = Object.entries(decodedEntityCounts)
+                .map(([entity, count]) => `${entity} x${count}`)
+                .join(', ');
+              parts.push(`[OUT] [OK] Decoded ${decodedEntityTotal} HTML entity token(s): ${details}.`);
             }
             if (!parts.length) {
               parts.push('[OUT] [OK] Updated transcript content.');
@@ -1620,6 +1826,7 @@ export default function App() {
         setToast(message);
         setTimeout(() => setToast(null), 6000);
       }
+      return cleanedFiles.map(file => file.name);
     },
     [mode, audioTranscripts, imageTranscripts]
   );
@@ -1664,12 +1871,34 @@ export default function App() {
           nonWhitespaceChars: typeof entry.non_whitespace_chars === 'number' ? entry.non_whitespace_chars : undefined,
           removeIntroText: entry.remove_intro_text,
           removeOutroText: entry.remove_outro_text,
+          issueDetails: entry.issue_details,
           issues: entry.issues,
           placeholderCount: entry.placeholder_count,
           placeholderRatio: entry.placeholder_ratio,
           tokenCount: entry.token_count,
           repetitionRatio: entry.repetition_ratio,
-          markdownArtifacts: entry.markdown_artifacts
+          markdownArtifacts: entry.markdown_artifacts,
+          htmlAmpCount: entry.html_amp_count,
+          htmlEntityCount: entry.html_entity_count ?? entry.html_amp_count,
+          htmlEntityCounts: entry.html_entity_counts,
+          srtInvalidTimestampCount: entry.srt_invalid_timestamp_count,
+          srtInvalidRangeCount: entry.srt_invalid_range_count,
+          srtOverlapCount: entry.srt_overlap_count,
+          srtNoncanonicalTimestampCount: entry.srt_noncanonical_timestamp_count,
+          srtMissingHourTimestampCount: entry.srt_missing_hour_timestamp_count,
+          scoreBreakdown: entry.score_breakdown
+            ? {
+              placeholderPenalty: entry.score_breakdown.placeholder_penalty,
+              repetitionPenalty: entry.score_breakdown.repetition_penalty,
+              aiPenalty: entry.score_breakdown.ai_penalty,
+              rareTokenPenalty: entry.score_breakdown.rare_token_penalty,
+              wrapperPenalty: entry.score_breakdown.wrapper_penalty,
+              markdownPenalty: entry.score_breakdown.markdown_penalty,
+              encodedEntityPenalty: entry.score_breakdown.encoded_entity_penalty,
+              srtTimestampPenalty: entry.score_breakdown.srt_timestamp_penalty,
+              totalPenalty: entry.score_breakdown.total_penalty
+            }
+            : undefined
         };
         return acc;
       }, {});
@@ -1691,95 +1920,119 @@ export default function App() {
     }
   }, [mode, audioOutputDir, imageOutputDir, threshold]);
 
+  const applyRemediationState = useCallback((actionable: ScanResultEntry[]) => {
+    const remediationMap = new Map(
+      actionable
+        .map(entry => [entry.file, getRemediationActions(entry)] as const)
+        .filter(([, actions]) => hasRemediationActions(actions))
+    );
+    if (!remediationMap.size) return;
+
+    setScanResults(prev =>
+      prev.map(entry => {
+        const actions = remediationMap.get(entry.file);
+        if (!actions) return entry;
+        const next: ScanResultEntry = { ...entry };
+        if (actions.clearIntro) {
+          next.remove_intro_text = undefined;
+        }
+        if (actions.clearOutro) {
+          next.remove_outro_text = undefined;
+        }
+        if (actions.clearMarkdown) {
+          next.markdown_artifacts = [];
+        }
+        if (actions.clearEntities) {
+          next.html_entity_count = 0;
+          next.html_entity_counts = {};
+          next.html_amp_count = 0;
+        }
+        const codesToClear = getIssueCodesToClear(actions);
+        if (entry.issue_details && entry.issue_details.length) {
+          const remainingDetails = entry.issue_details.filter(detail => !codesToClear.has(detail.code));
+          next.issue_details = remainingDetails.length ? remainingDetails : undefined;
+          next.issues = remainingDetails.length
+            ? remainingDetails.map(detail => detail.message)
+            : undefined;
+        }
+        return next;
+      })
+    );
+    setQualityScores(prev => {
+      const next = { ...prev };
+      remediationMap.forEach((actions, file) => {
+        const entry = next[file];
+        if (!entry) return;
+        const updated: QualityEntry = { ...entry };
+        if (actions.clearIntro) {
+          updated.removeIntroText = undefined;
+        }
+        if (actions.clearOutro) {
+          updated.removeOutroText = undefined;
+        }
+        if (actions.clearMarkdown) {
+          updated.markdownArtifacts = [];
+        }
+        if (actions.clearEntities) {
+          updated.htmlEntityCount = 0;
+          updated.htmlEntityCounts = {};
+          updated.htmlAmpCount = 0;
+        }
+        const codesToClear = getIssueCodesToClear(actions);
+        if (entry.issueDetails && entry.issueDetails.length) {
+          const remainingDetails = entry.issueDetails.filter(detail => !codesToClear.has(detail.code));
+          updated.issueDetails = remainingDetails.length ? remainingDetails : undefined;
+          updated.issues = remainingDetails.length
+            ? remainingDetails.map(detail => detail.message)
+            : undefined;
+        }
+        next[file] = updated;
+      });
+      return next;
+    });
+  }, []);
+
   const remediateDocuments = useCallback(async () => {
     const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
     if (!dir) return;
-    const actionable = scanResults.filter(
-      entry =>
-        entry.remove_intro_text ||
-        entry.remove_outro_text ||
-        (entry.markdown_artifacts && entry.markdown_artifacts.length)
-    );
+    const actionable = scanResults.filter(isScanEntryRemediable);
     if (!actionable.length) return;
     setIsRemediating(true);
     try {
-      await cleanupWrappers(actionable, dir);
-      const remediationMap = new Map(
-        actionable.map(entry => [
-          entry.file,
-          {
-            clearIntro: Boolean(entry.remove_intro_text),
-            clearOutro: Boolean(entry.remove_outro_text),
-            clearMarkdown: Boolean(entry.markdown_artifacts && entry.markdown_artifacts.length)
-          }
-        ])
-      );
-      setScanResults(prev =>
-        prev.map(entry => {
-          const actions = remediationMap.get(entry.file);
-          if (!actions) return entry;
-          const next: ScanResultEntry = { ...entry };
-          if (actions.clearIntro) {
-            next.remove_intro_text = undefined;
-          }
-          if (actions.clearOutro) {
-            next.remove_outro_text = undefined;
-          }
-          if (actions.clearMarkdown) {
-            next.markdown_artifacts = [];
-          }
-          if (entry.issues && entry.issues.length) {
-            next.issues = entry.issues.filter(issue => {
-              const lowered = issue.toLowerCase();
-              if (actions.clearIntro && lowered.startsWith('intro chatter')) return false;
-              if (actions.clearOutro && lowered.startsWith('outro chatter')) return false;
-              if (actions.clearMarkdown && lowered.includes('markdown')) return false;
-              return true;
-            });
-            if (next.issues && !next.issues.length) {
-              next.issues = undefined;
-            }
-          }
-          return next;
-        })
-      );
-      setQualityScores(prev => {
-        const next = { ...prev };
-        remediationMap.forEach((actions, file) => {
-          const entry = next[file];
-          if (!entry) return;
-          const updated: QualityEntry = { ...entry };
-          if (actions.clearIntro) {
-            updated.removeIntroText = undefined;
-          }
-          if (actions.clearOutro) {
-            updated.removeOutroText = undefined;
-          }
-          if (actions.clearMarkdown) {
-            updated.markdownArtifacts = [];
-          }
-          if (entry.issues && entry.issues.length) {
-            updated.issues = entry.issues.filter(issue => {
-              const lowered = issue.toLowerCase();
-              if (actions.clearIntro && lowered.startsWith('intro chatter')) return false;
-              if (actions.clearOutro && lowered.startsWith('outro chatter')) return false;
-              if (actions.clearMarkdown && lowered.includes('markdown')) return false;
-              return true;
-            });
-            if (updated.issues && !updated.issues.length) {
-              updated.issues = undefined;
-            }
-          }
-          next[file] = updated;
-        });
-        return next;
-      });
+      const changedFiles = new Set(await cleanupWrappers(actionable, dir));
+      if (!changedFiles.size) return;
+      applyRemediationState(actionable.filter(entry => changedFiles.has(entry.file)));
     } catch (err) {
       console.error(err);
     } finally {
       setIsRemediating(false);
     }
-  }, [mode, audioOutputDir, imageOutputDir, scanResults, cleanupWrappers]);
+  }, [mode, audioOutputDir, imageOutputDir, scanResults, cleanupWrappers, applyRemediationState]);
+
+  const remediateSingleDocument = useCallback(
+    async (name: string) => {
+      const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
+      if (!dir) return;
+      const entry = scanResults.find(item => item.file === name);
+      if (!entry || !isScanEntryRemediable(entry)) {
+        setToast(`No remediation available for ${name}`);
+        setTimeout(() => setToast(null), 6000);
+        return;
+      }
+
+      setIsRemediating(true);
+      try {
+        const changedFiles = await cleanupWrappers([entry], dir);
+        if (!changedFiles.includes(entry.file)) return;
+        applyRemediationState([entry]);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setIsRemediating(false);
+      }
+    },
+    [mode, audioOutputDir, imageOutputDir, scanResults, cleanupWrappers, applyRemediationState]
+  );
 
   useEffect(() => {
     setQualityScores({});
@@ -1810,10 +2063,10 @@ export default function App() {
     setQualityScores(prev => {
       const entry = prev[name];
       if (!entry || !entry.issues || !entry.issues.length) return prev;
-      return { ...prev, [name]: { ...entry, issues: undefined } };
+      return { ...prev, [name]: { ...entry, issueDetails: undefined, issues: undefined } };
     });
     setScanResults(prev =>
-      prev.map(entry => (entry.file === name ? { ...entry, issues: undefined } : entry))
+      prev.map(entry => (entry.file === name ? { ...entry, issue_details: undefined, issues: undefined } : entry))
     );
   }, []);
 
@@ -1849,12 +2102,7 @@ export default function App() {
 
   const canRemediate = useMemo(
     () =>
-      scanResults.some(
-        entry =>
-          entry.remove_intro_text ||
-          entry.remove_outro_text ||
-          (entry.markdown_artifacts && entry.markdown_artifacts.length)
-      ),
+      scanResults.some(isScanEntryRemediable),
     [scanResults]
   );
 
@@ -2240,8 +2488,12 @@ export default function App() {
   const contextIssues = contextMenu
     ? qualityScores[contextMenu.transcript.name]?.issues
     : undefined;
+  const contextScanEntry = contextMenu
+    ? scanResults.find(entry => entry.file === contextMenu.transcript.name)
+    : undefined;
   const canClearContextWarning = Boolean(contextIssues && contextIssues.length);
   const canViewContextImage = Boolean(imageInputPath);
+  const canRemediateContextFile = Boolean(contextScanEntry && isScanEntryRemediable(contextScanEntry));
 
   const exportTranscriptList = useCallback(async () => {
     if (!filtered.length) {
@@ -2404,7 +2656,7 @@ export default function App() {
                 >
                   {isScanningQuality ? <FaSpinner className="spin" /> : 'Check Quality'}
                 </button>
-                <InfoTooltip text="Enter the minimum acceptable confidence (0–100). Confidence is 100% when no [unsure]/[blank] markers are present, and 0% when all tokens are placeholders. Empty transcripts are marked as Blank and treated as 0% confidence. Colors: green for ≥99%, yellow between the threshold and 99%, red below the threshold." />
+                <InfoTooltip text="Enter the minimum acceptable confidence (0–100). Confidence combines placeholder density, repetition, AI boilerplate, unusual token density, wrapper/artifact signals (intro/outro chatter, markdown, encoded entities), and SRT timestamp validation penalties. Empty transcripts are marked as Blank and treated as 0% confidence. Colors: green for ≥99%, yellow between the threshold and 99%, red below the threshold." />
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
                 <button
@@ -2472,9 +2724,11 @@ export default function App() {
               <div style={{ display: 'flex', alignItems: 'stretch', gap: '0.5rem' }}>
                 <input
                   className="filter-input"
-                  placeholder="Filter transcripts, subtitles…"
+                  placeholder={isFilterFocused ? '' : 'Filter transcripts, subtitles…'}
                   value={filter}
                   onChange={e => setFilter(e.target.value)}
+                  onFocus={() => setIsFilterFocused(true)}
+                  onBlur={() => setIsFilterFocused(false)}
                   style={{ width: '100%', marginBottom: 0, height: '32px' }}
                 />
                 <button
@@ -2611,6 +2865,7 @@ export default function App() {
         <ul className="transcript-list">
           {filtered.map(t => {
             const entry = qualityScores[t.name];
+            const displayName = splitTranscriptNameForMiddleEllipsis(t.name);
             const issues = entry?.issues;
             const issueSummary = issues?.length ? `• ${issues.join('\n• ')}` : null;
             let confidenceNode: React.ReactNode = null;
@@ -2630,7 +2885,11 @@ export default function App() {
                   .replace(/\.00$/, '')
                   .replace(/(\.\d)0$/, '$1');
                 confidenceNode = (
-                  <span className="transcript-score" style={{ color }} title={`Confidence ${display}%`}>
+                  <span
+                    className="transcript-score"
+                    style={{ color }}
+                    title={buildConfidenceTitle(entry, display)}
+                  >
                     {display}%
                   </span>
                 );
@@ -2655,7 +2914,14 @@ export default function App() {
                     title={t.name}
                     onDoubleClick={() => openTranscript(t.path)}
                   >
-                    {t.name}
+                    {displayName.end ? (
+                      <>
+                        <span className="transcript-name-start">{displayName.start}</span>
+                        <span className="transcript-name-end">{displayName.end}</span>
+                      </>
+                    ) : (
+                      t.name
+                    )}
                   </span>
                   {confidenceNode}
                 </div>
@@ -2709,6 +2975,16 @@ export default function App() {
               disabled={!canViewContextImage}
             >
               View image
+            </button>
+            <button
+              className="transcript-context-item"
+              onClick={() => {
+                void remediateSingleDocument(contextMenu.transcript.name);
+                closeContextMenu();
+              }}
+              disabled={!canRemediateContextFile || isRemediating}
+            >
+              Remediate file
             </button>
             <button
               className="transcript-context-item"
