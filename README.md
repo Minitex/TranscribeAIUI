@@ -1,14 +1,19 @@
-<table align="center">
-  <tr>
-    <td>
-      <img src="./desktopIcon.svg" alt="TranscribeAI Logo" width="300">
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="./desktopIcon.svg" alt="TranscribeAI Logo" width="300">
+</p>
 
-**TranscribeAI** helps you turn audio files and image scans into text, fast.
+<p align="center"><strong>TranscribeAI</strong> turns audio files and image scans into text quickly and accurately.</p>
+<p align="center">Built for a simple setup and high-volume transcription workflows.</p>
 
-It is designed for people who want a simple setup and need to transcribe many files quickly.
+<p>
+  <a href="https://github.com/Minitex/TranscribeAIUI/releases/latest">
+    <img align="left" src="https://img.shields.io/github/v/tag/Minitex/TranscribeAIUI?label=Get%20Latest%20Version&style=for-the-badge&logo=github&logoColor=white&color=1f6feb" alt="Get latest TranscribeAI version" />
+  </a>
+  <a href="https://github.com/Minitex/TranscribeAIUI/releases">
+    <img align="right" src="https://img.shields.io/github/downloads/Minitex/TranscribeAIUI/total?label=%F0%9F%93%A5%20Downloads&style=for-the-badge&color=16a34a" alt="Total TranscribeAI downloads across GitHub release assets" />
+  </a>
+</p>
+<br clear="both" />
 
 ## Stay Tuned
 
@@ -19,8 +24,6 @@ It is designed for people who want a simple setup and need to transcribe many fi
     <img src="./starring.gif" alt="How to star this repository" width="900">
   </a>
 </p>
-
-**Latest downloads:** [Releases page](https://github.com/Minitex/TranscribeAIUI/releases/latest)
 
 ## What You Can Do
 

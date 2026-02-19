@@ -1397,7 +1397,6 @@ ipcMain.handle(
         files = [inputPath];
       }
 
-      let aggregate = '';
       const collectionName = stat.isDirectory() ? path.basename(inputPath) : path.basename(path.dirname(inputPath));
       
       // Throttle progress updates for large collections to improve performance
@@ -1447,7 +1446,6 @@ ipcMain.handle(
             });
             await fs.promises.writeFile(txtOut, out, 'utf-8');
             await fs.promises.appendFile(getLogPath('image'), `[OK] ${name}\n`, 'utf-8');
-            aggregate += out;
           } catch (err: any) {
             const cancelled = cancelRequested || err?.name === 'AbortError';
             const msg = cancelled ? 'Cancelled' : `Error: ${err?.message || err}`;
@@ -1465,7 +1463,7 @@ ipcMain.handle(
           }
         }
 
-        return aggregate;
+        return `[OK] Processed ${files.length} file(s) via Gemini OCR`;
       } catch (err: any) {
         if (err.killed || err.signal === 'SIGTERM' || err.cancelled || cancelRequested || err?.name === 'AbortError') {
           const lastIndex = Math.max(0, files.indexOf(err.file || '') + 1);
