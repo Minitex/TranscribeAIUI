@@ -8,6 +8,7 @@ let currentController: AbortController | null = null;
 
 const ffmpegPath = (ffmpegStatic as unknown as string) || '';
 const LONG_AUDIO_SPLIT_THRESHOLD_SECONDS = 3600;
+const MISTRAL_AUDIO_SPLIT_THRESHOLD_SECONDS = 1800;
 const TARGET_CHUNK_SECONDS = 30 * 60;
 const MAX_CHUNK_SECONDS = 35 * 60;
 const CHUNK_OVERLAP_SECONDS = 1.5;
@@ -20,9 +21,14 @@ const MAX_OVERLAP_LINES_FOR_DEDUPE = 16;
 const SRT_DUPLICATE_WINDOW_MS = 1500;
 const MAX_MISTRAL_ERROR_SNIPPET = 500;
 const MISTRAL_API_BASE = 'https://api.mistral.ai/v1';
+const MISTRAL_REQUEST_RETRY_BASE_DELAY_MS = 2000;
+const MISTRAL_REQUEST_MAX_RETRIES = 5;
+const MISTRAL_TRANSCRIPTION_RETRY_BASE_DELAY_MS = 5000;
+const MISTRAL_TRANSCRIPTION_MAX_ATTEMPTS = 3;
 
 const AUDIO_MIME_BY_EXT: Record<string, string> = {
   '.mp3': 'audio/mpeg',
+  '.mp4': 'video/mp4',
   '.wav': 'audio/wav',
   '.m4a': 'audio/mp4',
   '.aac': 'audio/aac',
@@ -132,6 +138,54 @@ async function probeDurationSeconds(filePath: string): Promise<number> {
       resolve(h * 3600 + mm * 60 + ss + frac);
     });
     proc.on('error', () => resolve(0));
+  });
+}
+
+async function inspectMediaInput(filePath: string): Promise<{
+  durationSeconds: number;
+  hasAudioStream: boolean;
+  hasVideoStream: boolean;
+}> {
+  const bin = ffmpegPath;
+  if (!bin) {
+    return {
+      durationSeconds: 0,
+      hasAudioStream: false,
+      hasVideoStream: false
+    };
+  }
+
+  return new Promise((resolve) => {
+    const proc = execFile(
+      bin,
+      ['-i', filePath],
+      {
+        windowsHide: true,
+        maxBuffer: 20 * 1024 * 1024
+      },
+      (_err, _stdout, stderr) => {
+        const details = String(stderr || '');
+        const durationMatch = /Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/.exec(details);
+        let durationSeconds = 0;
+        if (durationMatch) {
+          const [hours, minutes, seconds, fractionRaw] = durationMatch.slice(1).map(Number);
+          const fraction = Number(`0.${fractionRaw}`) || 0;
+          durationSeconds = hours * 3600 + minutes * 60 + seconds + fraction;
+        }
+
+        resolve({
+          durationSeconds,
+          hasAudioStream: /Stream #\d+:\d+(?:\[[^\]]+\])?(?:\([^)]+\))?: Audio:/i.test(details),
+          hasVideoStream: /Stream #\d+:\d+(?:\[[^\]]+\])?(?:\([^)]+\))?: Video:/i.test(details)
+        });
+      }
+    );
+
+    proc.on('error', () => resolve({
+      durationSeconds: 0,
+      hasAudioStream: false,
+      hasVideoStream: false
+    }));
   });
 }
 
@@ -492,6 +546,52 @@ function sanitizeMistralErrorText(errText: string): string {
   return `${scrubbed.slice(0, MAX_MISTRAL_ERROR_SNIPPET)}…`;
 }
 
+function getRetryDelayMs(attempt: number, baseDelayMs: number, maxDelayMs = 30000): number {
+  return Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt));
+}
+
+function formatRetryDelayMs(delayMs: number): string {
+  if (delayMs % 1000 === 0) {
+    return `${Math.round(delayMs / 1000)}s`;
+  }
+  return `${(delayMs / 1000).toFixed(1)}s`;
+}
+
+function isRetryableMistralNetworkError(error: any, signal?: AbortSignal): boolean {
+  if (!error) return false;
+  if (error instanceof DOMException && error.name === 'AbortError') return false;
+  if (signal?.aborted) return false;
+
+  const retryableCodes = new Set(['EPIPE', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+  const cause = error?.cause;
+  const code = typeof cause?.code === 'string' ? cause.code : (typeof error?.code === 'string' ? error.code : '');
+  if (retryableCodes.has(code)) return true;
+
+  const message = String(error?.message || '').toLowerCase();
+  return message.includes('fetch failed')
+    || message.includes('socket')
+    || message.includes('network')
+    || message.includes('upstream connect')
+    || message.includes('disconnect/reset before headers')
+    || message.includes('reset reason')
+    || message.includes('overflow')
+    || message.includes('headers timeout')
+    || message.includes('body timeout')
+    || message.includes('connect timeout')
+    || message.includes('other side closed')
+    || message.includes('connection terminated');
+}
+
+function isRetryableMistralError(error: any): boolean {
+  if (!error) return false;
+  if (error instanceof DOMException && error.name === 'AbortError') return false;
+
+  const retryableStatuses = new Set([408, 429, 500, 502, 503, 504]);
+  if (retryableStatuses.has(Number(error?.status))) return true;
+
+  return isRetryableMistralNetworkError(error);
+}
+
 async function sleepWithSignal(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
   await new Promise<void>((resolve, reject) => {
@@ -510,40 +610,82 @@ async function sleepWithSignal(ms: number, signal: AbortSignal): Promise<void> {
 async function uploadAudioFileToMistral(filePath: string, apiKey: string, signal: AbortSignal): Promise<string> {
   if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
   const data = await fs.promises.readFile(filePath);
-  const form = new FormData();
-  form.append('file', new Blob([data]), path.basename(filePath));
-  form.append('purpose', 'audio');
-
-  const resp = await fetch(`${MISTRAL_API_BASE}/files`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form,
-    signal
-  });
-
-  if (!resp.ok) {
-    const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
-    const err: any = new Error(`Mistral audio file upload failed: ${resp.status} ${resp.statusText} ${errText}`);
-    err.status = resp.status;
-    throw err;
+  if (data.length === 0) {
+    throw new Error(`Cannot upload empty audio file: ${path.basename(filePath)}`);
   }
 
-  const json = await resp.json();
-  const id = typeof json?.id === 'string' ? json.id : '';
-  if (!id) {
-    throw new Error('Mistral audio file upload missing id in response');
+  const maxRetries = 5;
+  const retryableCodes = new Set(['EPIPE', 'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+  const retryableStatuses = new Set([408, 429, 500, 502, 503, 504]);
+
+  const shouldRetry = (error: any): boolean => {
+    if (!error) return false;
+    if (error instanceof DOMException && error.name === 'AbortError') return false;
+    if (signal.aborted) return false;
+    if (retryableStatuses.has(Number(error?.status))) return true;
+    const cause = error?.cause;
+    const code = typeof cause?.code === 'string' ? cause.code : (typeof error?.code === 'string' ? error.code : '');
+    if (retryableCodes.has(code)) return true;
+    const message = String(error?.message || '').toLowerCase();
+    return message.includes('fetch failed') || message.includes('socket') || message.includes('network');
+  };
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    try {
+      const form = new FormData();
+      form.append('file', new Blob([data]), path.basename(filePath));
+      form.append('purpose', 'audio');
+
+      const resp = await fetch(`${MISTRAL_API_BASE}/files`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Connection: 'close'
+        },
+        body: form,
+        signal
+      });
+
+      if (!resp.ok) {
+        const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
+        const err: any = new Error(`Mistral audio file upload failed: ${resp.status} ${resp.statusText} ${errText}`);
+        err.status = resp.status;
+        throw err;
+      }
+
+      const json = await resp.json();
+      const id = typeof json?.id === 'string' ? json.id : '';
+      if (!id) {
+        throw new Error('Mistral audio file upload missing id in response');
+      }
+      return id;
+    } catch (error: any) {
+      if ((error instanceof DOMException && error.name === 'AbortError') || signal.aborted) {
+        throw error;
+      }
+      if (attempt === maxRetries - 1 || !shouldRetry(error)) {
+        throw error;
+      }
+      const delayMs = 2000 * Math.pow(2, attempt);
+      await sleepWithSignal(delayMs, signal);
+    }
   }
-  return id;
+
+  throw new Error(`Mistral audio file upload failed for ${path.basename(filePath)}`);
 }
 
 async function getMistralSignedUrl(fileId: string, apiKey: string, signal: AbortSignal): Promise<string> {
-  const maxRetries = 3;
-  const baseDelayMs = 800;
+  const maxRetries = 6;
+  const baseDelayMs = 2000;
 
   for (let attempt = 0; attempt < maxRetries; attempt += 1) {
     if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
     const resp = await fetch(`${MISTRAL_API_BASE}/files/${encodeURIComponent(fileId)}/url`, {
-      headers: { Authorization: `Bearer ${apiKey}` },
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Connection: 'close'
+      },
       signal
     });
 
@@ -720,17 +862,22 @@ type MistralTranscribeResult = {
   segments: MistralAudioSegment[];
 };
 
+function isEmptyMistralTranscribeResult(result: MistralTranscribeResult): boolean {
+  return !result.text.trim() && result.segments.length === 0;
+}
+
 async function uploadAndTranscribeMistral(
   filePath: string,
   modelName: string,
   apiKey: string,
   signal: AbortSignal,
-  opts: { subtitles: boolean; interviewMode: boolean }
+  opts: { subtitles: boolean; interviewMode: boolean; logger?: (msg: string) => Promise<void> | void }
 ): Promise<MistralTranscribeResult> {
   if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
   const data = await fs.promises.readFile(filePath);
   const fileBlob = new Blob([data]);
   const baseName = path.basename(filePath);
+  const retryLogger = opts.logger || (async () => {});
 
   const sendRequest = async (
     timestampEncoding: 'flat' | 'json-array'
@@ -753,7 +900,8 @@ async function uploadAndTranscribeMistral(
     const resp = await fetch(`${MISTRAL_API_BASE}/audio/transcriptions`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${apiKey}`
+        Authorization: `Bearer ${apiKey}`,
+        Connection: 'close'
       },
       body: form,
       signal
@@ -778,13 +926,51 @@ async function uploadAndTranscribeMistral(
     };
   };
 
-  let result = await sendRequest('flat');
+  const retryableStatuses = new Set([408, 429, 500, 502, 503, 504]);
+  const sendRequestWithRetries = async (
+    timestampEncoding: 'flat' | 'json-array'
+  ): Promise<{ ok: boolean; status: number; statusText: string; payload?: any; errText?: string }> => {
+    let lastResult: { ok: boolean; status: number; statusText: string; payload?: any; errText?: string } | null = null;
+
+    for (let requestAttempt = 0; requestAttempt < MISTRAL_REQUEST_MAX_RETRIES; requestAttempt++) {
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      try {
+        const response = await sendRequest(timestampEncoding);
+        if (response.ok || !retryableStatuses.has(response.status) || requestAttempt === MISTRAL_REQUEST_MAX_RETRIES - 1) {
+          return response;
+        }
+        lastResult = response;
+        const delayMs = getRetryDelayMs(requestAttempt, MISTRAL_REQUEST_RETRY_BASE_DELAY_MS);
+        await retryLogger(
+          `[WARN] Mistral request attempt ${requestAttempt + 1}/${MISTRAL_REQUEST_MAX_RETRIES} for ${baseName} returned ${response.status} ${response.statusText}; retrying in ${formatRetryDelayMs(delayMs)}.`
+        );
+        await sleepWithSignal(delayMs, signal);
+      } catch (error: any) {
+        if ((error instanceof DOMException && error.name === 'AbortError') || signal.aborted) throw error;
+        if (requestAttempt === MISTRAL_REQUEST_MAX_RETRIES - 1 || !isRetryableMistralNetworkError(error, signal)) {
+          throw error;
+        }
+        const delayMs = getRetryDelayMs(requestAttempt, MISTRAL_REQUEST_RETRY_BASE_DELAY_MS);
+        const detail = error?.message || error?.toString?.() || 'Unknown error';
+        await retryLogger(
+          `[WARN] Mistral request attempt ${requestAttempt + 1}/${MISTRAL_REQUEST_MAX_RETRIES} for ${baseName} failed: ${detail}. Retrying in ${formatRetryDelayMs(delayMs)}.`
+        );
+        await sleepWithSignal(delayMs, signal);
+      }
+    }
+
+    if (lastResult) return lastResult;
+    throw new Error('Mistral transcription failed: no response after retries');
+  };
+
+  let result = await sendRequestWithRetries('flat');
+
   if (
     !result.ok &&
     (opts.subtitles || opts.interviewMode) &&
     result.status === 422
   ) {
-    const retry = await sendRequest('json-array');
+    const retry = await sendRequestWithRetries('json-array');
     if (retry.ok) {
       result = retry;
     } else {
@@ -808,7 +994,7 @@ async function uploadAndTranscribeMistral(
   const segments = extractMistralSegments(payload);
   const text = extractMistralTranscriptionText(payload);
   if (!text && !segments.length) {
-    throw new Error('Mistral transcription returned no text.');
+    return { text: '', segments: [] };
   }
   return { text, segments };
 }
@@ -904,13 +1090,13 @@ async function detectSilenceRanges(
   }
 }
 
-function planBalancedChunkRanges(durationSeconds: number): PlannedChunkRange[] {
+function planBalancedChunkRanges(durationSeconds: number, minimumChunkCount = 1): PlannedChunkRange[] {
   const safeDuration = Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : TARGET_CHUNK_SECONDS;
   const minChunksByMax = Math.max(1, Math.ceil(safeDuration / MAX_CHUNK_SECONDS));
-  let chunkCount = Math.max(1, Math.round(safeDuration / TARGET_CHUNK_SECONDS), minChunksByMax);
+  let chunkCount = Math.max(1, minimumChunkCount, Math.round(safeDuration / TARGET_CHUNK_SECONDS), minChunksByMax);
 
   if (safeDuration > LONG_AUDIO_SPLIT_THRESHOLD_SECONDS) {
-    chunkCount = Math.max(2, chunkCount);
+    chunkCount = Math.max(2, minimumChunkCount, chunkCount);
   }
 
   while (safeDuration / chunkCount > MAX_CHUNK_SECONDS) {
@@ -1041,9 +1227,10 @@ async function createAudioChunks(
   base: string,
   totalDurationSeconds: number,
   signal: AbortSignal,
-  logger: (msg: string) => Promise<void> | void
+  logger: (msg: string) => Promise<void> | void,
+  minimumChunkCount = 1
 ): Promise<AudioChunk[]> {
-  const baseRanges = planBalancedChunkRanges(totalDurationSeconds);
+  const baseRanges = planBalancedChunkRanges(totalDurationSeconds, minimumChunkCount);
   const targetBoundaries = chunkRangesToBoundaries(baseRanges);
   let logicalRanges = baseRanges;
 
@@ -1218,6 +1405,48 @@ export function cancelAudioRequest() {
   }
 }
 
+async function writeEmptyAudioOutputs(
+  outputDir: string,
+  base: string,
+  subtitles: boolean,
+  logger: (msg: string) => Promise<void> | void,
+  reason: string
+): Promise<void> {
+  if (subtitles) {
+    await logger(`[WARN] ${reason}; saving empty SRT/TXT files.`);
+    const srtPath = path.join(outputDir, `${base}.srt`);
+    await fs.promises.writeFile(srtPath, '', 'utf-8');
+    await logger(`[OK] SRT saved: ${srtPath}`);
+
+    const txtPath = path.join(outputDir, `${base}.txt`);
+    await fs.promises.writeFile(txtPath, '', 'utf-8');
+    await logger(`[OK] Transcript (from SRT) saved: ${txtPath}`);
+    return;
+  }
+
+  await logger(`[WARN] ${reason}; saving empty transcript.`);
+  const outTxt = path.join(outputDir, `${base}.txt`);
+  await fs.promises.writeFile(outTxt, '', 'utf-8');
+  await logger(`[OK] Saved transcript: ${outTxt}`);
+}
+
+async function getPreflightEmptyAudioReason(filePath: string): Promise<string | null> {
+  const stat = await fs.promises.stat(filePath).catch(() => null);
+  if (stat && stat.isFile() && stat.size === 0) {
+    return 'Input file is empty';
+  }
+
+  const mediaInfo = await inspectMediaInput(filePath);
+  if (!mediaInfo.hasAudioStream && (mediaInfo.hasVideoStream || mediaInfo.durationSeconds > 0)) {
+    return 'No audio stream detected';
+  }
+  if (mediaInfo.durationSeconds <= 0 && (mediaInfo.hasAudioStream || mediaInfo.hasVideoStream)) {
+    return 'Media duration is zero';
+  }
+
+  return null;
+}
+
 type TranscribeOptions = {
   outputDir: string;
   modelName: string;
@@ -1238,6 +1467,7 @@ export async function transcribeAudioGemini(filePath: string, opts: TranscribeOp
     rawPrompt,
     interviewMode,
     subtitles,
+    tempDir,
     signal,
     logger = async () => {}
   } = opts;
@@ -1255,8 +1485,11 @@ export async function transcribeAudioGemini(filePath: string, opts: TranscribeOp
   })();
 
   await fs.promises.mkdir(outputDir, { recursive: true });
+  const workTempDir = tempDir ? path.resolve(tempDir) : outputDir;
+  await fs.promises.mkdir(workTempDir, { recursive: true });
   const base = path.basename(filePath, path.extname(filePath));
   const prompt = formatPrompt(rawPrompt, interviewMode, subtitles);
+  const tempRunId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 
   let mimeType = AUDIO_MIME_BY_EXT[path.extname(filePath).toLowerCase()] || 'audio/mpeg';
   let inputPath = filePath;
@@ -1265,10 +1498,15 @@ export async function transcribeAudioGemini(filePath: string, opts: TranscribeOp
 
   try {
     if (useSignal.aborted) throw new DOMException('Aborted', 'AbortError');
+    const preflightEmptyReason = await getPreflightEmptyAudioReason(filePath);
+    if (preflightEmptyReason) {
+      await writeEmptyAudioOutputs(outputDir, base, subtitles, logger, preflightEmptyReason);
+      return;
+    }
     if (path.extname(filePath).toLowerCase() !== '.mp3') {
-      tmpMp3 = path.join(outputDir, `${base}.mp3`);
+      tmpMp3 = path.join(workTempDir, `${base}__source_${tempRunId}.mp3`);
       await logger(`[INFO] Converting to mp3: ${tmpMp3}`);
-      await runFfmpeg(['-y', '-i', filePath, '-codec:a', 'libmp3lame', '-qscale:a', '2', tmpMp3], useSignal);
+      await runFfmpeg(['-y', '-i', filePath, '-vn', '-codec:a', 'libmp3lame', '-qscale:a', '2', tmpMp3], useSignal);
       inputPath = tmpMp3;
       mimeType = 'audio/mpeg';
       cleanup = async () => { await fs.promises.rm(tmpMp3!).catch(() => {}); };
@@ -1280,7 +1518,7 @@ export async function transcribeAudioGemini(filePath: string, opts: TranscribeOp
     const shouldSplit = totalDuration > LONG_AUDIO_SPLIT_THRESHOLD_SECONDS;
 
     if (shouldSplit) {
-      const chunks = await createAudioChunks(inputPath, outputDir, base, totalDuration, useSignal, logger);
+      const chunks = await createAudioChunks(inputPath, workTempDir, base, totalDuration, useSignal, logger);
       try {
         if (subtitles) {
           const chunkCueLists: SrtCue[][] = [];
@@ -1436,137 +1674,160 @@ export async function transcribeAudioMistral(filePath: string, opts: TranscribeO
 
   try {
     if (useSignal.aborted) throw new DOMException('Aborted', 'AbortError');
+    const preflightEmptyReason = await getPreflightEmptyAudioReason(filePath);
+    if (preflightEmptyReason) {
+      await writeEmptyAudioOutputs(outputDir, base, subtitles, logger, preflightEmptyReason);
+      return;
+    }
 
     if (path.extname(filePath).toLowerCase() !== '.mp3') {
       tmpMp3 = path.join(workTempDir, `${base}__source_${tempRunId}.mp3`);
       await logger(`[INFO] Converting to mp3: ${tmpMp3}`);
-      await runFfmpeg(['-y', '-i', filePath, '-codec:a', 'libmp3lame', '-qscale:a', '2', tmpMp3], useSignal);
+      await runFfmpeg(['-y', '-i', filePath, '-vn', '-codec:a', 'libmp3lame', '-qscale:a', '2', tmpMp3], useSignal);
       inputPath = tmpMp3;
       cleanup = async () => { await fs.promises.rm(tmpMp3!).catch(() => {}); };
     }
 
     const totalDuration = await probeDurationSeconds(inputPath);
     await logger(`[INFO] Input duration: ${totalDuration.toFixed(2)}s`);
-    const shouldSplit = totalDuration > LONG_AUDIO_SPLIT_THRESHOLD_SECONDS;
+    const shouldSplit = totalDuration > MISTRAL_AUDIO_SPLIT_THRESHOLD_SECONDS;
+    const performTranscriptionAttempt = async (): Promise<void> => {
+      if (shouldSplit) {
+        const chunks = await createAudioChunks(inputPath, workTempDir, base, totalDuration, useSignal, logger, 2);
+        try {
+          if (subtitles) {
+            const chunkCueLists: SrtCue[][] = [];
 
-    if (shouldSplit) {
-      const chunks = await createAudioChunks(inputPath, workTempDir, base, totalDuration, useSignal, logger);
-      try {
-        if (subtitles) {
-          const chunkCueLists: SrtCue[][] = [];
-
-          for (let i = 0; i < chunks.length; i += 1) {
-            const chunk = chunks[i];
-            await logger(`[INFO] Uploading subtitle chunk ${i + 1}/${chunks.length} (${path.basename(chunk.audioPath)})`);
-            const result = await uploadAndTranscribeMistral(chunk.audioPath, modelName, apiKey, useSignal, {
-              subtitles: true,
-              interviewMode: false
-            });
-            const cues = result.segments.length
-              ? mistralSegmentsToSrtCues(result.segments)
-              : parseSrtCues(result.text || '');
-            if (!cues.length) {
-              throw new Error(`Subtitle chunk ${i + 1}/${chunks.length} did not return timestamped segments.`);
-            }
-            chunkCueLists.push(shiftSrtCues(cues, chunk.startOffsetSeconds));
-          }
-
-          const mergedCues = mergeSrtCueLists(chunkCueLists);
-          const srtText = serializeSrtCues(mergedCues);
-          const srtPath = path.join(outputDir, `${base}.srt`);
-          await fs.promises.writeFile(srtPath, srtText, 'utf-8');
-          await logger(`[OK] SRT saved: ${srtPath}`);
-
-          const txtFromSrt = srtCuesToTranscript(mergedCues);
-          const txtPath = path.join(outputDir, `${base}.txt`);
-          await fs.promises.writeFile(txtPath, txtFromSrt, 'utf-8');
-          await logger(`[OK] Transcript (from merged SRT) saved: ${txtPath}`);
-        } else if (interviewMode) {
-          const chunkInterviewGroups: Array<Array<{ speaker?: string; transcription?: string }>> = [];
-          const chunkRawTexts: string[] = [];
-          let allChunksParsed = true;
-
-          for (let i = 0; i < chunks.length; i += 1) {
-            const chunk = chunks[i];
-            await logger(`[INFO] Uploading interview chunk ${i + 1}/${chunks.length} (${path.basename(chunk.audioPath)})`);
-            const result = await uploadAndTranscribeMistral(chunk.audioPath, modelName, apiKey, useSignal, {
-              subtitles: false,
-              interviewMode: true
-            });
-
-            const fallbackChunkText = result.segments.length
-              ? mistralSegmentsToTranscriptLines(result.segments).join('\n')
-              : sanitizeChunkText(result.text || '');
-            chunkRawTexts.push(shiftBracketTimestamps(fallbackChunkText, chunk.startOffsetSeconds));
-
-            let entries: Array<{ speaker?: string; transcription?: string }> | null = null;
-            if (result.segments.some(seg => typeof seg.speaker === 'string' && seg.speaker.trim())) {
-              const fromSegments = mistralSegmentsToInterviewEntries(result.segments);
-              if (fromSegments.length) entries = fromSegments;
-            }
-            if (!entries) {
-              const parsed = tryParseSpeakerJson(result.text || '');
-              if (parsed) entries = parsed;
+            for (let i = 0; i < chunks.length; i += 1) {
+              const chunk = chunks[i];
+              await logger(`[INFO] Uploading subtitle chunk ${i + 1}/${chunks.length} (${path.basename(chunk.audioPath)})`);
+              const result = await uploadAndTranscribeMistral(chunk.audioPath, modelName, apiKey, useSignal, {
+                subtitles: true,
+                interviewMode: false,
+                logger
+              });
+              const cues = result.segments.length
+                ? mistralSegmentsToSrtCues(result.segments)
+                : parseSrtCues(result.text || '');
+              if (!cues.length) {
+                if (isEmptyMistralTranscribeResult(result)) {
+                  await logger(`[WARN] Subtitle chunk ${i + 1}/${chunks.length} returned no speech; skipping empty chunk.`);
+                  chunkCueLists.push([]);
+                  continue;
+                }
+                throw new Error(`Subtitle chunk ${i + 1}/${chunks.length} did not return timestamped segments.`);
+              }
+              chunkCueLists.push(shiftSrtCues(cues, chunk.startOffsetSeconds));
             }
 
-            if (entries && entries.length) {
-              chunkInterviewGroups.push(entries);
+            const mergedCues = mergeSrtCueLists(chunkCueLists);
+            if (!mergedCues.length) {
+              await logger('[WARN] No speech detected across subtitle chunks; saving empty SRT/TXT files.');
+            }
+            const srtText = serializeSrtCues(mergedCues);
+            const srtPath = path.join(outputDir, `${base}.srt`);
+            await fs.promises.writeFile(srtPath, srtText, 'utf-8');
+            await logger(`[OK] SRT saved: ${srtPath}`);
+
+            const txtFromSrt = srtCuesToTranscript(mergedCues);
+            const txtPath = path.join(outputDir, `${base}.txt`);
+            await fs.promises.writeFile(txtPath, txtFromSrt, 'utf-8');
+            await logger(`[OK] Transcript (from merged SRT) saved: ${txtPath}`);
+          } else if (interviewMode) {
+            const chunkInterviewGroups: Array<Array<{ speaker?: string; transcription?: string }>> = [];
+            const chunkRawTexts: string[] = [];
+            let allChunksParsed = true;
+
+            for (let i = 0; i < chunks.length; i += 1) {
+              const chunk = chunks[i];
+              await logger(`[INFO] Uploading interview chunk ${i + 1}/${chunks.length} (${path.basename(chunk.audioPath)})`);
+              const result = await uploadAndTranscribeMistral(chunk.audioPath, modelName, apiKey, useSignal, {
+                subtitles: false,
+                interviewMode: true,
+                logger
+              });
+
+              const fallbackChunkText = result.segments.length
+                ? mistralSegmentsToTranscriptLines(result.segments).join('\n')
+                : sanitizeChunkText(result.text || '');
+              chunkRawTexts.push(shiftBracketTimestamps(fallbackChunkText, chunk.startOffsetSeconds));
+
+              let entries: Array<{ speaker?: string; transcription?: string }> | null = null;
+              if (result.segments.some(seg => typeof seg.speaker === 'string' && seg.speaker.trim())) {
+                const fromSegments = mistralSegmentsToInterviewEntries(result.segments);
+                if (fromSegments.length) entries = fromSegments;
+              }
+              if (!entries) {
+                const parsed = tryParseSpeakerJson(result.text || '');
+                if (parsed) entries = parsed;
+              }
+
+              if (entries && entries.length) {
+                chunkInterviewGroups.push(entries);
+              } else {
+                allChunksParsed = false;
+              }
+            }
+
+            const outTxt = path.join(outputDir, `${base}.txt`);
+            if (allChunksParsed && chunkInterviewGroups.length === chunks.length) {
+              const mergedEntries = mergeInterviewEntries(chunkInterviewGroups);
+              const pretty = formatSpeakerTranscript(mergedEntries);
+              const outText = pretty.endsWith('\n') ? pretty : `${pretty}\n`;
+              await fs.promises.writeFile(outTxt, outText, 'utf-8');
+              await logger(`[OK] Interview diarization parsed across chunks: ${mergedEntries.length} entries.`);
+              await logger(`[OK] Saved transcript: ${outTxt}`);
             } else {
-              allChunksParsed = false;
+              const mergedRaw = mergeTextChunks(chunkRawTexts);
+              await fs.promises.writeFile(outTxt, mergedRaw, 'utf-8');
+              await logger('[WARN] Interview diarization unavailable for one or more chunks; saved merged raw transcript.');
+              await logger(`[OK] Saved transcript: ${outTxt}`);
             }
-          }
-
-          const outTxt = path.join(outputDir, `${base}.txt`);
-          if (allChunksParsed && chunkInterviewGroups.length === chunks.length) {
-            const mergedEntries = mergeInterviewEntries(chunkInterviewGroups);
-            const pretty = formatSpeakerTranscript(mergedEntries);
-            const outText = pretty.endsWith('\n') ? pretty : `${pretty}\n`;
-            await fs.promises.writeFile(outTxt, outText, 'utf-8');
-            await logger(`[OK] Interview diarization parsed across chunks: ${mergedEntries.length} entries.`);
-            await logger(`[OK] Saved transcript: ${outTxt}`);
           } else {
-            const mergedRaw = mergeTextChunks(chunkRawTexts);
-            await fs.promises.writeFile(outTxt, mergedRaw, 'utf-8');
-            await logger('[WARN] Interview diarization unavailable for one or more chunks; saved merged raw transcript.');
-            await logger(`[OK] Saved transcript: ${outTxt}`);
-          }
-        } else {
-          const chunkTexts: string[] = [];
+            const chunkTexts: string[] = [];
 
-          for (let i = 0; i < chunks.length; i += 1) {
-            const chunk = chunks[i];
-            await logger(`[INFO] Uploading transcript chunk ${i + 1}/${chunks.length} (${path.basename(chunk.audioPath)})`);
-            const result = await uploadAndTranscribeMistral(chunk.audioPath, modelName, apiKey, useSignal, {
-              subtitles: false,
-              interviewMode: false
-            });
-            const chunkText = result.segments.length
-              ? mistralSegmentsToTranscriptLines(result.segments).join('\n')
-              : sanitizeChunkText(result.text || '');
-            const shifted = shiftBracketTimestamps(chunkText, chunk.startOffsetSeconds);
-            chunkTexts.push(shifted);
-          }
+            for (let i = 0; i < chunks.length; i += 1) {
+              const chunk = chunks[i];
+              await logger(`[INFO] Uploading transcript chunk ${i + 1}/${chunks.length} (${path.basename(chunk.audioPath)})`);
+              const result = await uploadAndTranscribeMistral(chunk.audioPath, modelName, apiKey, useSignal, {
+                subtitles: false,
+                interviewMode: false,
+                logger
+              });
+              const chunkText = result.segments.length
+                ? mistralSegmentsToTranscriptLines(result.segments).join('\n')
+                : sanitizeChunkText(result.text || '');
+              const shifted = shiftBracketTimestamps(chunkText, chunk.startOffsetSeconds);
+              chunkTexts.push(shifted);
+            }
 
-          const combined = mergeTextChunks(chunkTexts);
-          const combinedTxt = path.join(outputDir, `${base}.txt`);
-          await fs.promises.writeFile(combinedTxt, combined, 'utf-8');
-          await logger(`[OK] Saved merged TXT: ${combinedTxt}`);
+            const combined = mergeTextChunks(chunkTexts);
+            const combinedTxt = path.join(outputDir, `${base}.txt`);
+            await fs.promises.writeFile(combinedTxt, combined, 'utf-8');
+            await logger(`[OK] Saved merged TXT: ${combinedTxt}`);
+          }
+        } finally {
+          await cleanupAudioChunks(chunks);
         }
-      } finally {
-        await cleanupAudioChunks(chunks);
+        return;
       }
-    } else {
+
       await logger(`[INFO] Uploading full audio (${path.basename(inputPath)})`);
       const result = await uploadAndTranscribeMistral(inputPath, modelName, apiKey, useSignal, {
         subtitles,
-        interviewMode
+        interviewMode,
+        logger
       });
 
       if (subtitles) {
+        const emptyResult = isEmptyMistralTranscribeResult(result);
+        if (emptyResult) {
+          await logger('[WARN] No speech detected; saving empty SRT/TXT files.');
+        }
         const cues = result.segments.length
           ? mistralSegmentsToSrtCues(result.segments)
           : parseSrtCues(result.text || '');
-        if (!cues.length) {
+        if (!cues.length && !emptyResult) {
           throw new Error('Mistral subtitle mode returned no timestamped segments.');
         }
 
@@ -1599,7 +1860,11 @@ export async function transcribeAudioMistral(filePath: string, opts: TranscribeO
           await logger('[WARN] Interview diarization missing speaker labels; saved timestamped transcript.');
         } else {
           outText = sanitizeChunkText(result.text || '');
-          await logger('[WARN] Interview mode: expected diarized segments, saving raw text.');
+          if (isEmptyMistralTranscribeResult(result)) {
+            await logger('[WARN] Interview mode: no speech detected; saving empty transcript.');
+          } else {
+            await logger('[WARN] Interview mode: expected diarized segments, saving raw text.');
+          }
         }
         const outTxt = path.join(outputDir, `${base}.txt`);
         await fs.promises.writeFile(outTxt, outText, 'utf-8');
@@ -1608,9 +1873,34 @@ export async function transcribeAudioMistral(filePath: string, opts: TranscribeO
         const outText = result.segments.length
           ? mistralSegmentsToTranscriptLines(result.segments).join('\n')
           : sanitizeChunkText(result.text || '');
+        if (isEmptyMistralTranscribeResult(result)) {
+          await logger('[WARN] No speech detected; saving empty transcript.');
+        }
         const outTxt = path.join(outputDir, `${base}.txt`);
         await fs.promises.writeFile(outTxt, outText, 'utf-8');
         await logger(`[OK] Saved transcript: ${outTxt}`);
+      }
+    };
+
+    for (let attempt = 0; attempt < MISTRAL_TRANSCRIPTION_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        if (attempt > 0) {
+          await logger(
+            `[INFO] Retrying Mistral transcription for ${path.basename(inputPath)} (${attempt + 1}/${MISTRAL_TRANSCRIPTION_MAX_ATTEMPTS}).`
+          );
+        }
+        await performTranscriptionAttempt();
+        break;
+      } catch (error: any) {
+        if ((error instanceof DOMException && error.name === 'AbortError') || useSignal.aborted) throw error;
+        if (attempt === MISTRAL_TRANSCRIPTION_MAX_ATTEMPTS - 1 || !isRetryableMistralError(error)) throw error;
+
+        const delayMs = getRetryDelayMs(attempt, MISTRAL_TRANSCRIPTION_RETRY_BASE_DELAY_MS, 45000);
+        const detail = error?.message || error?.toString?.() || 'Unknown error';
+        await logger(
+          `[WARN] Mistral transcription attempt ${attempt + 1}/${MISTRAL_TRANSCRIPTION_MAX_ATTEMPTS} failed for ${path.basename(inputPath)}: ${detail}. Retrying full file in ${formatRetryDelayMs(delayMs)}.`
+        );
+        await sleepWithSignal(delayMs, useSignal);
       }
     }
   } finally {

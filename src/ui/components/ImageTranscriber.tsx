@@ -13,7 +13,7 @@ interface ImageTranscriberProps {
   outputDir: string;
   isTranscribing: boolean;
   mistralMode: boolean;
-  recursive: boolean;
+  outputPdfEnabled: boolean;
   batchEnabled: boolean;
   batchSize: number;
   inputIsDirectory: boolean;
@@ -28,7 +28,7 @@ interface ImageTranscriberProps {
   onSelectOutput(): void;
   onClearInput(): void;
   onClearOutput(): void;
-  onToggleRecursive(): void;
+  onToggleOutputPdf(): void;
   onToggleBatch(): void;
   onBatchSizeChange(size: number): void;
   onOpenBatchQueue(): void;
@@ -60,7 +60,7 @@ export default function ImageTranscriber({
   outputDir,
   isTranscribing,
   mistralMode,
-  recursive,
+  outputPdfEnabled,
   batchEnabled,
   batchSize,
   inputIsDirectory,
@@ -69,7 +69,7 @@ export default function ImageTranscriber({
   onSelectOutput,
   onClearInput,
   onClearOutput,
-  onToggleRecursive,
+  onToggleOutputPdf,
   onToggleBatch,
   onBatchSizeChange,
   onOpenBatchQueue,
@@ -143,83 +143,94 @@ export default function ImageTranscriber({
               </button>
             )}
           </div>
-          <div className="options-group">
-            <label className="option-item" style={{ opacity: inputIsDirectory ? 1 : 0.6 }}>
+          <div className="options-group options-group-column">
+            <label className="option-item">
               <input
                 type="checkbox"
-                checked={batchEnabled}
-                onChange={onToggleBatch}
-                disabled={!inputIsDirectory || isTranscribing}
+                checked={outputPdfEnabled}
+                onChange={onToggleOutputPdf}
+                disabled={isTranscribing}
               />
-              Batch mode
+              Generate accessible PDF
             </label>
-            {batchEnabled && (
-              <div className="batch-controls-inline" style={{ opacity: inputIsDirectory ? 1 : 0.6 }}>
-                <div className="batch-size-controls">
-                  <span className="batch-size-label">Size</span>
-                  <div className="batch-size-main">
-                    <button
-                      type="button"
-                      className="batch-step-btn"
-                      onClick={() => onBatchSizeChange(getPrevBatchSize(batchSize))}
-                      disabled={batchSize <= 10 || !inputIsDirectory || isTranscribing}
-                      aria-label="Decrease batch size"
-                    >
-                      −
-                    </button>
-                    <span className="batch-size-current">{batchSize}</span>
-                    <button
-                      type="button"
-                      className="batch-step-btn"
-                      onClick={() => onBatchSizeChange(getNextBatchSize(batchSize))}
-                      disabled={batchSize >= 500 || !inputIsDirectory || isTranscribing}
-                      aria-label="Increase batch size"
-                    >
-                      +
-                    </button>
+            <div className="options-group">
+              <label className="option-item" style={{ opacity: inputIsDirectory ? 1 : 0.6 }}>
+                <input
+                  type="checkbox"
+                  checked={batchEnabled}
+                  onChange={onToggleBatch}
+                  disabled={!inputIsDirectory || isTranscribing}
+                />
+                Batch mode
+              </label>
+              {batchEnabled && (
+                <div className="batch-controls-inline" style={{ opacity: inputIsDirectory ? 1 : 0.6 }}>
+                  <div className="batch-size-controls">
+                    <span className="batch-size-label">Size</span>
+                    <div className="batch-size-main">
+                      <button
+                        type="button"
+                        className="batch-step-btn"
+                        onClick={() => onBatchSizeChange(getPrevBatchSize(batchSize))}
+                        disabled={batchSize <= 10 || !inputIsDirectory || isTranscribing}
+                        aria-label="Decrease batch size"
+                      >
+                        −
+                      </button>
+                      <span className="batch-size-current">{batchSize}</span>
+                      <button
+                        type="button"
+                        className="batch-step-btn"
+                        onClick={() => onBatchSizeChange(getNextBatchSize(batchSize))}
+                        disabled={batchSize >= 500 || !inputIsDirectory || isTranscribing}
+                        aria-label="Increase batch size"
+                      >
+                        +
+                      </button>
+                    </div>
                   </div>
-                </div>
-                {inputIsDirectory && (
-                  <div className="batch-mini-stats">
-                    <div className="batch-mini-stat">
-                      <span>Uploaded</span>
-                      <strong>{batchStats?.uploaded ?? 0}</strong>
-                    </div>
-                    <div className="batch-mini-stat">
-                      <span>Processing</span>
-                      <strong>{batchStats?.processing ?? 0}</strong>
-                    </div>
-                    <div className="batch-mini-stat">
-                      <span>Completed</span>
-                      <strong>{batchStats?.completed ?? 0}</strong>
-                    </div>
-                    {(batchStats?.failed ?? 0) > 0 && (
-                      <div className="batch-mini-stat failed">
-                        <span>Failed</span>
-                        <strong>{batchStats?.failed ?? 0}</strong>
+                  {inputIsDirectory && (
+                    <div className="batch-mini-stats">
+                      <div className="batch-mini-stat">
+                        <span>Uploaded</span>
+                        <strong>{batchStats?.uploaded ?? 0}</strong>
                       </div>
-                    )}
-                  </div>
-                )}
-                {inputIsDirectory && (
-                  <button
-                    type="button"
-                    className="batch-queue-open-btn"
-                    onClick={onOpenBatchQueue}
-                    disabled={isTranscribing}
-                    aria-label="Open saved Mistral batch queue"
-                  >
-                    <FaListUl className="batch-queue-icon" aria-hidden="true" />
-                    <span className="batch-queue-tooltip" role="tooltip">Open batch queue</span>
-                    {queueCollectionCount > 0 && (
-                      <span className="batch-queue-count-badge" aria-label={`${queueCollectionCount} saved collections`}>
-                        {queueCollectionCount > 99 ? '99+' : queueCollectionCount}
-                      </span>
-                    )}
-                  </button>
-                )}
-              </div>
-            )}
+                      <div className="batch-mini-stat">
+                        <span>Processing</span>
+                        <strong>{batchStats?.processing ?? 0}</strong>
+                      </div>
+                      <div className="batch-mini-stat">
+                        <span>Completed</span>
+                        <strong>{batchStats?.completed ?? 0}</strong>
+                      </div>
+                      {(batchStats?.failed ?? 0) > 0 && (
+                        <div className="batch-mini-stat failed">
+                          <span>Failed</span>
+                          <strong>{batchStats?.failed ?? 0}</strong>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {inputIsDirectory && (
+                    <button
+                      type="button"
+                      className="batch-queue-open-btn"
+                      onClick={onOpenBatchQueue}
+                      disabled={isTranscribing}
+                      aria-label="Open saved Mistral batch queue"
+                    >
+                      <FaListUl className="batch-queue-icon" aria-hidden="true" />
+                      <span className="batch-queue-tooltip" role="tooltip">Open batch queue</span>
+                      {queueCollectionCount > 0 && (
+                        <span className="batch-queue-count-badge" aria-label={`${queueCollectionCount} saved collections`}>
+                          {queueCollectionCount > 99 ? '99+' : queueCollectionCount}
+                        </span>
+                      )}
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}

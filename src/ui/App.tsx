@@ -29,20 +29,89 @@ const os = (window as any).require('os') as typeof import('os');
 const pathModule = (window as any).require('path') as typeof import('path');
 
 const AUDIO_MODEL_OPTIONS = [
+  'voxtral-mini-latest',
+  'gemini-3.1-pro-preview',
+  'gemini-3-flash-preview',
   'gemini-2.5-pro',
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
-  'voxtral-mini-latest'
+  'gemini-2.5-flash'
 ];
+const DEFAULT_AUDIO_MODEL = 'gemini-3.1-pro-preview';
 
 const IMAGE_MODEL_OPTIONS = [
+  'mistral-ocr-latest',
+  'gemini-3.1-pro-preview',
+  'gemini-3-flash-preview',
   'gemini-2.5-pro',
-  'gemini-2.5-flash',
-  'gemini-2.0-flash',
-  'mistral-ocr-latest'
+  'gemini-2.5-flash'
 ];
+const DEFAULT_IMAGE_MODEL = 'gemini-2.5-flash';
+const MISTRAL_BATCH_WORKER_OPTIONS = [1, 2, 3, 4, 5] as const;
+const MIN_MISTRAL_BATCH_WORKERS = MISTRAL_BATCH_WORKER_OPTIONS[0];
+const MAX_MISTRAL_BATCH_WORKERS = MISTRAL_BATCH_WORKER_OPTIONS[MISTRAL_BATCH_WORKER_OPTIONS.length - 1];
+const DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS = 2;
+const DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS = 2;
+const DISPLAY_LOG_MAX_BYTES = 256 * 1024;
+const LIVE_LOG_REFRESH_INTERVAL_MS = 2000;
+const LIVE_TRANSCRIPT_REFRESH_INTERVAL_MS = 8000;
+const LIVE_BATCH_UI_REFRESH_INTERVAL_MS = 2000;
 
-const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.gif', '.pdf'];
+const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.jp2', '.tif', '.tiff', '.bmp', '.gif', '.pdf'];
+const ACCESSIBLE_PDF_PREFIX = 'ACCESSIBLE_';
+
+function resolveSupportedModel(
+  value: string | null | undefined,
+  options: readonly string[],
+  fallback: string
+): string {
+  if (typeof value === 'string' && options.includes(value)) {
+    return value;
+  }
+  return fallback;
+}
+
+function resolveWorkerCount(value: string | number | null | undefined, fallback: number): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(MAX_MISTRAL_BATCH_WORKERS, Math.max(MIN_MISTRAL_BATCH_WORKERS, Math.floor(parsed)));
+}
+
+function getNextWorkerCount(currentValue: number): number {
+  return Math.min(MAX_MISTRAL_BATCH_WORKERS, resolveWorkerCount(currentValue, MAX_MISTRAL_BATCH_WORKERS) + 1);
+}
+
+function getPrevWorkerCount(currentValue: number): number {
+  return Math.max(MIN_MISTRAL_BATCH_WORKERS, resolveWorkerCount(currentValue, MIN_MISTRAL_BATCH_WORKERS) - 1);
+}
+
+function normalizeLocalPath(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  try {
+    return pathModule.normalize(pathModule.resolve(trimmed));
+  } catch {
+    return trimmed;
+  }
+}
+
+function resolveImageInputPathKind(value: string): 'file' | 'directory' | 'missing' {
+  const normalized = normalizeLocalPath(value);
+  if (!normalized) return 'missing';
+
+  try {
+    const stats = fs.statSync(normalized);
+    if (stats.isDirectory()) return 'directory';
+    if (stats.isFile()) return 'file';
+  } catch {
+    const ext = pathModule.extname(normalized).toLowerCase();
+    if (IMAGE_EXTS.includes(ext)) return 'file';
+    // The UI picker only allows folders here, so keep batch mode available
+    // when a renderer-side stat check is the only thing failing.
+    return 'directory';
+  }
+
+  return 'missing';
+}
 
 type QualityIssueCode =
   | 'blank_transcript'
@@ -317,11 +386,17 @@ function SettingsView({
   onOpenUpdateInstructions
 }: SettingsProps) {
   const [key, setKey] = useState('');
-  const [audioModel, setAudioModel] = useState(AUDIO_MODEL_OPTIONS[0]);
-  const [imageModel, setImageModel] = useState(IMAGE_MODEL_OPTIONS[0]);
+  const [audioModel, setAudioModel] = useState(DEFAULT_AUDIO_MODEL);
+  const [imageModel, setImageModel] = useState(DEFAULT_IMAGE_MODEL);
   const [mistralKey, setMistralKey] = useState('');
   const [audioPrompt, setAudioPrompt] = useState<string>(DEFAULT_AUDIO_PROMPT);
   const [imagePrompt, setImagePrompt] = useState<string>(DEFAULT_IMAGE_PROMPT);
+  const [mistralBatchPreprocessWorkers, setMistralBatchPreprocessWorkers] = useState<number>(
+    DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS
+  );
+  const [mistralBatchUploadWorkers, setMistralBatchUploadWorkers] = useState<number>(
+    DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS
+  );
   const [saved, setSaved] = useState(false);
   const [showApiKeys, setShowApiKeys] = useState(false);
   const [clearingTempFiles, setClearingTempFiles] = useState(false);
@@ -335,20 +410,36 @@ function SettingsView({
 
     ipcRenderer
       .invoke('get-audio-model')
-        .then((m: string) =>
-          setAudioModel(m || (localStorage.getItem('audioModel') || AUDIO_MODEL_OPTIONS[0]))
+      .then((m: string) =>
+        setAudioModel(
+          resolveSupportedModel(
+            m || localStorage.getItem('audioModel'),
+            AUDIO_MODEL_OPTIONS,
+            DEFAULT_AUDIO_MODEL
+          )
         )
+      )
       .catch(() =>
-        setAudioModel((localStorage.getItem('audioModel') as string) || AUDIO_MODEL_OPTIONS[0])
+        setAudioModel(
+          resolveSupportedModel(localStorage.getItem('audioModel'), AUDIO_MODEL_OPTIONS, DEFAULT_AUDIO_MODEL)
+        )
       );
 
     ipcRenderer
       .invoke('get-image-model')
-        .then((m: string) =>
-          setImageModel(m || (localStorage.getItem('imageModel') || IMAGE_MODEL_OPTIONS[0]))
+      .then((m: string) =>
+        setImageModel(
+          resolveSupportedModel(
+            m || localStorage.getItem('imageModel'),
+            IMAGE_MODEL_OPTIONS,
+            DEFAULT_IMAGE_MODEL
+          )
         )
+      )
       .catch(() =>
-        setImageModel((localStorage.getItem('imageModel') as string) || IMAGE_MODEL_OPTIONS[0])
+        setImageModel(
+          resolveSupportedModel(localStorage.getItem('imageModel'), IMAGE_MODEL_OPTIONS, DEFAULT_IMAGE_MODEL)
+        )
       );
 
     ipcRenderer
@@ -376,6 +467,44 @@ function SettingsView({
       )
       .catch(() =>
         setImagePrompt((localStorage.getItem('imagePrompt') as string) || DEFAULT_IMAGE_PROMPT)
+      );
+
+    ipcRenderer
+      .invoke('get-mistral-batch-preprocess-workers')
+      .then((value: number) =>
+        setMistralBatchPreprocessWorkers(
+          resolveWorkerCount(
+            value ?? localStorage.getItem('mistralBatchPreprocessWorkers'),
+            DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS
+          )
+        )
+      )
+      .catch(() =>
+        setMistralBatchPreprocessWorkers(
+          resolveWorkerCount(
+            localStorage.getItem('mistralBatchPreprocessWorkers'),
+            DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS
+          )
+        )
+      );
+
+    ipcRenderer
+      .invoke('get-mistral-batch-upload-workers')
+      .then((value: number) =>
+        setMistralBatchUploadWorkers(
+          resolveWorkerCount(
+            value ?? localStorage.getItem('mistralBatchUploadWorkers'),
+            DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS
+          )
+        )
+      )
+      .catch(() =>
+        setMistralBatchUploadWorkers(
+          resolveWorkerCount(
+            localStorage.getItem('mistralBatchUploadWorkers'),
+            DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS
+          )
+        )
       );
   }, []);
 
@@ -412,6 +541,17 @@ function SettingsView({
       await ipcRenderer.invoke('set-image-prompt', imagePrompt);
     } catch {
       localStorage.setItem('imagePrompt', imagePrompt);
+    }
+
+    try {
+      await ipcRenderer.invoke('set-mistral-batch-preprocess-workers', mistralBatchPreprocessWorkers);
+    } catch {
+      localStorage.setItem('mistralBatchPreprocessWorkers', String(mistralBatchPreprocessWorkers));
+    }
+    try {
+      await ipcRenderer.invoke('set-mistral-batch-upload-workers', mistralBatchUploadWorkers);
+    } catch {
+      localStorage.setItem('mistralBatchUploadWorkers', String(mistralBatchUploadWorkers));
     }
 
     setSaved(true);
@@ -459,80 +599,80 @@ function SettingsView({
       <h2 style={{ flexShrink: 0 }}>Settings</h2>
 
       <div className="settings-scroll">
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-            gap: '0.75rem',
-            padding: '0.85rem 1rem',
-            borderRadius: 10,
-            background: 'rgba(255,255,255,0.04)',
-            border: '1px solid rgba(255,255,255,0.08)',
-            flexWrap: 'wrap'
-          }}
-        >
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <div style={{ fontWeight: 600 }}>Software Updates</div>
-            <div style={{ fontSize: '0.9rem', color: 'var(--text-light)' }}>
-              {checkingUpdate
-                ? 'Checking for updates…'
-                : latestVersion && currentVersion && latestVersion === currentVersion
-                ? `You’re up to date on v${currentVersion}.`
-                : latestVersion && currentVersion
-                ? `New version v${latestVersion} available.`
-                : currentVersion
-                ? `Current v${currentVersion}`
-                : 'Check for newer versions on GitHub releases.'}
-            </div>
-            {updateError && (
-              <div style={{ color: '#ff8a80', fontSize: '0.85rem' }}>{updateError}</div>
-            )}
-            {latestVersion && currentVersion && latestVersion !== currentVersion && (
-              <div style={{ color: '#6dd36d', fontSize: '0.9rem' }}>
-                Download from the latest release to update.{' '}
-                <a
-                  href="#"
-                  onClick={e => {
-                    e.preventDefault();
-                    onOpenUpdateInstructions();
-                  }}
-                  style={{ color: '#8dd3ff', textDecoration: 'underline' }}
-                >
-                  View instructions on our page.
-                </a>
-              </div>
-            )}
-          </div>
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
-            <button
-              className="btn"
-              onClick={onCheckLatest}
-              disabled={checkingUpdate}
-              style={{ display: 'flex', alignItems: 'center', gap: 8 }}
-              title="Check GitHub for the latest release"
-            >
-              {checkingUpdate ? <FaSpinner className="spin" /> : 'Check'}
-            </button>
-            {latestVersion && currentVersion && latestVersion !== currentVersion && (
-              <button
-                className="btn save"
-                onClick={onOpenUpdatePage}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  border: '2px solid #4caf50'
-                }}
-                title="Open the latest release page on GitHub"
-              >
-                New version available
-              </button>
-            )}
-          </div>
-        </div>
-
         <div className="settings-body">
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: '0.75rem',
+              padding: '0.85rem 1rem',
+              borderRadius: 10,
+              background: 'rgba(255,255,255,0.04)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              flexWrap: 'wrap'
+            }}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <div style={{ fontWeight: 600 }}>Software Updates</div>
+              <div style={{ fontSize: '0.9rem', color: 'var(--text-light)' }}>
+                {checkingUpdate
+                  ? 'Checking for updates…'
+                  : latestVersion && currentVersion && latestVersion === currentVersion
+                  ? `You’re up to date on v${currentVersion}.`
+                  : latestVersion && currentVersion
+                  ? `New version v${latestVersion} available.`
+                  : currentVersion
+                  ? `Current v${currentVersion}`
+                  : 'Check for newer versions on GitHub releases.'}
+              </div>
+              {updateError && (
+                <div style={{ color: '#ff8a80', fontSize: '0.85rem' }}>{updateError}</div>
+              )}
+              {latestVersion && currentVersion && latestVersion !== currentVersion && (
+                <div style={{ color: '#6dd36d', fontSize: '0.9rem' }}>
+                  Download from the latest release to update.{' '}
+                  <a
+                    href="#"
+                    onClick={e => {
+                      e.preventDefault();
+                      onOpenUpdateInstructions();
+                    }}
+                    style={{ color: '#8dd3ff', textDecoration: 'underline' }}
+                  >
+                    View instructions on our page.
+                  </a>
+                </div>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+              <button
+                className="btn"
+                onClick={onCheckLatest}
+                disabled={checkingUpdate}
+                style={{ display: 'flex', alignItems: 'center', gap: 8 }}
+                title="Check GitHub for the latest release"
+              >
+                {checkingUpdate ? <FaSpinner className="spin" /> : 'Check'}
+              </button>
+              {latestVersion && currentVersion && latestVersion !== currentVersion && (
+                <button
+                  className="btn save"
+                  onClick={onOpenUpdatePage}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8,
+                    border: '2px solid #4caf50'
+                  }}
+                  title="Open the latest release page on GitHub"
+                >
+                  New version available
+                </button>
+              )}
+            </div>
+          </div>
+
           <div className="api-key-section">
             <button
               type="button"
@@ -702,6 +842,94 @@ function SettingsView({
           </div>
         </div>
 
+        <div
+          className="clear-temp-section"
+          style={{ marginTop: '1.5rem', padding: '1rem', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderRadius: '8px' }}
+        >
+          <div style={{ marginBottom: '0.9rem' }}>
+            <h3 style={{ margin: '0 0 0.25rem 0', fontSize: '1rem', fontWeight: '500' }}>Image Workers</h3>
+            <p style={{ margin: 0, fontSize: '0.875rem', opacity: 0.8 }}>
+              Control how many files preprocess and send OCR requests in parallel for Mistral batch, regular Mistral, and Gemini image runs.
+            </p>
+          </div>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+              gap: '1rem'
+            }}
+          >
+            <div className="model-group" style={{ marginBottom: 0 }}>
+              <label htmlFor="mistral-batch-preprocess-workers">Preprocess Workers</label>
+              <div
+                className="batch-size-controls"
+                role="group"
+                aria-labelledby="mistral-batch-preprocess-workers"
+                style={{ width: 'fit-content' }}
+              >
+                <div className="batch-size-main">
+                  <button
+                    type="button"
+                    className="batch-step-btn"
+                    onClick={() => setMistralBatchPreprocessWorkers(getPrevWorkerCount(mistralBatchPreprocessWorkers))}
+                    disabled={mistralBatchPreprocessWorkers <= MIN_MISTRAL_BATCH_WORKERS}
+                    aria-label="Decrease preprocess workers"
+                  >
+                    −
+                  </button>
+                  <span className="batch-size-current" aria-live="polite">{mistralBatchPreprocessWorkers}</span>
+                  <button
+                    type="button"
+                    className="batch-step-btn"
+                    onClick={() => setMistralBatchPreprocessWorkers(getNextWorkerCount(mistralBatchPreprocessWorkers))}
+                    disabled={mistralBatchPreprocessWorkers >= MAX_MISTRAL_BATCH_WORKERS}
+                    aria-label="Increase preprocess workers"
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+              <small style={{ display: 'block', marginTop: 6, opacity: 0.75 }}>
+                Controls JP2/TIFF conversion and image resize work before each OCR request.
+              </small>
+            </div>
+            <div className="model-group" style={{ marginBottom: 0 }}>
+              <label htmlFor="mistral-batch-upload-workers">Upload / Request Workers</label>
+              <div
+                className="batch-size-controls"
+                role="group"
+                aria-labelledby="mistral-batch-upload-workers"
+                style={{ width: 'fit-content' }}
+              >
+                <div className="batch-size-main">
+                  <button
+                    type="button"
+                    className="batch-step-btn"
+                    onClick={() => setMistralBatchUploadWorkers(getPrevWorkerCount(mistralBatchUploadWorkers))}
+                    disabled={mistralBatchUploadWorkers <= MIN_MISTRAL_BATCH_WORKERS}
+                    aria-label="Decrease upload workers"
+                  >
+                    −
+                  </button>
+                  <span className="batch-size-current" aria-live="polite">{mistralBatchUploadWorkers}</span>
+                  <button
+                    type="button"
+                    className="batch-step-btn"
+                    onClick={() => setMistralBatchUploadWorkers(getNextWorkerCount(mistralBatchUploadWorkers))}
+                    disabled={mistralBatchUploadWorkers >= MAX_MISTRAL_BATCH_WORKERS}
+                    aria-label="Increase upload workers"
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+              <small style={{ display: 'block', marginTop: 6, opacity: 0.75 }}>
+                Higher values are faster, but can increase socket resets, API throttling, or request failures.
+              </small>
+            </div>
+          </div>
+        </div>
+
         {/* Clear Temp Files Section */}
         <div className="clear-temp-section" style={{ marginTop: '1.5rem', padding: '1rem', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderRadius: '8px' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
@@ -795,23 +1023,60 @@ function sortTranscripts(list: Transcript[]): Transcript[] {
   );
 }
 
-function resolveImageForTranscript(transcriptName: string, imageInputPath: string): string | null {
+function sourceBaseNameForTranscript(transcriptName: string): string {
+  const lowerName = transcriptName.toLowerCase();
+  if (lowerName.endsWith('.txt') || lowerName.endsWith('.srt')) {
+    return transcriptName.replace(/\.(txt|srt)$/i, '');
+  }
+  if (
+    lowerName.startsWith(ACCESSIBLE_PDF_PREFIX.toLowerCase())
+    && (lowerName.endsWith('.pdf') || lowerName.endsWith('.html'))
+  ) {
+    return transcriptName.slice(ACCESSIBLE_PDF_PREFIX.length, lowerName.endsWith('.html') ? -5 : -4);
+  }
+  if (lowerName.endsWith('.pdf') || lowerName.endsWith('.html')) {
+    return transcriptName.slice(0, lowerName.endsWith('.html') ? -5 : -4);
+  }
+  return transcriptName;
+}
+
+function resolveSourceFileForTranscript(
+  transcript: Transcript,
+  imageInputPath: string,
+  imageOutputDir: string
+): string | null {
   if (!imageInputPath) return null;
-  let baseDir = imageInputPath;
+  const sourceBaseName = sourceBaseNameForTranscript(transcript.name);
+  if (!sourceBaseName) return null;
+
   try {
     if (fs.statSync(imageInputPath).isFile()) {
-      baseDir = pathModule.dirname(imageInputPath);
+      const inputBaseName = pathModule.basename(imageInputPath, pathModule.extname(imageInputPath));
+      return inputBaseName === sourceBaseName ? imageInputPath : null;
     }
   } catch {
     return null;
   }
-  const nameNoExt = transcriptName.replace(/\.(txt|srt)$/i, '');
-  const directCandidate = pathModule.join(baseDir, nameNoExt);
-  if (fs.existsSync(directCandidate)) return directCandidate;
-  for (const ext of IMAGE_EXTS) {
-    const candidate = pathModule.join(baseDir, `${nameNoExt}${ext}`);
-    if (fs.existsSync(candidate)) return candidate;
+
+  const candidateDirs: string[] = [];
+  if (imageOutputDir && transcript.path) {
+    const relativePath = pathModule.relative(imageOutputDir, transcript.path);
+    if (relativePath && !relativePath.startsWith('..') && !pathModule.isAbsolute(relativePath)) {
+      const relativeDir = pathModule.dirname(relativePath);
+      if (relativeDir && relativeDir !== '.') {
+        candidateDirs.push(pathModule.join(imageInputPath, relativeDir));
+      }
+    }
   }
+  candidateDirs.push(imageInputPath);
+
+  for (const baseDir of candidateDirs) {
+    for (const ext of IMAGE_EXTS) {
+      const candidate = pathModule.join(baseDir, `${sourceBaseName}${ext}`);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  }
+
   return null;
 }
 
@@ -1136,6 +1401,15 @@ function BatchQueueView() {
 export default function App() {
   const isSettings = window.location.hash === '#/settings';
   const isBatchQueue = window.location.hash === '#/batch-queue';
+  const readStoredBoolean = (key: string, fallback: boolean = false): boolean => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw === 'true') return true;
+      if (raw === 'false') return false;
+    } catch {
+    }
+    return fallback;
+  };
 
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const [isResizing, setIsResizing] = useState(false);
@@ -1147,15 +1421,17 @@ export default function App() {
   const [audioOutputDir, setAudioOutputDir] = useState('');
   const [audioTranscripts, setAudioTranscripts] = useState<Transcript[]>([]);
 
-  const [imageModelName, setImageModelName] = useState<string>(
-    localStorage.getItem('imageModel') || IMAGE_MODEL_OPTIONS[0]
+  const [imageModelName, setImageModelName] = useState<string>(() =>
+    resolveSupportedModel(localStorage.getItem('imageModel'), IMAGE_MODEL_OPTIONS, DEFAULT_IMAGE_MODEL)
   );
   const [imageInputPath, setImageInputPath] = useState('');
   const [imageOutputDir, setImageOutputDir] = useState('');
   const [imageTranscripts, setImageTranscripts] = useState<Transcript[]>([]);
-  const [imageRecursive, setImageRecursive] = useState(false);
   const [imageBatchSize, setImageBatchSize] = useState<number>(50);
-  const [imageBatchEnabled, setImageBatchEnabled] = useState(false);
+  const [imageBatchEnabled, setImageBatchEnabled] = useState<boolean>(() =>
+    readStoredBoolean('mistralBatchEnabled')
+  );
+  const [mistralOutputPdf, setMistralOutputPdf] = useState(false);
   const [mistralBatchStats, setMistralBatchStats] = useState<MistralBatchStats | null>(null);
   const [mistralQueueCollectionCount, setMistralQueueCollectionCount] = useState(0);
 
@@ -1179,12 +1455,13 @@ export default function App() {
     transcript: Transcript;
   } | null>(null);
   const [pathPicker, setPathPicker] = useState<PathPickerTarget | null>(null);
-  const [fileTypeFilter, setFileTypeFilter] = useState<'all' | 'transcript' | 'subtitle'>('all');
+  const [fileTypeFilter, setFileTypeFilter] = useState<'all' | 'transcript' | 'subtitle' | 'pdf'>('all');
   const [issueFilter, setIssueFilter] = useState<'all' | 'clean' | 'issues'>('all');
   const [sortOption, setSortOption] = useState<SortOption>('name-asc');
   const [showFilters, setShowFilters] = useState(false);
   const [folderFavorites, setFolderFavorites] = useState<string[]>([]);
   const favoritesLoadedRef = useRef(false);
+  const mistralBatchSettingLoadedRef = useRef(false);
   const pathsLoadedRef = useRef(false);
   const modeLoadedRef = useRef(false);
   const [currentVersion, setCurrentVersion] = useState('');
@@ -1192,18 +1469,24 @@ export default function App() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateError, setUpdateError] = useState('');
   const [newVersionAvailable, setNewVersionAvailable] = useState(false);
+  const modeRef = useRef<'audio' | 'image'>('audio');
+  const logRefreshInFlightRef = useRef(false);
+  const transcriptRefreshInFlightRef = useRef(false);
+  const lastLogRefreshAtRef = useRef(0);
+  const lastTranscriptRefreshAtRef = useRef(0);
+  const lastBatchUiRefreshAtRef = useRef(0);
   const isMistralImageModel = useMemo(
     () => imageModelName.trim().toLowerCase().includes('mistral'),
     [imageModelName]
   );
+  const normalizedImageInputPath = useMemo(
+    () => normalizeLocalPath(imageInputPath),
+    [imageInputPath]
+  );
   const imageInputIsDirectory = useMemo(() => {
-    if (!imageInputPath) return false;
-    try {
-      return fs.statSync(imageInputPath).isDirectory();
-    } catch {
-      return false;
-    }
-  }, [imageInputPath]);
+    return resolveImageInputPathKind(normalizedImageInputPath) === 'directory';
+  }, [normalizedImageInputPath]);
+  const effectiveImageBatchEnabled = isMistralImageModel && imageInputIsDirectory && imageBatchEnabled;
   const refreshMistralBatchStats = useCallback(async () => {
     if (!imageInputPath || !imageInputIsDirectory || !isMistralImageModel) {
       setMistralBatchStats(null);
@@ -1228,6 +1511,73 @@ export default function App() {
       setMistralQueueCollectionCount(0);
     }
   }, []);
+
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  const refreshVisibleLogs = useCallback(async (targetMode: 'audio' | 'image', force: boolean = false) => {
+    const now = Date.now();
+    if (!force && now - lastLogRefreshAtRef.current < LIVE_LOG_REFRESH_INTERVAL_MS) {
+      return;
+    }
+    if (logRefreshInFlightRef.current) {
+      return;
+    }
+    logRefreshInFlightRef.current = true;
+    try {
+      const nextLogs = await ipcRenderer.invoke('read-log-tail', {
+        mode: targetMode,
+        maxBytes: DISPLAY_LOG_MAX_BYTES
+      });
+      if (modeRef.current === targetMode && typeof nextLogs === 'string') {
+        setLogs(nextLogs);
+      }
+      lastLogRefreshAtRef.current = Date.now();
+    } catch (error) {
+      console.error('Failed to refresh logs:', error);
+    } finally {
+      logRefreshInFlightRef.current = false;
+    }
+  }, []);
+
+  const refreshTranscriptListForMode = useCallback(async (targetMode: 'audio' | 'image', force: boolean = false) => {
+    const now = Date.now();
+    if (!force && now - lastTranscriptRefreshAtRef.current < LIVE_TRANSCRIPT_REFRESH_INTERVAL_MS) {
+      return;
+    }
+
+    const dir = targetMode === 'audio' ? audioOutputDir : imageOutputDir;
+    if (!dir || transcriptRefreshInFlightRef.current) {
+      return;
+    }
+
+    transcriptRefreshInFlightRef.current = true;
+    try {
+      const list = await ipcRenderer.invoke('list-transcripts-subtitles', dir) as Transcript[];
+      const sorted = sortTranscripts(list);
+      if (targetMode === 'audio') {
+        setAudioTranscripts(sorted);
+      } else {
+        setImageTranscripts(sorted);
+      }
+      lastTranscriptRefreshAtRef.current = Date.now();
+    } catch (error) {
+      console.error('Failed to refresh transcript list:', error);
+    } finally {
+      transcriptRefreshInFlightRef.current = false;
+    }
+  }, [audioOutputDir, imageOutputDir]);
+
+  const refreshLiveImageBatchUi = useCallback((force: boolean = false) => {
+    const now = Date.now();
+    if (!force && now - lastBatchUiRefreshAtRef.current < LIVE_BATCH_UI_REFRESH_INTERVAL_MS) {
+      return;
+    }
+    lastBatchUiRefreshAtRef.current = now;
+    void refreshMistralBatchStats();
+    void refreshMistralQueueCollectionCount();
+  }, [refreshMistralBatchStats, refreshMistralQueueCollectionCount]);
 
   const fetchCurrentVersion = useCallback(() => {
     ipcRenderer
@@ -1289,22 +1639,47 @@ export default function App() {
   }, [refreshMistralQueueCollectionCount]);
 
   useEffect(() => {
-  if (!isMistralImageModel) {
-      setImageRecursive(false);
-      setImageBatchEnabled(false);
-    } else if (imageInputIsDirectory) {
-      setImageBatchEnabled(true);
-    }
-  }, [isMistralImageModel, imageInputIsDirectory]);
+    let cancelled = false;
+    const setIfValid = (value: unknown) => {
+      if (cancelled) return;
+      if (typeof value === 'boolean') {
+        setImageBatchEnabled(value);
+        return;
+      }
+      setImageBatchEnabled(readStoredBoolean('mistralBatchEnabled'));
+    };
+    const loadMistralBatchSetting = async () => {
+      try {
+        const stored = await ipcRenderer.invoke('get-mistral-batch-enabled');
+        setIfValid(stored);
+      } catch {
+        setIfValid(undefined);
+      } finally {
+        if (!cancelled) {
+          mistralBatchSettingLoadedRef.current = true;
+        }
+      }
+    };
+    loadMistralBatchSetting();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
-    if (!imageInputIsDirectory) {
-      setImageRecursive(false);
-      setImageBatchEnabled(false);
-    } else if (isMistralImageModel) {
-      setImageBatchEnabled(true);
-    }
-  }, [imageInputIsDirectory, isMistralImageModel]);
+    if (!mistralBatchSettingLoadedRef.current) return;
+    const persist = async () => {
+      try {
+        await ipcRenderer.invoke('set-mistral-batch-enabled', imageBatchEnabled);
+      } catch {
+      }
+      try {
+        localStorage.setItem('mistralBatchEnabled', String(imageBatchEnabled));
+      } catch {
+      }
+    };
+    persist();
+  }, [imageBatchEnabled]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1382,20 +1757,20 @@ export default function App() {
           ipcRenderer.invoke('get-image-output-dir')
         ]);
         if (!cancelled) {
-          setAudioInputPath(resolveValue(audioInput, 'audioInputPath'));
-          setAudioOutputDir(resolveValue(audioOutput, 'audioOutputDir'));
-          setImageInputPath(resolveValue(imageInput, 'imageInputPath'));
-          setImageOutputDir(resolveValue(imageOutput, 'imageOutputDir'));
+          setAudioInputPath(normalizeLocalPath(resolveValue(audioInput, 'audioInputPath')));
+          setAudioOutputDir(normalizeLocalPath(resolveValue(audioOutput, 'audioOutputDir')));
+          setImageInputPath(normalizeLocalPath(resolveValue(imageInput, 'imageInputPath')));
+          setImageOutputDir(normalizeLocalPath(resolveValue(imageOutput, 'imageOutputDir')));
           hydrated = true;
         }
       } catch {
       } finally {
         if (!cancelled) {
           if (!hydrated) {
-            setAudioInputPath(readLocal('audioInputPath'));
-            setAudioOutputDir(readLocal('audioOutputDir'));
-            setImageInputPath(readLocal('imageInputPath'));
-            setImageOutputDir(readLocal('imageOutputDir'));
+            setAudioInputPath(normalizeLocalPath(readLocal('audioInputPath')));
+            setAudioOutputDir(normalizeLocalPath(readLocal('audioOutputDir')));
+            setImageInputPath(normalizeLocalPath(readLocal('imageInputPath')));
+            setImageOutputDir(normalizeLocalPath(readLocal('imageOutputDir')));
           }
           pathsLoadedRef.current = true;
         }
@@ -1496,14 +1871,19 @@ export default function App() {
       ipcRenderer
         .invoke('get-image-model')
         .then((model: string) => {
-          const next = model || localStorage.getItem('imageModel') || IMAGE_MODEL_OPTIONS[0];
+          const next = resolveSupportedModel(
+            model || localStorage.getItem('imageModel'),
+            IMAGE_MODEL_OPTIONS,
+            DEFAULT_IMAGE_MODEL
+          );
           setImageModelName(next);
-          if (next.toLowerCase().includes('mistral') && imageInputIsDirectory) {
-            setImageBatchEnabled(true);
-          }
         })
         .catch(() => {
-          const fallback = localStorage.getItem('imageModel') || IMAGE_MODEL_OPTIONS[0];
+          const fallback = resolveSupportedModel(
+            localStorage.getItem('imageModel'),
+            IMAGE_MODEL_OPTIONS,
+            DEFAULT_IMAGE_MODEL
+          );
           setImageModelName(fallback);
         });
     };
@@ -1511,35 +1891,25 @@ export default function App() {
     loadImageModel();
     window.addEventListener('focus', loadImageModel);
     return () => window.removeEventListener('focus', loadImageModel);
-  }, [imageInputIsDirectory]);
+  }, []);
 
   useEffect(() => {
-    ipcRenderer.invoke('read-logs', mode).then(setLogs);
-  }, [mode]);
+    void refreshVisibleLogs(mode, true);
+  }, [mode, refreshVisibleLogs]);
 
   useEffect(() => {
     if (!isTranscribing) return;
 
-    const refreshInterval = setInterval(async () => {
-      try {
-        const logs = await ipcRenderer.invoke('read-logs', mode);
-        setLogs(logs);
-
-        if (mode === 'image' && imageOutputDir) {
-          const list = await ipcRenderer.invoke('list-transcripts-subtitles', imageOutputDir) as Transcript[];
-          setImageTranscripts(sortTranscripts(list));
-        }
-        else if (mode === 'audio' && audioOutputDir) {
-          const list = await ipcRenderer.invoke('list-transcripts-subtitles', audioOutputDir) as Transcript[];
-          setAudioTranscripts(sortTranscripts(list));
-        }
-      } catch (error) {
-        console.error('Error refreshing during transcription:', error);
+    const refreshInterval = window.setInterval(() => {
+      void refreshVisibleLogs(mode);
+      void refreshTranscriptListForMode(mode);
+      if (mode === 'image') {
+        refreshLiveImageBatchUi();
       }
-    }, 1000); // Refresh every second
+    }, 4000);
 
-    return () => clearInterval(refreshInterval);
-  }, [isTranscribing, mode, imageOutputDir, audioOutputDir]);
+    return () => window.clearInterval(refreshInterval);
+  }, [isTranscribing, mode, refreshLiveImageBatchUi, refreshTranscriptListForMode, refreshVisibleLogs]);
 
   useEffect(() => {
     if (!isTranscribing || !logs) return;
@@ -1636,37 +2006,31 @@ export default function App() {
       const detail = (msg || '').trim();
       setStatus(label && detail ? `${label} | ${detail}` : (label || detail));
       if (mode === 'image') {
-        refreshMistralBatchStats();
-        refreshMistralQueueCollectionCount();
+        refreshLiveImageBatchUi();
       }
-      ipcRenderer.invoke('read-logs', mode).then(setLogs);
-      const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
-      if (dir) {
-        ipcRenderer.invoke('list-transcripts-subtitles', dir).then((list: Transcript[]) => {
-          const sorted = sortTranscripts(list);
-          if (mode === 'audio') {
-            setAudioTranscripts(sorted);
-          } else {
-            setImageTranscripts(sorted);
-          }
-        });
+      void refreshVisibleLogs(mode);
+      if (detail === 'Done' || detail === 'Skipped' || detail === 'Error') {
+        void refreshTranscriptListForMode(mode);
       }
     };
     ipcRenderer.on('transcription-progress', handler);
     return () => {
       ipcRenderer.removeListener('transcription-progress', handler);
     };
-  }, [mode, audioOutputDir, imageOutputDir, refreshMistralBatchStats, refreshMistralQueueCollectionCount]);
+  }, [mode, refreshLiveImageBatchUi, refreshTranscriptListForMode, refreshVisibleLogs]);
 
   useEffect(() => {
     const handler = async (_: any, nextInputPath: string, nextOutputDir: string) => {
       if (typeof nextInputPath === 'string') {
-        setImageInputPath(nextInputPath);
+        setImageInputPath(normalizeLocalPath(nextInputPath));
       }
       if (typeof nextOutputDir === 'string') {
-        setImageOutputDir(nextOutputDir);
+        setImageOutputDir(normalizeLocalPath(nextOutputDir));
         try {
-          const list = await ipcRenderer.invoke('list-transcripts-subtitles', nextOutputDir) as Transcript[];
+          const list = await ipcRenderer.invoke(
+            'list-transcripts-subtitles',
+            normalizeLocalPath(nextOutputDir)
+          ) as Transcript[];
           setImageTranscripts(sortTranscripts(list));
         } catch {
           setImageTranscripts([]);
@@ -1813,8 +2177,7 @@ export default function App() {
             mode,
             message: logLines
           });
-          const updatedLogs = await ipcRenderer.invoke('read-logs', mode);
-          setLogs(updatedLogs);
+          await refreshVisibleLogs(mode, true);
         } catch (error) {
           console.error(`Failed to write ${mode} log entry`, error);
         }
@@ -2198,8 +2561,13 @@ export default function App() {
     .filter(t => t.name.toLowerCase().includes(nameFilter))
     .filter(t => {
       if (fileTypeFilter === 'all') return true;
-      const isSubtitle = t.name.toLowerCase().endsWith('.srt');
-      return fileTypeFilter === 'subtitle' ? isSubtitle : !isSubtitle;
+      const lowerName = t.name.toLowerCase();
+      const isTranscript = lowerName.endsWith('.txt');
+      const isSubtitle = lowerName.endsWith('.srt');
+      const isPdf = lowerName.endsWith('.pdf') || lowerName.endsWith('.html');
+      if (fileTypeFilter === 'transcript') return isTranscript;
+      if (fileTypeFilter === 'subtitle') return isSubtitle;
+      return isPdf;
     })
     .filter(t => {
       if (issueFilter === 'all') return true;
@@ -2260,7 +2628,7 @@ export default function App() {
         setTimeout(() => setToast(null), 6000);
       }
     },
-    [filtered, imageInputPath]
+    [filtered]
   );
 
   const copyImagesToFolder = useCallback(() => {
@@ -2273,30 +2641,30 @@ export default function App() {
       target: 'copy-images',
       allowFiles: false
     });
-  }, [filtered, imageInputPath]);
+  }, [filtered]);
 
   const handlePathPickerSelect = useCallback(
     async (selection: { path: string; isDirectory: boolean }) => {
       if (!pathPicker) return;
       switch (pathPicker.target) {
         case 'audio-input':
-          setAudioInputPath(selection.path);
+          setAudioInputPath(normalizeLocalPath(selection.path));
           break;
         case 'image-input':
           if (!selection.isDirectory) return;
-          setImageInputPath(selection.path);
+          setImageInputPath(normalizeLocalPath(selection.path));
           break;
         case 'audio-output':
           if (!selection.isDirectory) return;
-          await applyOutputSelection(selection.path, 'audio');
+          await applyOutputSelection(normalizeLocalPath(selection.path), 'audio');
           break;
         case 'image-output':
           if (!selection.isDirectory) return;
-          await applyOutputSelection(selection.path, 'image');
+          await applyOutputSelection(normalizeLocalPath(selection.path), 'image');
           break;
         case 'copy-images':
           if (!selection.isDirectory) return;
-          await copyImagesToDestination(selection.path);
+          await copyImagesToDestination(normalizeLocalPath(selection.path));
           break;
         default:
           break;
@@ -2354,14 +2722,6 @@ export default function App() {
   const transcribeImage = useCallback(async () => {
     if (!imageInputPath || !imageOutputDir) return;
 
-    if (imageBatchEnabled && !imageInputIsDirectory) {
-      const msg = 'Batch processing requires selecting a folder.';
-      setStatus(`❌ ${msg}`);
-      setToast(`❌ ${msg}`);
-      setTimeout(() => setToast(null), 6000);
-      return;
-    }
-
     setStatus('');
     setIsTranscribing(true);
     try {
@@ -2373,15 +2733,18 @@ export default function App() {
         '',
         false,
         false,
-        { recursive: false, batch: imageBatchEnabled, batchSize: imageBatchSize }
+        {
+          recursive: false,
+          batch: effectiveImageBatchEnabled,
+          batchSize: imageBatchSize,
+          outputPdf: isMistralImageModel && mistralOutputPdf
+        }
       ) as string;
       
       if (imageOutputDir) {
-        const list = await ipcRenderer.invoke('list-transcripts-subtitles', imageOutputDir) as Transcript[];
-        setImageTranscripts(sortTranscripts(list));
+        await refreshTranscriptListForMode('image', true);
       }
-      const logs = await ipcRenderer.invoke('read-logs', 'image');
-      setLogs(logs);
+      await refreshVisibleLogs('image', true);
 
       const normalized = typeof result === 'string' ? result.trim() : '';
       const detail = normalized.replace(/^\[[A-Z]+\]\s*/, '');
@@ -2408,12 +2771,14 @@ export default function App() {
   }, [
     imageInputPath,
     imageOutputDir,
-    imageBatchEnabled,
+    effectiveImageBatchEnabled,
     imageBatchSize,
-    imageRecursive,
-    imageInputIsDirectory,
+    isMistralImageModel,
+    mistralOutputPdf,
     refreshMistralBatchStats,
-    refreshMistralQueueCollectionCount
+    refreshMistralQueueCollectionCount,
+    refreshTranscriptListForMode,
+    refreshVisibleLogs
   ]);
 
   const cancel = useCallback(async () => {
@@ -2423,31 +2788,81 @@ export default function App() {
   }, []);
 
   const openTranscript = useCallback((p: string) => ipcRenderer.invoke('open-transcript', p), []);
-  const openImageForTranscript = useCallback(
+  const refreshCurrentTranscriptList = useCallback(async () => {
+    const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
+    if (!dir) return;
+    const rawList: Transcript[] = await ipcRenderer.invoke('list-transcripts-subtitles', dir);
+    const sorted = sortTranscripts(rawList);
+    if (mode === 'audio') {
+      setAudioTranscripts(sorted);
+    } else {
+      setImageTranscripts(sorted);
+    }
+  }, [audioOutputDir, imageOutputDir, mode]);
+  const openSourceFileForTranscript = useCallback(
     async (transcript: Transcript) => {
       if (!imageInputPath) {
-        setToast('Set an image input folder first.');
+        setToast('Set an input file or folder first.');
         setTimeout(() => setToast(null), 6000);
         return;
       }
-      const imagePath = resolveImageForTranscript(transcript.name, imageInputPath);
-      if (!imagePath) {
-        setToast(`No matching image found for ${transcript.name}`);
+      const sourcePath = resolveSourceFileForTranscript(transcript, imageInputPath, imageOutputDir);
+      if (!sourcePath) {
+        setToast(`No matching original file found for ${transcript.name}`);
         setTimeout(() => setToast(null), 6000);
         return;
       }
       try {
-        const err = await ipcRenderer.invoke('open-transcript', imagePath);
+        const err = await ipcRenderer.invoke('open-transcript', sourcePath);
         if (err) {
           setToast(`❌ ${err}`);
           setTimeout(() => setToast(null), 6000);
         }
       } catch (error: any) {
-        setToast(`❌ Failed to open image: ${error?.message || error}`);
+        setToast(`❌ Failed to open original file: ${error?.message || error}`);
         setTimeout(() => setToast(null), 6000);
       }
     },
-    [imageInputPath]
+    [imageInputPath, imageOutputDir]
+  );
+  const deleteGeneratedFileFamily = useCallback(
+    async (transcript: Transcript) => {
+      if (!/\.(pdf|html)$/i.test(transcript.name)) {
+        setToast('Select a generated PDF or HTML file.');
+        setTimeout(() => setToast(null), 6000);
+        return;
+      }
+      try {
+        const result = await ipcRenderer.invoke('delete-generated-family', transcript.path) as {
+          ok?: boolean;
+          deletedNames?: string[];
+          count?: number;
+          error?: string;
+        };
+        if (!result?.ok) {
+          throw new Error(result?.error || 'Failed to delete generated files');
+        }
+        await refreshCurrentTranscriptList();
+        const deletedNames = Array.isArray(result.deletedNames) ? result.deletedNames : [];
+        if (deletedNames.length) {
+          setQualityScores(prev => {
+            const next = { ...prev };
+            for (const name of deletedNames) {
+              delete next[name];
+            }
+            return next;
+          });
+          setScanResults(prev => prev.filter(entry => !deletedNames.includes(entry.file)));
+        }
+        const count = typeof result.count === 'number' ? result.count : deletedNames.length;
+        setToast(`Deleted ${count} generated file${count === 1 ? '' : 's'}`);
+        setTimeout(() => setToast(null), 6000);
+      } catch (error: any) {
+        setToast(`❌ Failed to delete generated files: ${error?.message || error}`);
+        setTimeout(() => setToast(null), 6000);
+      }
+    },
+    [refreshCurrentTranscriptList]
   );
   const clearLogs = useCallback(async () => {
     await ipcRenderer.invoke('clear-logs', mode);
@@ -2492,8 +2907,9 @@ export default function App() {
     ? scanResults.find(entry => entry.file === contextMenu.transcript.name)
     : undefined;
   const canClearContextWarning = Boolean(contextIssues && contextIssues.length);
-  const canViewContextImage = Boolean(imageInputPath);
+  const canOpenContextSourceFile = Boolean(imageInputPath);
   const canRemediateContextFile = Boolean(contextScanEntry && isScanEntryRemediable(contextScanEntry));
+  const canDeleteGeneratedContextFamily = Boolean(contextMenu && /\.(pdf|html)$/i.test(contextMenu.transcript.name));
 
   const exportTranscriptList = useCallback(async () => {
     if (!filtered.length) {
@@ -2764,12 +3180,13 @@ export default function App() {
                   <span>Type</span>
                   <select
                     value={fileTypeFilter}
-                    onChange={e => setFileTypeFilter(e.target.value as 'all' | 'transcript' | 'subtitle')}
+                    onChange={e => setFileTypeFilter(e.target.value as 'all' | 'transcript' | 'subtitle' | 'pdf')}
                     style={{ width: '100%', padding: '0.45rem 0.6rem' }}
                   >
                     <option value="all">All files</option>
                     <option value="transcript">Transcripts (.txt)</option>
                     <option value="subtitle">Subtitles (.srt)</option>
+                    <option value="pdf">Documents (.pdf, .html)</option>
                   </select>
                 </label>
                 <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: '0.9rem' }}>
@@ -2969,13 +3386,25 @@ export default function App() {
             <button
               className="transcript-context-item"
               onClick={() => {
-                openImageForTranscript(contextMenu.transcript);
+                openSourceFileForTranscript(contextMenu.transcript);
                 closeContextMenu();
               }}
-              disabled={!canViewContextImage}
+              disabled={!canOpenContextSourceFile}
             >
-              View image
+              Open original file
             </button>
+            {canDeleteGeneratedContextFamily && (
+              <button
+                className="transcript-context-item"
+                onClick={() => {
+                  void deleteGeneratedFileFamily(contextMenu.transcript);
+                  closeContextMenu();
+                }}
+                disabled={isTranscribing}
+              >
+                Delete generated files
+              </button>
+            )}
             <button
               className="transcript-context-item"
               onClick={() => {
@@ -3031,8 +3460,8 @@ export default function App() {
             outputDir={imageOutputDir}
             isTranscribing={isTranscribing}
             mistralMode={isMistralImageModel}
-            recursive={false}
-            batchEnabled={imageBatchEnabled}
+            outputPdfEnabled={mistralOutputPdf}
+            batchEnabled={effectiveImageBatchEnabled}
             batchSize={imageBatchSize}
             inputIsDirectory={imageInputIsDirectory}
             batchStats={mistralBatchStats}
@@ -3040,7 +3469,7 @@ export default function App() {
             onSelectOutput={selectOutput}
             onClearInput={clearImageInputPath}
             onClearOutput={clearImageOutputDir}
-            onToggleRecursive={() => setImageRecursive(v => !v)}
+            onToggleOutputPdf={() => setMistralOutputPdf(v => !v)}
             onToggleBatch={() => setImageBatchEnabled(v => !v)}
             onBatchSizeChange={(size: number) => setImageBatchSize(size)}
             onOpenBatchQueue={openBatchQueueWindow}

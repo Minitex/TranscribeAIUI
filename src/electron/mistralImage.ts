@@ -1,3 +1,4 @@
+import { execFile } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -5,7 +6,7 @@ import path from 'path';
 let currentController: AbortController | null = null;
 let currentReject: ((err: any) => void) | null = null;
 
-const SUPPORTED_EXTS = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp', '.gif']);
+const SUPPORTED_EXTS = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.jp2', '.tif', '.tiff', '.bmp', '.gif']);
 const MAX_ERROR_SNIPPET = 500;
 
 function sanitizeMistralErrorText(errText: string): string {
@@ -29,6 +30,7 @@ function mimeFor(filePath: string): string {
     case '.png': return 'image/png';
     case '.jpg':
     case '.jpeg': return 'image/jpeg';
+    case '.jp2': return 'image/jp2';
     case '.tif':
     case '.tiff': return 'image/tiff';
     case '.bmp': return 'image/bmp';
@@ -64,6 +66,251 @@ function normalizeCustomId(filePath: string, baseInput: string): string {
   }
   const rel = path.relative(absBase, absFile);
   return rel.split(path.sep).join('/');
+}
+
+export interface MistralOcrPageDimensions {
+  dpi?: number;
+  width?: number;
+  height?: number;
+}
+
+export interface MistralOcrPageResult {
+  index: number;
+  markdown: string;
+  markdownWithImages: string;
+  dimensions: MistralOcrPageDimensions;
+}
+
+export interface MistralOcrResult {
+  text: string;
+  pages: MistralOcrPageResult[];
+}
+
+const ACCESSIBLE_IMAGE_ANNOTATION_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'transcribeai_image_annotation',
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        image_type: {
+          type: 'string',
+          description: 'The type of image, such as portrait, chart, diagram, logo, or illustration.'
+        },
+        short_description: {
+          type: 'string',
+          description: 'A concise English description suitable for HTML alt text. Mention essential visible content only.'
+        },
+        summary: {
+          type: 'string',
+          description: 'A brief one or two sentence English summary of the image content and purpose.'
+        }
+      },
+      required: ['image_type', 'short_description', 'summary']
+    }
+  }
+} as const;
+
+function normalizeNumber(value: unknown): number | undefined {
+  const num = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(num) ? num : undefined;
+}
+
+function inferImageMimeFromId(id: string): string {
+  const ext = path.extname(id).toLowerCase();
+  switch (ext) {
+    case '.png':
+      return 'image/png';
+    case '.gif':
+      return 'image/gif';
+    case '.webp':
+      return 'image/webp';
+    case '.bmp':
+      return 'image/bmp';
+    case '.tif':
+    case '.tiff':
+      return 'image/tiff';
+    default:
+      return 'image/jpeg';
+  }
+}
+
+function normalizeDataUri(imageBase64: string, id: string): string {
+  const raw = imageBase64.trim();
+  if (!raw) return '';
+  if (raw.startsWith('data:')) return raw;
+  return `data:${inferImageMimeFromId(id)};base64,${raw}`;
+}
+
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function collapseWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function sanitizeMarkdownAltText(value: string): string {
+  return collapseWhitespace(value || '').replace(/[\r\n[\]]+/g, ' ').trim();
+}
+
+function sanitizeMarkdownTitleText(value: string): string {
+  return collapseWhitespace(value || '').replace(/[\r\n"]+/g, ' ').trim();
+}
+
+function isPlaceholderImageLabel(value: string): boolean {
+  const normalized = collapseWhitespace(value || '');
+  if (!normalized) return true;
+
+  const lowered = normalized.toLowerCase();
+  const withoutExtension = lowered.replace(/\.[a-z0-9]{1,5}$/i, '');
+  const relaxed = collapseWhitespace(withoutExtension.replace(/[_-]+/g, ' '));
+  if (!relaxed) return true;
+
+  return /^(img|image|photo|picture|graphic|figure|diagram|illustration|scan|screenshot|page|pic|dsc|chart|table)\s*(?:[#-]?\s*\d+)?$/i.test(relaxed);
+}
+
+function firstNonEmptyString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    const trimmed = collapseWhitespace(value);
+    if (trimmed) return trimmed;
+  }
+  return '';
+}
+
+function normalizeImageAnnotationPayload(annotation: unknown): unknown {
+  if (typeof annotation === 'string') {
+    const trimmed = annotation.trim();
+    if (!trimmed) return '';
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+      try {
+        return normalizeImageAnnotationPayload(JSON.parse(trimmed));
+      } catch {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  }
+
+  if (!annotation || typeof annotation !== 'object') {
+    return annotation;
+  }
+
+  const candidate = annotation as Record<string, unknown>;
+  const nested = candidate.parsed ?? candidate.value ?? candidate.json ?? candidate.data ?? candidate.content;
+  if (nested !== undefined && nested !== annotation) {
+    return normalizeImageAnnotationPayload(nested);
+  }
+
+  return annotation;
+}
+
+function extractImageAnnotationData(image: any): { altText: string; summary: string } {
+  const annotation = normalizeImageAnnotationPayload(
+    image?.image_annotation ?? image?.bbox_annotation ?? image?.annotation
+  );
+  if (!annotation) {
+    return { altText: '', summary: '' };
+  }
+
+  if (typeof annotation === 'string') {
+    const text = collapseWhitespace(annotation);
+    return { altText: text, summary: text };
+  }
+
+  if (typeof annotation !== 'object') {
+    return { altText: '', summary: '' };
+  }
+
+  const annotationRecord = annotation as Record<string, unknown>;
+  const altText = firstNonEmptyString(
+    annotationRecord.short_description,
+    annotationRecord.shortDescription,
+    annotationRecord.alt_text,
+    annotationRecord.altText,
+    annotationRecord.description,
+    annotationRecord.caption,
+    annotationRecord.title,
+    annotationRecord.label,
+    annotationRecord.image_type,
+    annotationRecord.imageType
+  );
+  const summary = firstNonEmptyString(
+    annotationRecord.summary,
+    annotationRecord.long_description,
+    annotationRecord.longDescription,
+    annotationRecord.explanation
+  );
+  return { altText, summary };
+}
+
+type EmbeddedImageInfo = {
+  uri: string;
+  altText: string;
+  summary: string;
+};
+
+function buildImageDataMap(images: any[]): Map<string, EmbeddedImageInfo> {
+  const map = new Map<string, EmbeddedImageInfo>();
+  for (const img of images) {
+    if (!img || typeof img !== 'object') continue;
+    const id = typeof img.id === 'string' ? img.id.trim() : '';
+    const base64 = typeof img.image_base64 === 'string'
+      ? img.image_base64
+      : (typeof img.imageBase64 === 'string' ? img.imageBase64 : '');
+    if (!id || !base64) continue;
+    const uri = normalizeDataUri(base64, id);
+    if (!uri) continue;
+    const annotation = extractImageAnnotationData(img);
+    const entry: EmbeddedImageInfo = {
+      uri,
+      altText: annotation.altText,
+      summary: annotation.summary
+    };
+    map.set(id, entry);
+    map.set(path.basename(id), entry);
+  }
+  return map;
+}
+
+function embedImagesIntoMarkdown(markdown: string, pageImages: any[]): string {
+  if (!markdown) return '';
+  if (!Array.isArray(pageImages) || pageImages.length === 0) return markdown;
+
+  const imageMap = buildImageDataMap(pageImages);
+  if (!imageMap.size) return markdown;
+
+  return markdown.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (full, alt, srcRaw) => {
+    const src = String(srcRaw || '').trim();
+    const decodedSrc = safeDecodeURIComponent(src);
+    const candidateKeys = [
+      src,
+      decodedSrc,
+      path.basename(src),
+      path.basename(decodedSrc)
+    ];
+    for (const key of candidateKeys) {
+      const value = imageMap.get(key);
+      if (value) {
+        const existingAlt = sanitizeMarkdownAltText(String(alt || ''));
+        const annotationAlt = sanitizeMarkdownAltText(value.altText);
+        const nextAlt = (!isPlaceholderImageLabel(existingAlt) ? existingAlt : annotationAlt) || existingAlt;
+        const safeAlt = sanitizeMarkdownAltText(nextAlt);
+        const safeTitle = sanitizeMarkdownTitleText(value.summary);
+        if (safeTitle) {
+          return `![${safeAlt}](${value.uri} "${safeTitle}")`;
+        }
+        return `![${safeAlt}](${value.uri})`;
+      }
+    }
+    return full;
+  });
 }
 
 function extractMarkdownSections(payload: any): string[] {
@@ -132,19 +379,149 @@ function cleanMarkdown(text: string): string {
   return cleaned.trim();
 }
 
+function parseOcrPayload(payload: any): MistralOcrResult {
+  const rawPages = Array.isArray(payload?.pages) ? payload.pages : [];
+  const pages: MistralOcrPageResult[] = [];
+  const parts: string[] = [];
+
+  if (rawPages.length > 0) {
+    for (let i = 0; i < rawPages.length; i++) {
+      const page = rawPages[i];
+      const markdown = (page && typeof page.markdown === 'string')
+        ? page.markdown.trim()
+        : '';
+      const images = Array.isArray(page?.images) ? page.images : [];
+      const markdownWithImages = embedImagesIntoMarkdown(markdown, images);
+      const text = cleanMarkdown(markdown);
+      if (text) parts.push(text);
+      pages.push({
+        index: i + 1,
+        markdown,
+        markdownWithImages,
+        dimensions: {
+          dpi: normalizeNumber(page?.dimensions?.dpi),
+          width: normalizeNumber(page?.dimensions?.width),
+          height: normalizeNumber(page?.dimensions?.height)
+        }
+      });
+    }
+    return { text: parts.join('\n\n').trim(), pages };
+  }
+
+  // Fallback for unexpected payload shapes.
+  const sections = extractMarkdownSections(payload);
+  for (let i = 0; i < sections.length; i++) {
+    const markdown = typeof sections[i] === 'string' ? sections[i].trim() : '';
+    if (!markdown) continue;
+    const text = cleanMarkdown(markdown);
+    if (text) parts.push(text);
+    pages.push({
+      index: i + 1,
+      markdown,
+      markdownWithImages: markdown,
+      dimensions: {}
+    });
+  }
+
+  return { text: parts.join('\n\n').trim(), pages };
+}
+
 const MAX_DIMENSION = 4096;
 const MAX_FILE_BYTES = 20 * 1024 * 1024; // 20MB threshold to re-encode
+const JPEG_QUALITY_STEPS = [90, 82, 74, 66];
+
+async function convertImageToJpegWithSips(inputPath: string, outputPath: string): Promise<void> {
+  if (process.platform !== 'darwin') {
+    throw new Error('sharp preprocessing failed and sips is only available on macOS');
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    execFile(
+      '/usr/bin/sips',
+      [
+        '-s', 'format', 'jpeg',
+        '--resampleHeightWidthMax', String(MAX_DIMENSION),
+        inputPath,
+        '--out', outputPath
+      ],
+      { timeout: 120000 },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(String(stderr || stdout || error.message).trim() || 'sips failed'));
+          return;
+        }
+        resolve();
+      }
+    );
+  });
+}
+
+type MistralPreprocessResult = {
+  path: string;
+  mime: string;
+  cleanup: (() => Promise<void>) | null;
+  cacheStatus: 'none' | 'hit' | 'created';
+};
+
+function buildCachedMistralPath(
+  filePath: string,
+  outputExt: string,
+  cacheDir?: string,
+  baseInput?: string,
+  tempRoot?: string
+): string {
+  const baseTemp = tempRoot || os.tmpdir();
+  let outDir = cacheDir || baseTemp;
+  if (cacheDir && baseInput) {
+    const rel = path.relative(path.resolve(baseInput), path.resolve(filePath));
+    outDir = path.join(cacheDir, path.dirname(rel));
+  }
+  return path.join(outDir, `${path.basename(filePath, path.extname(filePath))}${outputExt}`);
+}
+
+async function writeOptimizedJpeg(
+  inputPath: string,
+  outputPath: string,
+  resize: boolean
+): Promise<void> {
+  const sharpMod = await import('sharp');
+  const sharp = sharpMod?.default ?? sharpMod;
+  for (let idx = 0; idx < JPEG_QUALITY_STEPS.length; idx++) {
+    const quality = JPEG_QUALITY_STEPS[idx];
+    let pipeline = sharp(inputPath, { failOnError: false, limitInputPixels: false });
+    if (resize) {
+      pipeline = pipeline.resize({
+        width: MAX_DIMENSION,
+        height: MAX_DIMENSION,
+        fit: 'inside',
+        withoutEnlargement: true
+      });
+    }
+    await pipeline
+      .jpeg({
+        quality,
+        mozjpeg: true
+      })
+      .toFile(outputPath);
+
+    const written = await fs.promises.stat(outputPath).catch(() => null);
+    if (!written || written.size <= MAX_FILE_BYTES || idx === JPEG_QUALITY_STEPS.length - 1) {
+      return;
+    }
+  }
+}
 
 async function preprocessForMistral(
   filePath: string,
   cacheDir?: string,
   baseInput?: string,
   tempRoot?: string
-): Promise<{ path: string; mime: string; cleanup: (() => Promise<void>) | null }> {
+): Promise<MistralPreprocessResult> {
   const ext = path.extname(filePath).toLowerCase();
+  const requiresCompatibleUpload = ext === '.jp2';
   // PDFs pass through untouched
   if (ext === '.pdf') {
-    return { path: filePath, mime: mimeFor(filePath), cleanup: null };
+    return { path: filePath, mime: mimeFor(filePath), cleanup: null, cacheStatus: 'none' };
   }
 
   const mime = mimeFor(filePath);
@@ -160,7 +537,7 @@ async function preprocessForMistral(
   let needsResize = false;
   if (sharp) {
     try {
-      const meta = await sharp(filePath, { failOnError: false }).metadata();
+      const meta = await sharp(filePath, { failOnError: false, limitInputPixels: false }).metadata();
       const width = meta.width ?? 0;
       const height = meta.height ?? 0;
       needsResize = width > MAX_DIMENSION || height > MAX_DIMENSION;
@@ -168,39 +545,100 @@ async function preprocessForMistral(
       needsResize = false;
     }
   }
-  const needsReencode = ext === '.tif' || ext === '.tiff' || inputStat.size > MAX_FILE_BYTES;
+  const needsReencode = requiresCompatibleUpload || ext === '.tif' || ext === '.tiff' || inputStat.size > MAX_FILE_BYTES;
 
-  // Determine destination directory
-  const baseTemp = tempRoot || os.tmpdir();
-  let outDir = cacheDir || baseTemp;
-  if (cacheDir && baseInput) {
-    const rel = path.relative(path.resolve(baseInput), path.resolve(filePath));
-    outDir = path.join(cacheDir, path.dirname(rel));
+  if (!needsResize && !needsReencode) {
+    return { path: filePath, mime, cleanup: null, cacheStatus: 'none' };
   }
-  await fs.promises.mkdir(outDir, { recursive: true }).catch(() => {});
-  const outPath = path.join(outDir, `${path.basename(filePath, ext)}.png`);
 
-  // Reuse if already cached
-  const exists = await fs.promises.stat(outPath).then(() => true).catch(() => false);
-  if (exists) {
-    return { path: outPath, mime: 'image/png', cleanup: null };
+  const baseTemp = tempRoot || os.tmpdir();
+  let tempDir: string | null = null;
+  let outPath = '';
+
+  if (cacheDir) {
+    outPath = buildCachedMistralPath(filePath, '.jpg', cacheDir, baseInput, tempRoot);
+    await fs.promises.mkdir(path.dirname(outPath), { recursive: true }).catch(() => {});
+
+    const cachedStat = await fs.promises.stat(outPath).catch(() => null);
+    if (cachedStat && cachedStat.size > 0) {
+      return { path: outPath, mime: 'image/jpeg', cleanup: null, cacheStatus: 'hit' };
+    }
+    // Remove stale 0-byte cache files from previous failed/cancelled runs
+    if (cachedStat && cachedStat.size === 0) {
+      await fs.promises.rm(outPath, { force: true }).catch(() => {});
+    }
+  } else {
+    await fs.promises.mkdir(baseTemp, { recursive: true }).catch(() => {});
+    tempDir = await fs.promises.mkdtemp(path.join(baseTemp, 'mistral-prep-'));
+    outPath = path.join(tempDir, `${path.basename(filePath, ext)}.jpg`);
+  }
+
+  if (requiresCompatibleUpload) {
+    try {
+      if (sharp) {
+        await writeOptimizedJpeg(filePath, outPath, needsResize);
+      } else {
+        await convertImageToJpegWithSips(filePath, outPath);
+      }
+    } catch (error) {
+      try {
+        await convertImageToJpegWithSips(filePath, outPath);
+      } catch (fallbackError) {
+        const detail = fallbackError instanceof Error && fallbackError.message
+          ? fallbackError.message
+          : (error instanceof Error && error.message ? error.message : 'Unknown error');
+        throw new Error(`Failed to convert JP2 to JPEG before Mistral upload: ${detail}`);
+      }
+    }
+
+    return {
+      path: outPath,
+      mime: 'image/jpeg',
+      cleanup: tempDir
+        ? async () => {
+          await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+        }
+        : null,
+      cacheStatus: cacheDir ? 'created' : 'none'
+    };
   }
 
   try {
-    if (sharp && (needsResize || needsReencode || cacheDir)) {
-      const img = sharp(filePath, { failOnError: false });
-      const transformer = needsResize
-        ? img.resize({ width: MAX_DIMENSION, height: MAX_DIMENSION, fit: 'inside', withoutEnlargement: true }).png()
-        : img.png();
-      await transformer.toFile(outPath);
+    if (sharp) {
+      await writeOptimizedJpeg(filePath, outPath, needsResize);
     } else {
-      await fs.promises.copyFile(filePath, outPath);
+      await convertImageToJpegWithSips(filePath, outPath);
     }
-  } catch {
-    await fs.promises.copyFile(filePath, outPath).catch(() => {});
+  } catch (error) {
+    try {
+      await convertImageToJpegWithSips(filePath, outPath);
+    } catch (fallbackError) {
+      const detail = fallbackError instanceof Error && fallbackError.message
+        ? fallbackError.message
+        : (error instanceof Error && error.message ? error.message : 'Unknown error');
+      throw new Error(`Failed to preprocess image for Mistral upload: ${detail}`);
+    }
   }
 
-  return { path: outPath, mime: 'image/png', cleanup: null };
+  return {
+    path: outPath,
+    mime: 'image/jpeg',
+    cleanup: tempDir
+      ? async () => {
+        await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+      }
+      : null,
+    cacheStatus: cacheDir ? 'created' : 'none'
+  };
+}
+
+export async function prepareImageForMistral(
+  filePath: string,
+  cacheDir?: string,
+  baseInput?: string,
+  tempRoot?: string
+): Promise<MistralPreprocessResult> {
+  return await preprocessForMistral(filePath, cacheDir, baseInput, tempRoot);
 }
 
 async function sleep(ms: number, signal?: AbortSignal) {
@@ -223,48 +661,123 @@ async function uploadFileToMistral(
   filePath: string,
   apiKey: string,
   purpose: 'ocr' | 'batch',
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  logger?: (msg: string) => void | Promise<void>
 ): Promise<{ id: string; fileName: string }> {
   if (signal?.aborted) throw abortError();
   const data = await fs.promises.readFile(filePath);
-  const form = new FormData();
-  form.append('file', new Blob([data]), path.basename(filePath));
-  form.append('purpose', purpose);
+  if (data.length === 0) {
+    throw new Error(`Cannot upload empty file: ${path.basename(filePath)}`);
+  }
+  const mime = mimeFor(filePath);
+  const maxRetries = 5;
+  const retryableStatuses = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+  const retryableCodes = new Set([
+    'EPIPE',
+    'ECONNRESET',
+    'ETIMEDOUT',
+    'ECONNREFUSED',
+    'ENOTFOUND',
+    'EAI_AGAIN',
+    'UND_ERR_SOCKET',
+    'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_HEADERS_TIMEOUT',
+    'UND_ERR_BODY_TIMEOUT'
+  ]);
+  const describeUploadError = (error: any): string => {
+    const cause = error?.cause;
+    const directCode = typeof error?.code === 'string' ? error.code : '';
+    const causeCode = typeof cause?.code === 'string' ? cause.code : '';
+    const code = causeCode || directCode;
+    const message = typeof error?.message === 'string' ? error.message : String(error);
+    return code && !message.includes(code) ? `${message} (${code})` : message;
+  };
+  const shouldRetry = (error: any): boolean => {
+    if (!error) return false;
+    if (error instanceof DOMException && error.name === 'AbortError') return false;
+    if (signal?.aborted) return false;
+    if (retryableStatuses.has(Number(error?.status))) return true;
+    const cause = error?.cause;
+    const code = typeof cause?.code === 'string'
+      ? cause.code
+      : (typeof error?.code === 'string' ? error.code : '');
+    if (retryableCodes.has(code)) return true;
+    const message = String(error?.message || '').toLowerCase();
+    return message.includes('fetch failed') || message.includes('socket') || message.includes('network');
+  };
 
-  const resp = await fetch('https://api.mistral.ai/v1/files', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form,
-    signal
-  });
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    if (signal?.aborted) throw abortError();
+    try {
+      const form = new FormData();
+      form.append('file', new Blob([data], { type: mime }), path.basename(filePath));
+      form.append('purpose', purpose);
 
-  if (!resp.ok) {
-    const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
-    const err: any = new Error(`Mistral file upload failed: ${resp.status} ${resp.statusText} ${errText}`);
-    err.status = resp.status;
-    throw err;
+      const resp = await fetch('https://api.mistral.ai/v1/files', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Connection: 'close'
+        },
+        body: form,
+        signal
+      });
+
+      if (!resp.ok) {
+        const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
+        const err: any = new Error(`Mistral file upload failed: ${resp.status} ${resp.statusText} ${errText}`);
+        err.status = resp.status;
+        throw err;
+      }
+
+      const json = await resp.json();
+      const id = json?.id;
+      if (!id) {
+        throw new Error('Mistral file upload missing id in response');
+      }
+      return { id, fileName: path.basename(filePath) };
+    } catch (error: any) {
+      if ((error instanceof DOMException && error.name === 'AbortError') || signal?.aborted) {
+        throw abortError();
+      }
+      if (attempt === maxRetries - 1 || !shouldRetry(error)) {
+        if (typeof error?.status === 'number') {
+          throw error;
+        }
+        const wrapped: any = new Error(
+          `Mistral file upload failed for ${path.basename(filePath)}: ${describeUploadError(error)}`
+        );
+        wrapped.cause = error;
+        throw wrapped;
+      }
+      const delayMs = 2000 * Math.pow(2, attempt);
+      if (logger) {
+        await logger(
+          `Upload attempt ${attempt + 1}/${maxRetries} failed for ${path.basename(filePath)}: ${describeUploadError(error)}. Retrying in ${delayMs}ms...`
+        );
+      }
+      await sleep(delayMs, signal);
+    }
   }
 
-  const json = await resp.json();
-  const id = json?.id;
-  if (!id) {
-    throw new Error('Mistral file upload missing id in response');
-  }
-  return { id, fileName: path.basename(filePath) };
+  throw new Error(`Mistral file upload failed for ${path.basename(filePath)}`);
 }
 
 async function getSignedUrl(fileId: string, apiKey: string, signal?: AbortSignal): Promise<string> {
   if (signal?.aborted) throw abortError();
   
-  const maxRetries = 3;
-  const baseDelayMs = 1000;
+  const maxRetries = 6;
+  const baseDelayMs = 2000;
   
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     if (signal?.aborted) throw abortError();
     
     try {
       const resp = await fetch(`https://api.mistral.ai/v1/files/${fileId}/url`, {
-        headers: { Authorization: `Bearer ${apiKey}` },
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Connection: 'close'
+        },
         signal
       });
       
@@ -363,11 +876,20 @@ async function downloadFileContent(fileId: string, apiKey: string, signal?: Abor
   return await resp.text();
 }
 
-export async function transcribeImageMistral(
+export async function transcribeImageMistralDetailed(
   filePath: string,
   apiKey: string,
-  modelName: string = 'mistral-ocr-latest'
-): Promise<string> {
+  modelName: string = 'mistral-ocr-latest',
+  options: {
+    includeImageBase64?: boolean;
+    includeImageDescriptions?: boolean;
+    signal?: AbortSignal;
+    logger?: (msg: string) => void | Promise<void>;
+    cacheDir?: string;
+    baseInput?: string;
+    tempRoot?: string;
+  } = {}
+): Promise<MistralOcrResult> {
   const stat = await fs.promises.stat(filePath);
   if (!stat.isFile()) {
     throw new Error('Input must be a file for Mistral OCR');
@@ -376,58 +898,31 @@ export async function transcribeImageMistral(
     throw new Error('Unsupported file type for Mistral OCR');
   }
 
-  const prep = await preprocessForMistral(filePath);
+  const prep = await prepareImageForMistral(filePath, options.cacheDir, options.baseInput, options.tempRoot);
 
   currentController = new AbortController();
+  const useSignal = currentController.signal;
+  const externalSignal = options.signal;
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      currentController.abort();
+    } else {
+      externalSignal.addEventListener('abort', () => currentController?.abort(), { once: true });
+    }
+  }
+  const includeImageBase64 = Boolean(options.includeImageBase64);
+  const includeImageDescriptions = Boolean(options.includeImageDescriptions);
 
-  return await new Promise<string>(async (resolve, reject) => {
+  return await new Promise<MistralOcrResult>(async (resolve, reject) => {
     currentReject = reject;
     try {
-      const { id } = await uploadFileToMistral(prep.path, apiKey, 'ocr', currentController?.signal);
-      const signedUrl = await getSignedUrl(id, apiKey, currentController?.signal);
-      const body = {
-        model: modelName,
-        document: {
-          type: 'document_url',
-          document_url: signedUrl
-        },
-        include_image_base64: false
-      };
-
-      const resp = await fetch('https://api.mistral.ai/v1/ocr', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(body),
-        signal: currentController?.signal
+      const result = await transcribePreparedImageMistralDetailed(prep.path, apiKey, modelName, {
+        includeImageBase64,
+        includeImageDescriptions,
+        signal: useSignal,
+        logger: options.logger
       });
-
-      if (!resp.ok) {
-        const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
-        const err: any = new Error(`Mistral OCR failed: ${resp.status} ${resp.statusText} ${errText}`);
-        err.status = resp.status;
-        throw err;
-      }
-
-      const json = await resp.json();
-      const pages = Array.isArray(json?.pages) ? json.pages : [];
-      const parts: string[] = [];
-      for (const p of pages) {
-        const md = (p && typeof p.markdown === 'string') ? p.markdown : '';
-        if (md) parts.push(md.trim());
-      }
-      const raw = parts.join('\n\n');
-      try {
-        resolve(cleanMarkdown(raw));
-      } catch (err: any) {
-        if (err instanceof RangeError) {
-          resolve(raw.trim());
-          return;
-        }
-        throw err;
-      }
+      resolve(result);
     } catch (err) {
       reject(err);
     } finally {
@@ -440,13 +935,100 @@ export async function transcribeImageMistral(
   });
 }
 
+export async function transcribeImageMistral(
+  filePath: string,
+  apiKey: string,
+  modelName: string = 'mistral-ocr-latest',
+  options: {
+    signal?: AbortSignal;
+    logger?: (msg: string) => void | Promise<void>;
+    cacheDir?: string;
+    baseInput?: string;
+    tempRoot?: string;
+  } = {}
+): Promise<string> {
+  const detailed = await transcribeImageMistralDetailed(filePath, apiKey, modelName, {
+    ...options,
+    includeImageBase64: false
+  });
+  return detailed.text;
+}
+
+export async function transcribePreparedImageMistralDetailed(
+  preparedPath: string,
+  apiKey: string,
+  modelName: string = 'mistral-ocr-latest',
+  options: {
+    includeImageBase64?: boolean;
+    includeImageDescriptions?: boolean;
+    signal?: AbortSignal;
+    logger?: (msg: string) => void | Promise<void>;
+  } = {}
+): Promise<MistralOcrResult> {
+  if (options.signal?.aborted) throw abortError();
+
+  const includeImageBase64 = Boolean(options.includeImageBase64);
+  const includeImageDescriptions = Boolean(options.includeImageDescriptions);
+  const { id } = await uploadFileToMistral(preparedPath, apiKey, 'ocr', options.signal, options.logger);
+  const signedUrl = await getSignedUrl(id, apiKey, options.signal);
+  const body: Record<string, unknown> = {
+    model: modelName,
+    document: {
+      type: 'document_url',
+      document_url: signedUrl
+    },
+    include_image_base64: includeImageBase64
+  };
+  if (includeImageDescriptions) {
+    body.bbox_annotation_format = ACCESSIBLE_IMAGE_ANNOTATION_FORMAT;
+  }
+
+  const resp = await fetch('https://api.mistral.ai/v1/ocr', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(body),
+    signal: options.signal
+  });
+
+  if (!resp.ok) {
+    const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
+    const err: any = new Error(`Mistral OCR failed: ${resp.status} ${resp.statusText} ${errText}`);
+    err.status = resp.status;
+    throw err;
+  }
+
+  const json = await resp.json();
+  return parseOcrPayload(json);
+}
+
 export interface MistralBatchSubmitOptions {
   baseInput?: string;
   logger?: (msg: string) => void | Promise<void>;
   signal?: AbortSignal;
   cacheDir?: string;
   tempRoot?: string;
+  includeImageBase64?: boolean;
+  includeImageDescriptions?: boolean;
+  preprocessWorkers?: number;
+  uploadWorkers?: number;
 }
+
+export interface SubmittedMistralBatchJob {
+  jobId: string;
+  status: string;
+  totalRequests: number;
+  succeededRequests: number;
+  failedRequests: number;
+  outputFileId: string | null;
+}
+
+const MIN_MISTRAL_BATCH_WORKERS = 1;
+const MAX_MISTRAL_BATCH_WORKERS = 5;
+const DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS = 2;
+const DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS = 2;
 
 export interface MistralBatchTranscribeOptions extends MistralBatchSubmitOptions {
   pollIntervalMs?: number;
@@ -459,6 +1041,8 @@ export interface MistralBatchJobStatus {
   succeededRequests: number;
   failedRequests: number;
   outputFileId: string | null;
+  errorFileId: string | null;
+  errorMessages: string[];
 }
 
 function normalizeBatchJobStatus(jobState: any, fallbackTotal: number): MistralBatchJobStatus {
@@ -467,6 +1051,11 @@ function normalizeBatchJobStatus(jobState: any, fallbackTotal: number): MistralB
     Number(jobState?.succeeded_requests ?? 0) + Number(jobState?.failed_requests ?? 0),
     0
   );
+  const errorMessages = Array.isArray(jobState?.errors)
+    ? jobState.errors
+      .map((entry: any) => typeof entry?.message === 'string' ? entry.message.trim() : '')
+      .filter(Boolean)
+    : [];
   return {
     id: String(jobState?.id || ''),
     status: String(jobState?.status || 'UNKNOWN'),
@@ -475,7 +1064,11 @@ function normalizeBatchJobStatus(jobState: any, fallbackTotal: number): MistralB
     failedRequests: Math.max(Number(jobState?.failed_requests ?? 0), 0),
     outputFileId: typeof jobState?.output_file === 'string' && jobState.output_file
       ? jobState.output_file
-      : null
+      : null,
+    errorFileId: typeof jobState?.error_file === 'string' && jobState.error_file
+      ? jobState.error_file
+      : null,
+    errorMessages
   };
 }
 
@@ -483,8 +1076,8 @@ function isTerminalBatchStatus(status: string): boolean {
   return status === 'SUCCESS' || status === 'FAILED' || status === 'CANCELLED';
 }
 
-function parseMistralBatchResultText(resultsText: string): Map<string, string> {
-  const results = new Map<string, string>();
+function parseMistralBatchResultTextDetailed(resultsText: string): Map<string, MistralOcrResult> {
+  const results = new Map<string, MistralOcrResult>();
   for (const line of resultsText.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -497,11 +1090,58 @@ function parseMistralBatchResultText(resultsText: string): Map<string, string> {
     const customId = typeof rec?.custom_id === 'string' ? rec.custom_id : undefined;
     if (!customId) continue;
     const body = rec?.response?.body ?? rec?.body ?? rec?.response ?? rec;
-    const pages = extractMarkdownSections(body);
-    const text = pages.map(p => (typeof p === 'string' ? p.trim() : '')).filter(Boolean).join('\n\n');
-    results.set(customId, cleanMarkdown(text));
+    results.set(customId, parseOcrPayload(body));
   }
   return results;
+}
+
+export interface MistralBatchRequestError {
+  customId: string;
+  statusCode: number | null;
+  message: string;
+}
+
+function parseMistralBatchErrorText(resultsText: string): MistralBatchRequestError[] {
+  const errors: MistralBatchRequestError[] = [];
+  for (const line of resultsText.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let rec: any;
+    try {
+      rec = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+
+    const statusCode = Number.isFinite(Number(rec?.response?.status_code))
+      ? Number(rec.response.status_code)
+      : null;
+    let message = '';
+    const responseBody = rec?.response?.body;
+    if (typeof responseBody === 'string' && responseBody.trim()) {
+      try {
+        const parsed = JSON.parse(responseBody);
+        message = typeof parsed?.message === 'string' ? parsed.message.trim() : responseBody.trim();
+      } catch {
+        message = responseBody.trim();
+      }
+    } else if (responseBody && typeof responseBody === 'object' && typeof responseBody?.message === 'string') {
+      message = responseBody.message.trim();
+    } else if (typeof rec?.error === 'string' && rec.error.trim()) {
+      message = rec.error.trim();
+    }
+
+    if (!message && statusCode !== null) {
+      message = `HTTP Error ${statusCode}`;
+    }
+
+    errors.push({
+      customId: typeof rec?.custom_id === 'string' ? rec.custom_id : '',
+      statusCode,
+      message: sanitizeMistralErrorText(message || 'Unknown batch request error')
+    });
+  }
+  return errors;
 }
 
 function bindSignal(external?: AbortSignal): AbortSignal {
@@ -539,12 +1179,103 @@ async function removeEmptyParentDirs(startDir: string, stopDir: string): Promise
   }
 }
 
+function normalizeBatchWorkerCount(value: unknown, fallback: number): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(MAX_MISTRAL_BATCH_WORKERS, Math.max(MIN_MISTRAL_BATCH_WORKERS, Math.floor(parsed)));
+}
+
+function createConcurrencyLimiter(limit: number) {
+  const normalizedLimit = Math.max(1, Math.floor(limit));
+  let activeCount = 0;
+  const queue: Array<() => void> = [];
+
+  const runNext = () => {
+    if (activeCount >= normalizedLimit) return;
+    const nextTask = queue.shift();
+    if (!nextTask) return;
+    activeCount += 1;
+    nextTask();
+  };
+
+  return async function schedule<T>(task: () => Promise<T>): Promise<T> {
+    return await new Promise<T>((resolve, reject) => {
+      const execute = () => {
+        Promise.resolve()
+          .then(task)
+          .then(resolve, reject)
+          .finally(() => {
+            activeCount = Math.max(0, activeCount - 1);
+            runNext();
+          });
+      };
+      queue.push(execute);
+      runNext();
+    });
+  };
+}
+
+type PreparedMistralBatchInput = {
+  customId: string;
+  filePath: string;
+  uploadPath: string;
+  cacheStatus: MistralPreprocessResult['cacheStatus'];
+};
+
+async function uploadPreparedMistralBatchInput(
+  prep: PreparedMistralBatchInput,
+  apiKey: string,
+  signal: AbortSignal,
+  log: (msg: string) => Promise<void>,
+  initialDelayMs: number = 0
+): Promise<{ customId: string; signedUrl: string; filePath: string }> {
+  if (signal.aborted) throw abortError();
+  if (initialDelayMs > 0) {
+    await sleep(initialDelayMs, signal);
+  }
+
+  const maxUploadAttempts = 3;
+  let signedUrl = '';
+  for (let uploadAttempt = 0; uploadAttempt < maxUploadAttempts; uploadAttempt++) {
+    if (signal.aborted) throw abortError();
+
+    if (uploadAttempt > 0) {
+      await log(`Re-uploading ${path.basename(prep.filePath)} (attempt ${uploadAttempt + 1}/${maxUploadAttempts})...`);
+      await sleep(3000, signal);
+    } else {
+      await log(`Uploading ${path.basename(prep.filePath)}...`);
+    }
+
+    const { id } = await uploadFileToMistral(prep.uploadPath, apiKey, 'ocr', signal, log);
+    await log(`Uploaded ${path.basename(prep.filePath)} as ${id}`);
+
+    await sleep(1500, signal);
+
+    try {
+      signedUrl = await getSignedUrl(id, apiKey, signal);
+      break;
+    } catch (err: any) {
+      if (err?.status === 404 && uploadAttempt < maxUploadAttempts - 1) {
+        await log(`Signed URL not found for ${path.basename(prep.filePath)} (file ${id}), will re-upload...`);
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  return {
+    customId: prep.customId,
+    signedUrl,
+    filePath: prep.filePath
+  };
+}
+
 export async function submitMistralBatchJob(
   files: string[],
   apiKey: string,
   modelName: string = 'mistral-ocr-latest',
   opts: MistralBatchSubmitOptions = {}
-): Promise<{ jobId: string; totalRequests: number }> {
+): Promise<SubmittedMistralBatchJob> {
   if (!files.length) {
     throw new Error('No files provided for Mistral batch OCR');
   }
@@ -559,6 +1290,14 @@ export async function submitMistralBatchJob(
   let uploadSucceeded = false;
   const cachedTempFiles = new Set<string>();
   const cacheRoot = opts.cacheDir ? path.resolve(opts.cacheDir) : null;
+  const preprocessWorkers = normalizeBatchWorkerCount(
+    opts.preprocessWorkers,
+    DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS
+  );
+  const uploadWorkers = normalizeBatchWorkerCount(
+    opts.uploadWorkers,
+    DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS
+  );
 
   try {
     const baseTemp = opts.tempRoot || os.tmpdir();
@@ -568,92 +1307,115 @@ export async function submitMistralBatchJob(
     await fs.promises.mkdir(manifestDir, { recursive: true }).catch(() => {});
     batchPath = manifestFilePath(manifestDir);
 
-    const preprocessed: Array<{ customId: string; uploadPath: string; filePath: string }> = [];
-    const uploads: { customId: string; signedUrl: string; filePath: string }[] = [];
+    const preprocessLimit = createConcurrencyLimiter(preprocessWorkers);
+    const uploadLimit = createConcurrencyLimiter(uploadWorkers);
+    const uploadTasks: Array<Promise<{ customId: string; signedUrl: string; filePath: string }> | undefined> = new Array(files.length);
 
-    await log(`Preprocessing ${files.length} file(s) before upload...`);
-    for (const file of files) {
-      await log(`Preprocessing ${path.basename(file)}...`);
-      if (useSignal.aborted) throw abortError();
+    await log(
+      `Preprocessing ${files.length} file(s) before upload with ${preprocessWorkers} preprocess worker(s) and ${uploadWorkers} upload worker(s)...`
+    );
+    const preprocessTasks = files.map((file, index) =>
+      preprocessLimit(async () => {
+        await log(`Preprocessing ${path.basename(file)}...`);
+        if (useSignal.aborted) throw abortError();
 
-      const stat = await fs.promises.stat(file);
-      if (!stat.isFile()) throw new Error(`Input must be a file: ${file}`);
-      if (!isMistralSupported(file)) throw new Error(`Unsupported file type for Mistral OCR: ${file}`);
+        const stat = await fs.promises.stat(file);
+        if (!stat.isFile()) throw new Error(`Input must be a file: ${file}`);
+        if (!isMistralSupported(file)) throw new Error(`Unsupported file type for Mistral OCR: ${file}`);
 
-      const customId = normalizeCustomId(file, baseInput);
-      let cachedPath: string | null = null;
-      if (opts.cacheDir) {
-        const rel = baseInput ? path.relative(path.resolve(baseInput), path.resolve(file)) : path.basename(file);
-        const relDir = path.dirname(rel);
-        cachedPath = path.join(opts.cacheDir, relDir, `${path.basename(file, path.extname(file))}.png`);
-        await fs.promises.mkdir(path.dirname(cachedPath), { recursive: true }).catch(() => {});
-        const exists = await fs.promises.stat(cachedPath).then(() => true).catch(() => false);
-        if (exists) {
-          await log(`Reusing cached image for ${path.basename(file)} at ${cachedPath}`);
-        } else {
-          cachedPath = null;
+        const customId = normalizeCustomId(file, baseInput);
+        const prep = await preprocessForMistral(file, opts.cacheDir, baseInput, baseTemp);
+        if (prep.cacheStatus === 'hit') {
+          await log(`Reusing cached image for ${path.basename(file)} at ${prep.path}`);
+        } else if (prep.cacheStatus === 'created') {
+          await log(`Cached preprocessed image for ${path.basename(file)} at ${prep.path}`);
         }
-      }
+        if (prep.cleanup) cleanups.push(prep.cleanup);
+        if (cacheRoot && isPathInside(cacheRoot, prep.path)) {
+          cachedTempFiles.add(path.resolve(prep.path));
+        }
 
-      const prep = cachedPath
-        ? { path: cachedPath, mime: 'image/png', cleanup: null }
-        : await preprocessForMistral(file, opts.cacheDir, baseInput, baseTemp);
-      if (!cachedPath && opts.cacheDir) {
-        await log(`Cached preprocessed image for ${path.basename(file)} at ${prep.path}`);
-      }
-      if (prep.cleanup) cleanups.push(prep.cleanup);
-      preprocessed.push({
-        customId,
-        uploadPath: prep.path,
-        filePath: path.resolve(file)
+        const prepared: PreparedMistralBatchInput = {
+          customId,
+          uploadPath: prep.path,
+          filePath: path.resolve(file),
+          cacheStatus: prep.cacheStatus
+        };
+        const staggerDelayMs = uploadWorkers > 1 ? (index % uploadWorkers) * 250 : 0;
+        const uploadTask = uploadLimit(() =>
+          uploadPreparedMistralBatchInput(prepared, apiKey, useSignal, log, staggerDelayMs)
+        );
+        uploadTask.catch(() => {});
+        uploadTasks[index] = uploadTask;
+      })
+    );
+
+    let uploads: { customId: string; signedUrl: string; filePath: string }[] = [];
+    try {
+      await Promise.all(preprocessTasks);
+      await log(`Finished preprocessing ${files.length} file(s); waiting for upload queue to drain...`);
+      const readyUploadTasks = uploadTasks.map((task, index) => {
+        if (!task) {
+          throw new Error(`Upload task was not scheduled for ${path.basename(files[index])}`);
+        }
+        return task;
       });
-      if (cacheRoot && isPathInside(cacheRoot, prep.path)) {
-        cachedTempFiles.add(path.resolve(prep.path));
-      }
-    }
-
-    await log(`Finished preprocessing ${preprocessed.length} file(s); starting uploads...`);
-    for (const prep of preprocessed) {
-      if (useSignal.aborted) throw abortError();
-
-      await log(`Uploading ${path.basename(prep.filePath)}...`);
-      const { id } = await uploadFileToMistral(prep.uploadPath, apiKey, 'ocr', useSignal);
-      await log(`Uploaded ${path.basename(prep.filePath)} as ${id}`);
-
-      // Small delay to allow Mistral to process the uploaded file before requesting signed URL
-      await sleep(500, useSignal);
-
-      const signedUrl = await getSignedUrl(id, apiKey, useSignal);
-      uploads.push({
-        customId: prep.customId,
-        signedUrl,
-        filePath: prep.filePath
-      });
+      uploads = await Promise.all(readyUploadTasks);
+    } catch (error) {
+      currentController?.abort();
+      await Promise.allSettled(preprocessTasks);
+      await Promise.allSettled(
+        uploadTasks.filter(
+          (task): task is Promise<{ customId: string; signedUrl: string; filePath: string }> => Boolean(task)
+        )
+      );
+      throw error;
     }
 
     await log(`Uploads complete. Creating batch manifest...`);
+    const includeImageBase64 = Boolean(opts.includeImageBase64);
+    const includeImageDescriptions = Boolean(opts.includeImageDescriptions);
     const lines = uploads.map(u =>
       JSON.stringify({
         custom_id: u.customId,
         body: {
           document: { type: 'document_url', document_url: u.signedUrl },
-          include_image_base64: false
+          include_image_base64: includeImageBase64,
+          ...(includeImageDescriptions ? { bbox_annotation_format: ACCESSIBLE_IMAGE_ANNOTATION_FORMAT } : {})
         }
       })
     );
     await fs.promises.writeFile(batchPath, lines.join('\n'), 'utf-8');
     await log(`Batch JSONL written (${uploads.length} lines) at ${batchPath}`);
 
-    const { id: batchFileId } = await uploadFileToMistral(batchPath, apiKey, 'batch', useSignal);
+    const { id: batchFileId } = await uploadFileToMistral(batchPath, apiKey, 'batch', useSignal, log);
     await log(`Uploaded batch manifest ${batchFileId}`);
     const job = await createBatchJob(batchFileId, apiKey, modelName, useSignal);
-    const jobId = String(job?.id || '');
+    const createdStatus = normalizeBatchJobStatus(job, uploads.length);
+    const jobId = String(createdStatus.id || '');
     if (!jobId) {
       throw new Error('Mistral batch job creation returned no job id');
     }
-    await log(`Created batch job ${jobId}`);
+    let initialStatus = createdStatus;
+    if (!isTerminalBatchStatus(createdStatus.status)) {
+      try {
+        initialStatus = await fetchMistralBatchJobStatus(jobId, apiKey, useSignal);
+      } catch (error: any) {
+        await log(
+          `Immediate status refresh failed for batch job ${jobId}; keeping creation response status ${createdStatus.status}: ${error?.message || error}`
+        );
+      }
+    }
+    await log(`Created batch job ${jobId} with status ${initialStatus.status}`);
     uploadSucceeded = true;
-    return { jobId, totalRequests: uploads.length };
+    return {
+      jobId,
+      status: initialStatus.status,
+      totalRequests: Math.max(initialStatus.totalRequests, uploads.length),
+      succeededRequests: initialStatus.succeededRequests,
+      failedRequests: initialStatus.failedRequests,
+      outputFileId: initialStatus.outputFileId
+    };
   } finally {
     currentController = null;
     currentReject = null;
@@ -687,22 +1449,53 @@ export async function fetchMistralBatchJobStatus(
   }
 }
 
-export async function downloadMistralBatchResults(
+export async function downloadMistralBatchResultsDetailed(
   outputFileId: string,
   apiKey: string,
   signal?: AbortSignal
-): Promise<Map<string, string>> {
+): Promise<Map<string, MistralOcrResult>> {
   if (!outputFileId) {
     throw new Error('Missing output file id for Mistral batch results');
   }
   const useSignal = bindSignal(signal);
   try {
     const resultsText = await downloadFileContent(outputFileId, apiKey, useSignal);
-    return parseMistralBatchResultText(resultsText);
+    return parseMistralBatchResultTextDetailed(resultsText);
   } finally {
     currentController = null;
     currentReject = null;
   }
+}
+
+export async function downloadMistralBatchErrors(
+  errorFileId: string,
+  apiKey: string,
+  signal?: AbortSignal
+): Promise<MistralBatchRequestError[]> {
+  if (!errorFileId) {
+    throw new Error('Missing error file id for Mistral batch errors');
+  }
+  const useSignal = bindSignal(signal);
+  try {
+    const errorText = await downloadFileContent(errorFileId, apiKey, useSignal);
+    return parseMistralBatchErrorText(errorText);
+  } finally {
+    currentController = null;
+    currentReject = null;
+  }
+}
+
+export async function downloadMistralBatchResults(
+  outputFileId: string,
+  apiKey: string,
+  signal?: AbortSignal
+): Promise<Map<string, string>> {
+  const detailed = await downloadMistralBatchResultsDetailed(outputFileId, apiKey, signal);
+  const flattened = new Map<string, string>();
+  for (const [key, value] of detailed.entries()) {
+    flattened.set(key, value.text);
+  }
+  return flattened;
 }
 
 export async function transcribeImageMistralBatch(
@@ -729,7 +1522,8 @@ export async function transcribeImageMistralBatch(
         logger: opts.logger,
         signal: useSignal,
         cacheDir: opts.cacheDir,
-        tempRoot: opts.tempRoot
+        tempRoot: opts.tempRoot,
+        includeImageBase64: opts.includeImageBase64
       });
 
       let status = await fetchMistralBatchJobStatus(submission.jobId, apiKey, useSignal);
@@ -745,7 +1539,10 @@ export async function transcribeImageMistralBatch(
         throw new Error(`Batch ended with status ${status.status}`);
       }
       if (!status.outputFileId) {
-        throw new Error(`Batch ${submission.jobId} succeeded but output file is missing`);
+        const detail = status.errorMessages.length
+          ? ` ${status.errorMessages.join('; ')}`
+          : '';
+        throw new Error(`Batch ${submission.jobId} completed without an output file.${detail}`);
       }
 
       await log(`Job ${submission.jobId} succeeded, downloading results ${status.outputFileId}`);
