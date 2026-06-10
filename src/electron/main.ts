@@ -2836,7 +2836,7 @@ ipcMain.handle(
         const stat = await fs.promises.stat(inputPath);
         if (stat.isDirectory()) {
           const names = (await fs.promises.readdir(inputPath))
-            .filter(f => /\.(mp3|mp4|wav|m4a|aac|flac|ogg)$/i.test(f))
+            .filter(f => /\.(mp3|mp4|wav|m4a|aac|flac|ogg|avi)$/i.test(f))
             .sort((a, b) =>
               a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
             );

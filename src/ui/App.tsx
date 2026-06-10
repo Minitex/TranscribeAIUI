@@ -1471,9 +1471,19 @@ export default function App() {
   const [newVersionAvailable, setNewVersionAvailable] = useState(false);
   const modeRef = useRef<'audio' | 'image'>('audio');
   const logRefreshInFlightRef = useRef(false);
-  const transcriptRefreshInFlightRef = useRef(false);
+  const transcriptRefreshInFlightRef = useRef<Record<'audio' | 'image', boolean>>({
+    audio: false,
+    image: false
+  });
+  const pendingTranscriptRefreshRef = useRef<Record<'audio' | 'image', boolean>>({
+    audio: false,
+    image: false
+  });
   const lastLogRefreshAtRef = useRef(0);
-  const lastTranscriptRefreshAtRef = useRef(0);
+  const lastTranscriptRefreshAtRef = useRef<Record<'audio' | 'image', number>>({
+    audio: 0,
+    image: 0
+  });
   const lastBatchUiRefreshAtRef = useRef(0);
   const isMistralImageModel = useMemo(
     () => imageModelName.trim().toLowerCase().includes('mistral'),
@@ -1543,29 +1553,42 @@ export default function App() {
 
   const refreshTranscriptListForMode = useCallback(async (targetMode: 'audio' | 'image', force: boolean = false) => {
     const now = Date.now();
-    if (!force && now - lastTranscriptRefreshAtRef.current < LIVE_TRANSCRIPT_REFRESH_INTERVAL_MS) {
+    if (!force && now - lastTranscriptRefreshAtRef.current[targetMode] < LIVE_TRANSCRIPT_REFRESH_INTERVAL_MS) {
       return;
     }
 
     const dir = targetMode === 'audio' ? audioOutputDir : imageOutputDir;
-    if (!dir || transcriptRefreshInFlightRef.current) {
+    if (!dir) {
       return;
     }
 
-    transcriptRefreshInFlightRef.current = true;
+    if (transcriptRefreshInFlightRef.current[targetMode]) {
+      pendingTranscriptRefreshRef.current[targetMode] = true;
+      return;
+    }
+
+    transcriptRefreshInFlightRef.current[targetMode] = true;
     try {
       const list = await ipcRenderer.invoke('list-transcripts-subtitles', dir) as Transcript[];
       const sorted = sortTranscripts(list);
-      if (targetMode === 'audio') {
-        setAudioTranscripts(sorted);
-      } else {
-        setImageTranscripts(sorted);
+      const activeDir = targetMode === 'audio' ? audioOutputDir : imageOutputDir;
+
+      if (activeDir === dir) {
+        if (targetMode === 'audio') {
+          setAudioTranscripts(sorted);
+        } else {
+          setImageTranscripts(sorted);
+        }
+        lastTranscriptRefreshAtRef.current[targetMode] = Date.now();
       }
-      lastTranscriptRefreshAtRef.current = Date.now();
     } catch (error) {
       console.error('Failed to refresh transcript list:', error);
     } finally {
-      transcriptRefreshInFlightRef.current = false;
+      transcriptRefreshInFlightRef.current[targetMode] = false;
+      if (pendingTranscriptRefreshRef.current[targetMode]) {
+        pendingTranscriptRefreshRef.current[targetMode] = false;
+        void refreshTranscriptListForMode(targetMode, true);
+      }
     }
   }, [audioOutputDir, imageOutputDir]);
 
@@ -2699,6 +2722,8 @@ export default function App() {
           generateSubtitles,
           interviewMode
         );
+        await refreshTranscriptListForMode('audio', true);
+        await refreshVisibleLogs('audio', true);
         setStatus('✅ Batch complete');
         setToast('✅ Done');
         setTimeout(() => setToast(null), 6000);
@@ -2716,7 +2741,7 @@ export default function App() {
         setIsTranscribing(false);
       }
     },
-    [audioInputPath, audioOutputDir]
+    [audioInputPath, audioOutputDir, refreshTranscriptListForMode, refreshVisibleLogs]
   );
 
   const transcribeImage = useCallback(async () => {

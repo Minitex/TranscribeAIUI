@@ -6,7 +6,35 @@ import { GoogleAIFileManager } from '@google/generative-ai/server';
 
 let currentController: AbortController | null = null;
 
-const ffmpegPath = (ffmpegStatic as unknown as string) || '';
+function resolveFfmpegPath(binPath: string): string {
+  if (!binPath) return '';
+
+  const unpackedPath = binPath.replace(
+    /([\\/])app\.asar([\\/])/i,
+    '$1app.asar.unpacked$2'
+  );
+  if (unpackedPath !== binPath && fs.existsSync(unpackedPath)) {
+    return unpackedPath;
+  }
+
+  const moduleRelativePath = binPath.split(/node_modules[\\/]+ffmpeg-static[\\/]+/i)[1];
+  if (process.resourcesPath && moduleRelativePath) {
+    const packagedPath = path.join(
+      process.resourcesPath,
+      'app.asar.unpacked',
+      'node_modules',
+      'ffmpeg-static',
+      moduleRelativePath
+    );
+    if (fs.existsSync(packagedPath)) {
+      return packagedPath;
+    }
+  }
+
+  return binPath;
+}
+
+const ffmpegPath = resolveFfmpegPath((ffmpegStatic as unknown as string) || '');
 const LONG_AUDIO_SPLIT_THRESHOLD_SECONDS = 3600;
 const MISTRAL_AUDIO_SPLIT_THRESHOLD_SECONDS = 1800;
 const TARGET_CHUNK_SECONDS = 30 * 60;
