@@ -2,11 +2,13 @@ import { execFile } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { PDFDocument } from 'pdf-lib';
+import { callMarkdownWorker } from './markdownRenderWorker.js';
 
 let currentController: AbortController | null = null;
 let currentReject: ((err: any) => void) | null = null;
 
-const SUPPORTED_EXTS = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.jp2', '.tif', '.tiff', '.bmp', '.gif']);
+const SUPPORTED_EXTS = new Set(['.pdf', '.png', '.jpg', '.jpeg', '.jp2', '.tif', '.tiff', '.bmp', '.gif', '.webp']);
 const MAX_ERROR_SNIPPET = 500;
 
 function sanitizeMistralErrorText(errText: string): string {
@@ -35,7 +37,16 @@ function mimeFor(filePath: string): string {
     case '.tiff': return 'image/tiff';
     case '.bmp': return 'image/bmp';
     case '.gif': return 'image/gif';
+    case '.webp': return 'image/webp';
     case '.pdf': return 'application/pdf';
+    case '.mp3': return 'audio/mpeg';
+    case '.mp4': return 'audio/mp4';
+    case '.wav': return 'audio/wav';
+    case '.m4a': return 'audio/mp4';
+    case '.aac': return 'audio/aac';
+    case '.flac': return 'audio/flac';
+    case '.ogg': return 'audio/ogg';
+    case '.avi': return 'video/x-msvideo';
     default: return 'application/octet-stream';
   }
 }
@@ -74,11 +85,37 @@ export interface MistralOcrPageDimensions {
   height?: number;
 }
 
+export interface MistralOcrWordConfidence {
+  text: string;
+  confidence: number;
+}
+
+export interface MistralOcrConfidence {
+  averagePageConfidenceScore?: number;
+  minimumPageConfidenceScore?: number;
+  words?: MistralOcrWordConfidence[];
+}
+
+export interface MistralOcrBlockBoundingBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+export interface MistralOcrBlock {
+  type: string;
+  bbox: MistralOcrBlockBoundingBox;
+  text: string;
+}
+
 export interface MistralOcrPageResult {
   index: number;
   markdown: string;
   markdownWithImages: string;
   dimensions: MistralOcrPageDimensions;
+  confidence?: MistralOcrConfidence;
+  blocks?: MistralOcrBlock[];
 }
 
 export interface MistralOcrResult {
@@ -117,200 +154,13 @@ function normalizeNumber(value: unknown): number | undefined {
   return Number.isFinite(num) ? num : undefined;
 }
 
-function inferImageMimeFromId(id: string): string {
-  const ext = path.extname(id).toLowerCase();
-  switch (ext) {
-    case '.png':
-      return 'image/png';
-    case '.gif':
-      return 'image/gif';
-    case '.webp':
-      return 'image/webp';
-    case '.bmp':
-      return 'image/bmp';
-    case '.tif':
-    case '.tiff':
-      return 'image/tiff';
-    default:
-      return 'image/jpeg';
-  }
-}
-
-function normalizeDataUri(imageBase64: string, id: string): string {
-  const raw = imageBase64.trim();
-  if (!raw) return '';
-  if (raw.startsWith('data:')) return raw;
-  return `data:${inferImageMimeFromId(id)};base64,${raw}`;
-}
-
-function safeDecodeURIComponent(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
-function collapseWhitespace(value: string): string {
-  return value.replace(/\s+/g, ' ').trim();
-}
-
-function sanitizeMarkdownAltText(value: string): string {
-  return collapseWhitespace(value || '').replace(/[\r\n[\]]+/g, ' ').trim();
-}
-
-function sanitizeMarkdownTitleText(value: string): string {
-  return collapseWhitespace(value || '').replace(/[\r\n"]+/g, ' ').trim();
-}
-
-function isPlaceholderImageLabel(value: string): boolean {
-  const normalized = collapseWhitespace(value || '');
-  if (!normalized) return true;
-
-  const lowered = normalized.toLowerCase();
-  const withoutExtension = lowered.replace(/\.[a-z0-9]{1,5}$/i, '');
-  const relaxed = collapseWhitespace(withoutExtension.replace(/[_-]+/g, ' '));
-  if (!relaxed) return true;
-
-  return /^(img|image|photo|picture|graphic|figure|diagram|illustration|scan|screenshot|page|pic|dsc|chart|table)\s*(?:[#-]?\s*\d+)?$/i.test(relaxed);
-}
-
-function firstNonEmptyString(...values: unknown[]): string {
-  for (const value of values) {
-    if (typeof value !== 'string') continue;
-    const trimmed = collapseWhitespace(value);
-    if (trimmed) return trimmed;
-  }
-  return '';
-}
-
-function normalizeImageAnnotationPayload(annotation: unknown): unknown {
-  if (typeof annotation === 'string') {
-    const trimmed = annotation.trim();
-    if (!trimmed) return '';
-    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-      try {
-        return normalizeImageAnnotationPayload(JSON.parse(trimmed));
-      } catch {
-        return trimmed;
-      }
-    }
-    return trimmed;
-  }
-
-  if (!annotation || typeof annotation !== 'object') {
-    return annotation;
-  }
-
-  const candidate = annotation as Record<string, unknown>;
-  const nested = candidate.parsed ?? candidate.value ?? candidate.json ?? candidate.data ?? candidate.content;
-  if (nested !== undefined && nested !== annotation) {
-    return normalizeImageAnnotationPayload(nested);
-  }
-
-  return annotation;
-}
-
-function extractImageAnnotationData(image: any): { altText: string; summary: string } {
-  const annotation = normalizeImageAnnotationPayload(
-    image?.image_annotation ?? image?.bbox_annotation ?? image?.annotation
-  );
-  if (!annotation) {
-    return { altText: '', summary: '' };
-  }
-
-  if (typeof annotation === 'string') {
-    const text = collapseWhitespace(annotation);
-    return { altText: text, summary: text };
-  }
-
-  if (typeof annotation !== 'object') {
-    return { altText: '', summary: '' };
-  }
-
-  const annotationRecord = annotation as Record<string, unknown>;
-  const altText = firstNonEmptyString(
-    annotationRecord.short_description,
-    annotationRecord.shortDescription,
-    annotationRecord.alt_text,
-    annotationRecord.altText,
-    annotationRecord.description,
-    annotationRecord.caption,
-    annotationRecord.title,
-    annotationRecord.label,
-    annotationRecord.image_type,
-    annotationRecord.imageType
-  );
-  const summary = firstNonEmptyString(
-    annotationRecord.summary,
-    annotationRecord.long_description,
-    annotationRecord.longDescription,
-    annotationRecord.explanation
-  );
-  return { altText, summary };
-}
-
-type EmbeddedImageInfo = {
-  uri: string;
-  altText: string;
-  summary: string;
-};
-
-function buildImageDataMap(images: any[]): Map<string, EmbeddedImageInfo> {
-  const map = new Map<string, EmbeddedImageInfo>();
-  for (const img of images) {
-    if (!img || typeof img !== 'object') continue;
-    const id = typeof img.id === 'string' ? img.id.trim() : '';
-    const base64 = typeof img.image_base64 === 'string'
-      ? img.image_base64
-      : (typeof img.imageBase64 === 'string' ? img.imageBase64 : '');
-    if (!id || !base64) continue;
-    const uri = normalizeDataUri(base64, id);
-    if (!uri) continue;
-    const annotation = extractImageAnnotationData(img);
-    const entry: EmbeddedImageInfo = {
-      uri,
-      altText: annotation.altText,
-      summary: annotation.summary
-    };
-    map.set(id, entry);
-    map.set(path.basename(id), entry);
-  }
-  return map;
-}
-
-function embedImagesIntoMarkdown(markdown: string, pageImages: any[]): string {
-  if (!markdown) return '';
-  if (!Array.isArray(pageImages) || pageImages.length === 0) return markdown;
-
-  const imageMap = buildImageDataMap(pageImages);
-  if (!imageMap.size) return markdown;
-
-  return markdown.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (full, alt, srcRaw) => {
-    const src = String(srcRaw || '').trim();
-    const decodedSrc = safeDecodeURIComponent(src);
-    const candidateKeys = [
-      src,
-      decodedSrc,
-      path.basename(src),
-      path.basename(decodedSrc)
-    ];
-    for (const key of candidateKeys) {
-      const value = imageMap.get(key);
-      if (value) {
-        const existingAlt = sanitizeMarkdownAltText(String(alt || ''));
-        const annotationAlt = sanitizeMarkdownAltText(value.altText);
-        const nextAlt = (!isPlaceholderImageLabel(existingAlt) ? existingAlt : annotationAlt) || existingAlt;
-        const safeAlt = sanitizeMarkdownAltText(nextAlt);
-        const safeTitle = sanitizeMarkdownTitleText(value.summary);
-        if (safeTitle) {
-          return `![${safeAlt}](${value.uri} "${safeTitle}")`;
-        }
-        return `![${safeAlt}](${value.uri})`;
-      }
-    }
-    return full;
-  });
+// embedImagesIntoMarkdown (and its image-annotation/data-URI helpers) used
+// to live here as synchronous, regex-heavy code over potentially large OCR
+// markdown. It now lives in markdownRenderWorker.ts and runs on a shared
+// worker thread via callMarkdownWorker(), so it never blocks Electron's
+// main-process event loop regardless of input size.
+async function embedImagesIntoMarkdown(markdown: string, pageImages: any[]): Promise<string> {
+  return callMarkdownWorker<string>('embedImagesIntoMarkdown', [markdown, pageImages]);
 }
 
 function extractMarkdownSections(payload: any): string[] {
@@ -333,53 +183,57 @@ function extractMarkdownSections(payload: any): string[] {
   return sections;
 }
 
-function cleanMarkdown(text: string): string {
-  if (!text) return '';
-  let cleaned = text;
-
-  // Drop code fences and their contents
-  cleaned = cleaned.replace(/```[\s\S]*?```/g, '');
-  cleaned = cleaned.replace(/~~~[\s\S]*?~~~/g, '');
-  // Drop images entirely
-  cleaned = cleaned.replace(/!\[[^\]]*]\([^)]+\)/g, '');
-  // Links -> keep the label
-  cleaned = cleaned.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
-  // Headers
-  cleaned = cleaned.replace(/^\s{0,3}#{1,6}\s+/gm, '');
-  // Blockquotes
-  cleaned = cleaned.replace(/^\s{0,3}>\s?/gm, '');
-  // Lists (bullets and numbered)
-  cleaned = cleaned.replace(/^\s*[-*+]\s+/gm, '');
-  cleaned = cleaned.replace(/^\s*\d+\.\s+/gm, '');
-  // Tables: drop header separators and outer pipes
-  cleaned = cleaned.replace(/^\s*\|?\s*:?-{2,}.*\n?/gm, '');
-  cleaned = cleaned.replace(/^\s*\|([^|]+(?:\|[^|]+)+)\|\s*$/gm, (_m, row: string) => {
-    return row
-      .split('|')
-      .map((cell: string) => cell.trim())
-      .filter(Boolean)
-      .join('  ');
-  });
-  // Footnote markers and definitions
-  cleaned = cleaned.replace(/\[\^[^\]]+]\s*/g, '');
-  cleaned = cleaned.replace(/^\s*\[\^[^\]]+]:.*$/gm, '');
-  // Simple LaTeX-ish superscripts like ${ }^{34}$
-  cleaned = cleaned.replace(/\$\s*\{\s*\}\^\{(\d+)\}\$/g, '$1');
-  // Inline math and display math: drop delimiters, keep inner text
-  cleaned = cleaned.replace(/\$\$([\s\S]*?)\$\$/g, '$1');
-  cleaned = cleaned.replace(/\$([^$]+)\$/g, '$1');
-  // Strip HTML tags
-  cleaned = cleaned.replace(/<[^>]+>/g, '');
-  // Strip basic markdown emphasis/inline code markers
-  cleaned = cleaned.replace(/[*_`~]+/g, '');
-  // Collapse excess whitespace
-  cleaned = cleaned.replace(/[ \t]+\n/g, '\n');
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
-  cleaned = cleaned.replace(/[ \t]{2,}/g, ' ');
-  return cleaned.trim();
+// cleanMarkdown used to live here as a synchronous, regex-heavy replace
+// chain over potentially large OCR markdown. It now lives in
+// markdownRenderWorker.ts and runs on a shared worker thread via
+// callMarkdownWorker(), so it never blocks Electron's main-process event
+// loop regardless of input size.
+export async function cleanMarkdown(text: string): Promise<string> {
+  return callMarkdownWorker<string>('cleanMarkdown', [text]);
 }
 
-function parseOcrPayload(payload: any): MistralOcrResult {
+// Field names below match Mistral's documented OCR 4 schema (confidence_scores.*,
+// blocks[].top_left_x etc). Docs disagreed with themselves on a couple of details, so every
+// read here is optional-chained — an unrecognized shape just yields undefined, never a crash.
+function parseConfidence(page: any): MistralOcrConfidence | undefined {
+  const scores = page?.confidence_scores;
+  if (!scores || typeof scores !== 'object') return undefined;
+  const words = Array.isArray(scores.word_confidence_scores)
+    ? scores.word_confidence_scores
+      .map((w: any): MistralOcrWordConfidence | undefined => {
+        const text = typeof w?.text === 'string' ? w.text : undefined;
+        const confidence = normalizeNumber(w?.confidence);
+        return text !== undefined && confidence !== undefined ? { text, confidence } : undefined;
+      })
+      .filter((w: MistralOcrWordConfidence | undefined): w is MistralOcrWordConfidence => Boolean(w))
+    : undefined;
+  const averagePageConfidenceScore = normalizeNumber(scores.average_page_confidence_score);
+  const minimumPageConfidenceScore = normalizeNumber(scores.minimum_page_confidence_score);
+  if (!words?.length && averagePageConfidenceScore === undefined && minimumPageConfidenceScore === undefined) {
+    return undefined;
+  }
+  return { averagePageConfidenceScore, minimumPageConfidenceScore, words };
+}
+
+function parseBlocks(page: any): MistralOcrBlock[] | undefined {
+  const rawBlocks = Array.isArray(page?.blocks) ? page.blocks : undefined;
+  if (!rawBlocks?.length) return undefined;
+  const blocks = rawBlocks
+    .map((b: any): MistralOcrBlock | undefined => {
+      const x0 = normalizeNumber(b?.top_left_x);
+      const y0 = normalizeNumber(b?.top_left_y);
+      const x1 = normalizeNumber(b?.bottom_right_x);
+      const y1 = normalizeNumber(b?.bottom_right_y);
+      if (x0 === undefined || y0 === undefined || x1 === undefined || y1 === undefined) return undefined;
+      const text = typeof b?.content === 'string' ? b.content : (typeof b?.text === 'string' ? b.text : '');
+      const type = typeof b?.type === 'string' ? b.type : 'text';
+      return { type, bbox: { x0, y0, x1, y1 }, text };
+    })
+    .filter((b: MistralOcrBlock | undefined): b is MistralOcrBlock => Boolean(b));
+  return blocks.length ? blocks : undefined;
+}
+
+async function parseOcrPayload(payload: any): Promise<MistralOcrResult> {
   const rawPages = Array.isArray(payload?.pages) ? payload.pages : [];
   const pages: MistralOcrPageResult[] = [];
   const parts: string[] = [];
@@ -391,8 +245,8 @@ function parseOcrPayload(payload: any): MistralOcrResult {
         ? page.markdown.trim()
         : '';
       const images = Array.isArray(page?.images) ? page.images : [];
-      const markdownWithImages = embedImagesIntoMarkdown(markdown, images);
-      const text = cleanMarkdown(markdown);
+      const markdownWithImages = await embedImagesIntoMarkdown(markdown, images);
+      const text = await cleanMarkdown(markdown);
       if (text) parts.push(text);
       pages.push({
         index: i + 1,
@@ -402,7 +256,9 @@ function parseOcrPayload(payload: any): MistralOcrResult {
           dpi: normalizeNumber(page?.dimensions?.dpi),
           width: normalizeNumber(page?.dimensions?.width),
           height: normalizeNumber(page?.dimensions?.height)
-        }
+        },
+        confidence: parseConfidence(page),
+        blocks: parseBlocks(page)
       });
     }
     return { text: parts.join('\n\n').trim(), pages };
@@ -413,7 +269,7 @@ function parseOcrPayload(payload: any): MistralOcrResult {
   for (let i = 0; i < sections.length; i++) {
     const markdown = typeof sections[i] === 'string' ? sections[i].trim() : '';
     if (!markdown) continue;
-    const text = cleanMarkdown(markdown);
+    const text = await cleanMarkdown(markdown);
     if (text) parts.push(text);
     pages.push({
       index: i + 1,
@@ -426,9 +282,40 @@ function parseOcrPayload(payload: any): MistralOcrResult {
   return { text: parts.join('\n\n').trim(), pages };
 }
 
-const MAX_DIMENSION = 4096;
-const MAX_FILE_BYTES = 20 * 1024 * 1024; // 20MB threshold to re-encode
+// Mistral's vision/OCR image inputs cap at 20MB per image (docs.mistral.ai/resources/known-limitations);
+// there's no documented pixel-dimension limit, so we only downsize as a last resort to fit that cap.
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
 const JPEG_QUALITY_STEPS = [90, 82, 74, 66];
+const RESIZE_FALLBACK_DIMENSION = 4096;
+
+// Mistral's OCR docs cap a single /v1/ocr call at 1000 pages. This
+// only guards the page-count ceiling, not the separate ~50MB size ceiling —
+// a PDF under 1000 pages but over that size still fails whole. Upgrade path
+// if that's hit in practice: physically split the PDF with pdf-lib (already
+// a dependency here) instead of just paging the same upload.
+const MISTRAL_OCR_MAX_PAGES_PER_CALL = 1000;
+
+async function getPdfPageCount(filePath: string): Promise<number | null> {
+  try {
+    const bytes = await fs.promises.readFile(filePath);
+    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
+    return doc.getPageCount();
+  } catch {
+    return null;
+  }
+}
+
+function mergeMistralOcrResults(results: MistralOcrResult[]): MistralOcrResult {
+  const pages: MistralOcrPageResult[] = [];
+  const textParts: string[] = [];
+  for (const result of results) {
+    for (const page of result.pages) {
+      pages.push({ ...page, index: pages.length + 1 });
+    }
+    if (result.text) textParts.push(result.text);
+  }
+  return { text: textParts.join('\n\n').trim(), pages };
+}
 
 async function convertImageToJpegWithSips(inputPath: string, outputPath: string): Promise<void> {
   if (process.platform !== 'darwin') {
@@ -440,7 +327,7 @@ async function convertImageToJpegWithSips(inputPath: string, outputPath: string)
       '/usr/bin/sips',
       [
         '-s', 'format', 'jpeg',
-        '--resampleHeightWidthMax', String(MAX_DIMENSION),
+        '--resampleHeightWidthMax', String(RESIZE_FALLBACK_DIMENSION),
         inputPath,
         '--out', outputPath
       ],
@@ -479,35 +366,34 @@ function buildCachedMistralPath(
   return path.join(outDir, `${path.basename(filePath, path.extname(filePath))}${outputExt}`);
 }
 
-async function writeOptimizedJpeg(
-  inputPath: string,
-  outputPath: string,
-  resize: boolean
-): Promise<void> {
+async function writeOptimizedJpeg(inputPath: string, outputPath: string): Promise<void> {
   const sharpMod = await import('sharp');
   const sharp = sharpMod?.default ?? sharpMod;
-  for (let idx = 0; idx < JPEG_QUALITY_STEPS.length; idx++) {
-    const quality = JPEG_QUALITY_STEPS[idx];
-    let pipeline = sharp(inputPath, { failOnError: false, limitInputPixels: false });
-    if (resize) {
-      pipeline = pipeline.resize({
-        width: MAX_DIMENSION,
-        height: MAX_DIMENSION,
-        fit: 'inside',
-        withoutEnlargement: true
-      });
-    }
-    await pipeline
-      .jpeg({
-        quality,
-        mozjpeg: true
-      })
-      .toFile(outputPath);
 
-    const written = await fs.promises.stat(outputPath).catch(() => null);
-    if (!written || written.size <= MAX_FILE_BYTES || idx === JPEG_QUALITY_STEPS.length - 1) {
-      return;
+  // Returns true once the file fits Mistral's 20MB image cap (or we've exhausted this pass's options).
+  const tryQualitySteps = async (resize: boolean): Promise<boolean> => {
+    for (let idx = 0; idx < JPEG_QUALITY_STEPS.length; idx++) {
+      let pipeline = sharp(inputPath, { failOnError: false, limitInputPixels: false });
+      if (resize) {
+        pipeline = pipeline.resize({
+          width: RESIZE_FALLBACK_DIMENSION,
+          height: RESIZE_FALLBACK_DIMENSION,
+          fit: 'inside',
+          withoutEnlargement: true
+        });
+      }
+      await pipeline.jpeg({ quality: JPEG_QUALITY_STEPS[idx], mozjpeg: true }).toFile(outputPath);
+
+      const written = await fs.promises.stat(outputPath).catch(() => null);
+      if (!written || written.size <= MAX_FILE_BYTES) return true;
+      if (idx === JPEG_QUALITY_STEPS.length - 1) return false;
     }
+    return false;
+  };
+
+  // Quality reduction alone keeps full resolution; only downsize if that's not enough to fit the cap.
+  if (!(await tryQualitySteps(false))) {
+    await tryQualitySteps(true);
   }
 }
 
@@ -534,20 +420,14 @@ async function preprocessForMistral(
   const sharp = sharpMod?.default ?? sharpMod;
 
   const inputStat = await fs.promises.stat(filePath);
-  let needsResize = false;
-  if (sharp) {
-    try {
-      const meta = await sharp(filePath, { failOnError: false, limitInputPixels: false }).metadata();
-      const width = meta.width ?? 0;
-      const height = meta.height ?? 0;
-      needsResize = width > MAX_DIMENSION || height > MAX_DIMENSION;
-    } catch {
-      needsResize = false;
-    }
-  }
-  const needsReencode = requiresCompatibleUpload || ext === '.tif' || ext === '.tiff' || inputStat.size > MAX_FILE_BYTES;
+  // TIFF is an accepted OCR upload format, so it only gets forced
+  // through the lossy JPEG path when oversized, same as PNG/JPG/BMP/GIF.
+  // Multi-page or unusual-compression TIFFs could still fail upload as-is;
+  // if that shows up in practice, add a re-encode-and-retry fallback on
+  // failure rather than reinstating the unconditional transcode.
+  const needsReencode = requiresCompatibleUpload || inputStat.size > MAX_FILE_BYTES;
 
-  if (!needsResize && !needsReencode) {
+  if (!needsReencode) {
     return { path: filePath, mime, cleanup: null, cacheStatus: 'none' };
   }
 
@@ -576,7 +456,7 @@ async function preprocessForMistral(
   if (requiresCompatibleUpload) {
     try {
       if (sharp) {
-        await writeOptimizedJpeg(filePath, outPath, needsResize);
+        await writeOptimizedJpeg(filePath, outPath);
       } else {
         await convertImageToJpegWithSips(filePath, outPath);
       }
@@ -605,7 +485,7 @@ async function preprocessForMistral(
 
   try {
     if (sharp) {
-      await writeOptimizedJpeg(filePath, outPath, needsResize);
+      await writeOptimizedJpeg(filePath, outPath);
     } else {
       await convertImageToJpegWithSips(filePath, outPath);
     }
@@ -660,7 +540,7 @@ async function sleep(ms: number, signal?: AbortSignal) {
 async function uploadFileToMistral(
   filePath: string,
   apiKey: string,
-  purpose: 'ocr' | 'batch',
+  purpose: 'ocr' | 'batch' | 'audio',
   signal?: AbortSignal,
   logger?: (msg: string) => void | Promise<void>
 ): Promise<{ id: string; fileName: string }> {
@@ -819,7 +699,9 @@ async function createBatchJob(
   batchFileId: string,
   apiKey: string,
   model: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  endpoint: string = '/v1/ocr',
+  jobType: string = 'ocr'
 ): Promise<any> {
   if (signal?.aborted) throw abortError();
   const resp = await fetch('https://api.mistral.ai/v1/batch/jobs', {
@@ -831,8 +713,8 @@ async function createBatchJob(
     body: JSON.stringify({
       input_files: [batchFileId],
       model,
-      endpoint: '/v1/ocr',
-      metadata: { job_type: 'ocr' }
+      endpoint,
+      metadata: { job_type: jobType }
     }),
     signal
   });
@@ -954,6 +836,32 @@ export async function transcribeImageMistral(
   return detailed.text;
 }
 
+async function callMistralOcr(
+  body: Record<string, unknown>,
+  apiKey: string,
+  signal?: AbortSignal
+): Promise<MistralOcrResult> {
+  const resp = await fetch('https://api.mistral.ai/v1/ocr', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(body),
+    signal
+  });
+
+  if (!resp.ok) {
+    const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
+    const err: any = new Error(`Mistral OCR failed: ${resp.status} ${resp.statusText} ${errText}`);
+    err.status = resp.status;
+    throw err;
+  }
+
+  const json = await resp.json();
+  return await parseOcrPayload(json);
+}
+
 export async function transcribePreparedImageMistralDetailed(
   preparedPath: string,
   apiKey: string,
@@ -977,31 +885,36 @@ export async function transcribePreparedImageMistralDetailed(
       type: 'document_url',
       document_url: signedUrl
     },
-    include_image_base64: includeImageBase64
+    include_image_base64: includeImageBase64,
+    confidence_scores_granularity: 'word',
+    include_blocks: true
   };
   if (includeImageDescriptions) {
     body.bbox_annotation_format = ACCESSIBLE_IMAGE_ANNOTATION_FORMAT;
   }
 
-  const resp = await fetch('https://api.mistral.ai/v1/ocr', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
-    },
-    body: JSON.stringify(body),
-    signal: options.signal
-  });
+  const pageCount = path.extname(preparedPath).toLowerCase() === '.pdf'
+    ? await getPdfPageCount(preparedPath)
+    : null;
 
-  if (!resp.ok) {
-    const errText = sanitizeMistralErrorText(await resp.text().catch(() => ''));
-    const err: any = new Error(`Mistral OCR failed: ${resp.status} ${resp.statusText} ${errText}`);
-    err.status = resp.status;
-    throw err;
+  if (pageCount !== null && pageCount > MISTRAL_OCR_MAX_PAGES_PER_CALL) {
+    const callCount = Math.ceil(pageCount / MISTRAL_OCR_MAX_PAGES_PER_CALL);
+    await options.logger?.(
+      `PDF has ${pageCount} pages, over Mistral's ${MISTRAL_OCR_MAX_PAGES_PER_CALL}-page single-call limit; splitting into ${callCount} OCR call(s).`
+    );
+    const results: MistralOcrResult[] = [];
+    for (let call = 0; call < callCount; call++) {
+      if (options.signal?.aborted) throw abortError();
+      const start = call * MISTRAL_OCR_MAX_PAGES_PER_CALL;
+      const end = Math.min(pageCount, start + MISTRAL_OCR_MAX_PAGES_PER_CALL);
+      await options.logger?.(`Requesting OCR for pages ${start + 1}-${end}...`);
+      const pages = Array.from({ length: end - start }, (_, i) => start + i);
+      results.push(await callMistralOcr({ ...body, pages }, apiKey, options.signal));
+    }
+    return mergeMistralOcrResults(results);
   }
 
-  const json = await resp.json();
-  return parseOcrPayload(json);
+  return callMistralOcr(body, apiKey, options.signal);
 }
 
 export interface MistralBatchSubmitOptions {
@@ -1076,21 +989,34 @@ function isTerminalBatchStatus(status: string): boolean {
   return status === 'SUCCESS' || status === 'FAILED' || status === 'CANCELLED';
 }
 
-function parseMistralBatchResultTextDetailed(resultsText: string): Map<string, MistralOcrResult> {
+// A batch of a few hundred image pages, each with an embedded base64 scan in
+// its response body, can be tens of MB of JSONL — parsing it all in one
+// uninterrupted synchronous loop would stall the whole app for that
+// duration. Yielding every PARSE_YIELD_LINES lines lets the event loop
+// breathe between chunks without changing the parsed result.
+const PARSE_YIELD_LINES = 200;
+
+async function parseMistralBatchResultTextDetailed(resultsText: string): Promise<Map<string, MistralOcrResult>> {
   const results = new Map<string, MistralOcrResult>();
-  for (const line of resultsText.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let rec: any;
-    try {
-      rec = JSON.parse(trimmed);
-    } catch {
-      continue;
+  const lines = resultsText.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed) {
+      let rec: any;
+      try {
+        rec = JSON.parse(trimmed);
+      } catch {
+        rec = undefined;
+      }
+      const customId = typeof rec?.custom_id === 'string' ? rec.custom_id : undefined;
+      if (customId) {
+        const body = rec?.response?.body ?? rec?.body ?? rec?.response ?? rec;
+        results.set(customId, await parseOcrPayload(body));
+      }
     }
-    const customId = typeof rec?.custom_id === 'string' ? rec.custom_id : undefined;
-    if (!customId) continue;
-    const body = rec?.response?.body ?? rec?.body ?? rec?.response ?? rec;
-    results.set(customId, parseOcrPayload(body));
+    if (i % PARSE_YIELD_LINES === PARSE_YIELD_LINES - 1) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
   }
   return results;
 }
@@ -1375,12 +1301,20 @@ export async function submitMistralBatchJob(
     await log(`Uploads complete. Creating batch manifest...`);
     const includeImageBase64 = Boolean(opts.includeImageBase64);
     const includeImageDescriptions = Boolean(opts.includeImageDescriptions);
+    // Unlike the sync path (transcribePreparedImageMistralDetailed),
+    // batch lines don't get split for PDFs over Mistral's 1000-page-per-call
+    // limit — one line is one document_url. An oversized PDF just fails that
+    // line. Upgrade path if that's hit in practice: submit multiple lines per
+    // such file (one per `pages` range) and merge them back by custom_id on
+    // download.
     const lines = uploads.map(u =>
       JSON.stringify({
         custom_id: u.customId,
         body: {
           document: { type: 'document_url', document_url: u.signedUrl },
           include_image_base64: includeImageBase64,
+          confidence_scores_granularity: 'word',
+          include_blocks: true,
           ...(includeImageDescriptions ? { bbox_annotation_format: ACCESSIBLE_IMAGE_ANNOTATION_FORMAT } : {})
         }
       })
@@ -1434,6 +1368,136 @@ export async function submitMistralBatchJob(
   }
 }
 
+export interface MistralAudioBatchSubmitOptions {
+  baseInput?: string;
+  logger?: (msg: string) => void | Promise<void>;
+  signal?: AbortSignal;
+  cacheDir?: string;
+  tempRoot?: string;
+  uploadWorkers?: number;
+  interviewMode?: boolean;
+  subtitles?: boolean;
+  contextBias?: string[];
+  language?: string;
+}
+
+// Mistral's documented single-request ceiling for audio transcription
+// (docs.mistral.ai/resources/known-limitations) is ~500MB / 60 minutes. The
+// batch endpoint can't chunk a file, so an oversized one just fails its
+// JSONL line; this only checks size (already stat'd per file below) since
+// checking duration would need ffmpeg probing from audioTranscribe.ts, and
+// importing that here risks a circular dependency for a warn-only check.
+const MISTRAL_AUDIO_BATCH_MAX_BYTES = 500 * 1024 * 1024;
+
+// Mirrors submitMistralBatchJob's shape (manifest -> upload manifest -> create
+// job) but for Voxtral audio: no image preprocessing/caching step, files
+// upload as-is. Long recordings that the sync path would split
+// into ffmpeg chunks are uploaded whole here instead — chunking+merging N
+// files x M chunks each inside one JSONL batch is a lot of bookkeeping for
+// a case batch mode isn't the primary fit for (many short files, not few
+// long ones). An oversized file just fails that one line; upgrade path is
+// per-file chunk-then-submit if users hit this in practice.
+export async function submitMistralAudioBatchJob(
+  files: string[],
+  apiKey: string,
+  modelName: string = 'voxtral-mini-latest',
+  opts: MistralAudioBatchSubmitOptions = {}
+): Promise<SubmittedMistralBatchJob> {
+  if (!files.length) {
+    throw new Error('No files provided for Mistral batch audio transcription');
+  }
+
+  const baseInput = opts.baseInput ? path.resolve(opts.baseInput) : path.dirname(path.resolve(files[0]));
+  const logFn = opts.logger ?? (() => {});
+  const log = async (msg: string) => { try { await logFn(`[mistral-audio-batch] ${msg}`); } catch {} };
+
+  const useSignal = bindSignal(opts.signal);
+  let batchPath: string | null = null;
+  const uploadWorkers = normalizeBatchWorkerCount(opts.uploadWorkers, DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS);
+
+  try {
+    const baseTemp = opts.tempRoot || os.tmpdir();
+    await fs.promises.mkdir(baseTemp, { recursive: true }).catch(() => {});
+    const manifestDir = opts.cacheDir || baseTemp;
+    await fs.promises.mkdir(manifestDir, { recursive: true }).catch(() => {});
+    batchPath = manifestFilePath(manifestDir);
+
+    const uploadLimit = createConcurrencyLimiter(uploadWorkers);
+    await log(`Uploading ${files.length} audio file(s) with ${uploadWorkers} upload worker(s)...`);
+
+    const uploads = await Promise.all(files.map((file, index) =>
+      uploadLimit(async () => {
+        if (useSignal.aborted) throw abortError();
+        const stat = await fs.promises.stat(file);
+        if (!stat.isFile()) throw new Error(`Input must be a file: ${file}`);
+        if (stat.size > MISTRAL_AUDIO_BATCH_MAX_BYTES) {
+          await log(
+            `[WARN] ${path.basename(file)} is ${(stat.size / (1024 * 1024)).toFixed(0)}MB, over Mistral's ~500MB single-request limit; this file may fail.`
+          );
+        }
+        const customId = normalizeCustomId(file, baseInput);
+        const staggerDelayMs = uploadWorkers > 1 ? (index % uploadWorkers) * 250 : 0;
+        if (staggerDelayMs) await sleep(staggerDelayMs, useSignal);
+        await log(`Uploading ${path.basename(file)}...`);
+        const { id } = await uploadFileToMistral(file, apiKey, 'audio', useSignal, log);
+        const signedUrl = await getSignedUrl(id, apiKey, useSignal);
+        return { customId, signedUrl };
+      })
+    ));
+
+    await log('Uploads complete. Creating batch manifest...');
+    // language is documented as mutually exclusive with timestamp_granularities.
+    const canSendLanguage = Boolean(opts.language) && !opts.subtitles && !opts.interviewMode;
+    const lines = uploads.map(u => JSON.stringify({
+      custom_id: u.customId,
+      body: {
+        model: modelName,
+        file_url: u.signedUrl,
+        ...(opts.subtitles || opts.interviewMode ? { timestamp_granularities: ['segment'] } : {}),
+        ...(opts.interviewMode ? { diarize: true } : {}),
+        ...(opts.contextBias?.length ? { context_bias: opts.contextBias } : {}),
+        ...(canSendLanguage ? { language: opts.language } : {})
+      }
+    }));
+    await fs.promises.writeFile(batchPath, lines.join('\n'), 'utf-8');
+    await log(`Batch JSONL written (${uploads.length} lines) at ${batchPath}`);
+
+    const { id: batchFileId } = await uploadFileToMistral(batchPath, apiKey, 'batch', useSignal, log);
+    await log(`Uploaded batch manifest ${batchFileId}`);
+    const job = await createBatchJob(batchFileId, apiKey, modelName, useSignal, '/v1/audio/transcriptions', 'audio_transcription');
+    const createdStatus = normalizeBatchJobStatus(job, uploads.length);
+    const jobId = String(createdStatus.id || '');
+    if (!jobId) {
+      throw new Error('Mistral batch job creation returned no job id');
+    }
+    let initialStatus = createdStatus;
+    if (!isTerminalBatchStatus(createdStatus.status)) {
+      try {
+        initialStatus = await fetchMistralBatchJobStatus(jobId, apiKey, useSignal);
+      } catch (error: any) {
+        await log(
+          `Immediate status refresh failed for batch job ${jobId}; keeping creation response status ${createdStatus.status}: ${error?.message || error}`
+        );
+      }
+    }
+    await log(`Created batch job ${jobId} with status ${initialStatus.status}`);
+    return {
+      jobId,
+      status: initialStatus.status,
+      totalRequests: Math.max(initialStatus.totalRequests, uploads.length),
+      succeededRequests: initialStatus.succeededRequests,
+      failedRequests: initialStatus.failedRequests,
+      outputFileId: initialStatus.outputFileId
+    };
+  } finally {
+    currentController = null;
+    currentReject = null;
+    if (batchPath) {
+      fs.promises.rm(batchPath, { force: true }).catch(() => {});
+    }
+  }
+}
+
 export async function fetchMistralBatchJobStatus(
   jobId: string,
   apiKey: string,
@@ -1460,7 +1524,7 @@ export async function downloadMistralBatchResultsDetailed(
   const useSignal = bindSignal(signal);
   try {
     const resultsText = await downloadFileContent(outputFileId, apiKey, useSignal);
-    return parseMistralBatchResultTextDetailed(resultsText);
+    return await parseMistralBatchResultTextDetailed(resultsText);
   } finally {
     currentController = null;
     currentReject = null;
@@ -1479,6 +1543,48 @@ export async function downloadMistralBatchErrors(
   try {
     const errorText = await downloadFileContent(errorFileId, apiKey, useSignal);
     return parseMistralBatchErrorText(errorText);
+  } finally {
+    currentController = null;
+    currentReject = null;
+  }
+}
+
+// Endpoint-agnostic batch result reader: returns each line's raw response
+// body keyed by custom_id, with no assumption about what endpoint produced
+// it (OCR, audio transcription, etc.) — callers apply their own payload
+// interpretation (parseOcrPayload, extractMistralSegments, ...).
+export async function downloadMistralBatchResultBodies(
+  outputFileId: string,
+  apiKey: string,
+  signal?: AbortSignal
+): Promise<Map<string, any>> {
+  if (!outputFileId) {
+    throw new Error('Missing output file id for Mistral batch results');
+  }
+  const useSignal = bindSignal(signal);
+  try {
+    const resultsText = await downloadFileContent(outputFileId, apiKey, useSignal);
+    const results = new Map<string, any>();
+    const lines = resultsText.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const trimmed = lines[i].trim();
+      if (trimmed) {
+        let rec: any;
+        try {
+          rec = JSON.parse(trimmed);
+        } catch {
+          rec = undefined;
+        }
+        const customId = typeof rec?.custom_id === 'string' ? rec.custom_id : undefined;
+        if (customId) {
+          results.set(customId, rec?.response?.body ?? rec?.body ?? rec?.response ?? rec);
+        }
+      }
+      if (i % PARSE_YIELD_LINES === PARSE_YIELD_LINES - 1) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    }
+    return results;
   } finally {
     currentController = null;
     currentReject = null;

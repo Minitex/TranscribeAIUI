@@ -1,12 +1,11 @@
-// src/components/ImageTranscriber.tsx
 import React from 'react';
-import {
-  FaFileImage,
-  FaFolderOpen,
-  FaListUl,
-  FaMicrophone,
-  FaTimesCircle
-} from 'react-icons/fa';
+import { FaFileImage, FaFolderOpen, FaListUl, FaMicrophone, FaTimesCircle } from 'react-icons/fa';
+import PathField from './PathField';
+import Stepper from './Stepper';
+import InfoTooltip from './InfoTooltip';
+import { buildBatchModeTooltip } from './BatchCostEstimate';
+import { MISTRAL_OCR_PRICE_PER_PAGE_DIRECT, MISTRAL_OCR_PRICE_PER_PAGE_BATCH, BATCH_MODE_INFO } from '../lib/constants';
+import type { BatchCostEstimateData } from '../lib/types';
 
 interface ImageTranscriberProps {
   inputPath: string;
@@ -24,6 +23,7 @@ interface ImageTranscriberProps {
     failed: number;
     total: number;
   } | null;
+  costEstimate: BatchCostEstimateData | null;
   onSelectInput(): void;
   onSelectOutput(): void;
   onClearInput(): void;
@@ -37,7 +37,6 @@ interface ImageTranscriberProps {
   onCancel(): void;
 }
 
-// Smart batch size increment/decrement logic
 const getBatchSizeIncrement = (currentSize: number): number => {
   if (currentSize < 50) return 10;      // 10, 20, 30, 40
   if (currentSize < 100) return 25;     // 50, 75, 100
@@ -55,7 +54,7 @@ const getPrevBatchSize = (currentSize: number): number => {
   return Math.max(10, currentSize - increment);
 };
 
-export default function ImageTranscriber({
+function ImageTranscriber({
   inputPath,
   outputDir,
   isTranscribing,
@@ -65,6 +64,7 @@ export default function ImageTranscriber({
   batchSize,
   inputIsDirectory,
   batchStats,
+  costEstimate,
   onSelectInput,
   onSelectOutput,
   onClearInput,
@@ -80,50 +80,28 @@ export default function ImageTranscriber({
   return (
     <>
       <div className="controls">
-        <div className="field-row">
-          <button onClick={onSelectInput}>
-            <FaFileImage />
-          </button>
-          <div className="path-input-wrapper">
-            <input
-              readOnly
-              value={inputPath}
-              placeholder="Select image folder…"
-            />
-            <button
-              type="button"
-              onClick={onClearInput}
-              aria-label="Clear image input path"
-              disabled={!inputPath}
-              title="Clear input path"
-              className="clear-path-btn"
-            >
-              <FaTimesCircle />
-            </button>
-          </div>
-        </div>
-        <div className="field-row">
-          <button onClick={onSelectOutput}>
-            <FaFolderOpen />
-          </button>
-          <div className="path-input-wrapper">
-            <input
-              readOnly
-              value={outputDir}
-              placeholder="Select output folder…"
-            />
-            <button
-              type="button"
-              onClick={onClearOutput}
-              aria-label="Clear image output folder"
-              disabled={!outputDir}
-              title="Clear output path"
-              className="clear-path-btn"
-            >
-              <FaTimesCircle />
-            </button>
-          </div>
-        </div>
+        <PathField
+          icon={<FaFileImage />}
+          value={inputPath}
+          placeholder="Select image folder…"
+          onSelect={onSelectInput}
+          onClear={onClearInput}
+          selectAriaLabel="Select input image"
+          inputAriaLabel="Input image path"
+          clearTitle="Clear input path"
+          clearAriaLabel="Clear image input path"
+        />
+        <PathField
+          icon={<FaFolderOpen />}
+          value={outputDir}
+          placeholder="Select output folder…"
+          onSelect={onSelectOutput}
+          onClear={onClearOutput}
+          selectAriaLabel="Select output folder"
+          inputAriaLabel="Output directory"
+          clearTitle="Clear output path"
+          clearAriaLabel="Clear image output folder"
+        />
       </div>
 
       {mistralMode && (
@@ -131,6 +109,7 @@ export default function ImageTranscriber({
           <div className="action-buttons">
             {!isTranscribing ? (
               <button
+                type="button"
                 className="transcribe-btn"
                 onClick={onTranscribe}
                 disabled={!inputPath || !outputDir}
@@ -138,7 +117,7 @@ export default function ImageTranscriber({
                 <FaMicrophone /> Transcribe
               </button>
             ) : (
-              <button className="cancel-btn" onClick={onCancel}>
+              <button type="button" className="cancel-btn" onClick={onCancel}>
                 <FaTimesCircle /> Cancel
               </button>
             )}
@@ -153,7 +132,7 @@ export default function ImageTranscriber({
               />
               Generate accessible PDF
             </label>
-            <div className="options-group">
+            <div className="options-group options-group-column">
               <label className="option-item" style={{ opacity: inputIsDirectory ? 1 : 0.6 }}>
                 <input
                   type="checkbox"
@@ -162,32 +141,26 @@ export default function ImageTranscriber({
                   disabled={!inputIsDirectory || isTranscribing}
                 />
                 Batch mode
+                <InfoTooltip text={buildBatchModeTooltip(BATCH_MODE_INFO, costEstimate && {
+                  fileCount: costEstimate.fileCount,
+                  quantity: costEstimate.quantity,
+                  unit: costEstimate.unit,
+                  directPricePerUnit: MISTRAL_OCR_PRICE_PER_PAGE_DIRECT,
+                  batchPricePerUnit: MISTRAL_OCR_PRICE_PER_PAGE_BATCH
+                })} />
               </label>
               {batchEnabled && (
                 <div className="batch-controls-inline" style={{ opacity: inputIsDirectory ? 1 : 0.6 }}>
                   <div className="batch-size-controls">
                     <span className="batch-size-label">Size</span>
-                    <div className="batch-size-main">
-                      <button
-                        type="button"
-                        className="batch-step-btn"
-                        onClick={() => onBatchSizeChange(getPrevBatchSize(batchSize))}
-                        disabled={batchSize <= 10 || !inputIsDirectory || isTranscribing}
-                        aria-label="Decrease batch size"
-                      >
-                        −
-                      </button>
-                      <span className="batch-size-current">{batchSize}</span>
-                      <button
-                        type="button"
-                        className="batch-step-btn"
-                        onClick={() => onBatchSizeChange(getNextBatchSize(batchSize))}
-                        disabled={batchSize >= 500 || !inputIsDirectory || isTranscribing}
-                        aria-label="Increase batch size"
-                      >
-                        +
-                      </button>
-                    </div>
+                    <Stepper
+                      value={batchSize}
+                      label="batch size"
+                      onDecrement={() => onBatchSizeChange(getPrevBatchSize(batchSize))}
+                      onIncrement={() => onBatchSizeChange(getNextBatchSize(batchSize))}
+                      decrementDisabled={batchSize <= 10 || !inputIsDirectory || isTranscribing}
+                      incrementDisabled={batchSize >= 500 || !inputIsDirectory || isTranscribing}
+                    />
                   </div>
                   {inputIsDirectory && (
                     <div className="batch-mini-stats">
@@ -239,6 +212,7 @@ export default function ImageTranscriber({
         <div className="action-buttons">
           {!isTranscribing ? (
             <button
+              type="button"
               className="transcribe-btn"
               onClick={onTranscribe}
               disabled={!inputPath || !outputDir}
@@ -246,7 +220,7 @@ export default function ImageTranscriber({
               <FaMicrophone /> Transcribe
             </button>
           ) : (
-            <button className="cancel-btn" onClick={onCancel}>
+            <button type="button" className="cancel-btn" onClick={onCancel}>
               <FaTimesCircle /> Cancel
             </button>
           )}
@@ -255,3 +229,5 @@ export default function ImageTranscriber({
     </>
   );
 }
+
+export default React.memo(ImageTranscriber);

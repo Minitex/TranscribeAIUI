@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, screen } from 'electron';
 import path from 'path';
 import fs from 'fs';
+import { execFile } from 'child_process';
 import {
   prepareImageForGemini,
   transcribePreparedImageGemini,
@@ -10,21 +11,28 @@ import {
   prepareImageForMistral,
   transcribePreparedImageMistralDetailed,
   submitMistralBatchJob,
+  submitMistralAudioBatchJob,
   fetchMistralBatchJobStatus,
   downloadMistralBatchErrors,
-  downloadMistralBatchResults,
   downloadMistralBatchResultsDetailed,
   cancelMistralRequest,
   isMistralSupported,
   type MistralOcrPageResult
 } from './mistralImage.js';
-import { transcribeAudioGemini, transcribeAudioMistral, cancelAudioRequest } from './audioTranscribe.js';
+import {
+  transcribeAudioGemini,
+  transcribeAudioMistral,
+  cancelAudioRequest,
+  downloadMistralAudioBatchResultsDetailed,
+  writeMistralAudioBatchResult,
+  estimateAudioBatchDurationMinutes
+} from './audioTranscribe.js';
 import { scanQualityFolder } from './qualityCheck.js';
+import { rasterizePdfPages } from './pdfRasterize.js';
 import Store from 'electron-store';
 import { isDev } from './util.js';
 import { pathToFileURL } from 'url';
 import { getLogPath } from './logHelpers.js';
-import katex from 'katex';
 import {
   PDFArray,
   PDFDict,
@@ -35,6 +43,14 @@ import {
   PDFString,
   decodePDFRawStream
 } from 'pdf-lib';
+import {
+  callMarkdownWorker,
+  escapeHtml,
+  sanitizeLanguageTag,
+  resolveAccessibleDocumentTitle,
+  type AccessiblePdfPageContent,
+  type RenderMarkdownOptions
+} from './markdownRenderWorker.js';
 
 interface StoreSchema {
   apiKey?: string;
@@ -42,8 +58,11 @@ interface StoreSchema {
   imageModel?: string;
   audioPrompt?: string;
   imagePrompt?: string;
+  mistralAudioContextBias?: string;
+  mistralAudioLanguage?: string;
   mistralApiKey?: string;
   mistralBatchEnabled?: boolean;
+  mistralAudioBatchEnabled?: boolean;
   mistralBatchPreprocessWorkers?: number;
   mistralBatchUploadWorkers?: number;
   folderFavorites?: string[];
@@ -55,25 +74,37 @@ interface StoreSchema {
 }
 const store = new Store<StoreSchema>();
 
-// Track running state
+// Some Macs hit a Chromium GPU-compositor bug here ("SharedImageManager::
+// ProduceOverlay ... non-existent mailbox") that leaves the whole window
+// permanently blank after a GPU-process hiccup, with no way to recover
+// short of quitting. This is a pure text/table UI with nothing that needs
+// GPU compositing, so trading it away avoids the crash class entirely.
+// disableHardwareAcceleration() alone still leaves a GPU process running
+// (just without compositing), which can still log the mailbox error below;
+// the explicit switch prevents that process from starting at all.
+// Must run before app is ready.
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch('disable-gpu');
+
 let mainWindow: BrowserWindow | null = null;
 let cancelRequested = false;
 let activeAudioAbort: AbortController | null = null;
 let activeImageAbort: AbortController | null = null;
 
 const ACCESSIBLE_PDF_PREFIX = 'ACCESSIBLE_';
+// Hash routes (mirrored in src/ui/App.tsx)
+const ROUTE_SETTINGS = '#/settings';
+const ROUTE_BATCH_QUEUE = '#/batch-queue';
 const AUDIO_MODEL_OPTIONS = [
   'voxtral-mini-latest',
   'gemini-3.1-pro-preview',
-  'gemini-3-flash-preview',
-  'gemini-2.5-pro',
+  'gemini-3.5-flash',
   'gemini-2.5-flash'
 ];
 const IMAGE_MODEL_OPTIONS = [
   'mistral-ocr-latest',
   'gemini-3.1-pro-preview',
-  'gemini-3-flash-preview',
-  'gemini-2.5-pro',
+  'gemini-3.5-flash',
   'gemini-2.5-flash'
 ];
 const DEFAULT_AUDIO_MODEL = 'gemini-3.1-pro-preview';
@@ -82,6 +113,11 @@ const MIN_MISTRAL_BATCH_WORKERS = 1;
 const MAX_MISTRAL_BATCH_WORKERS = 5;
 const DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS = 2;
 const DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS = 2;
+// Log file is trimmed to the last LOG_TRIM_KEEP_LINES lines once it exceeds this size.
+const LOG_TRIM_THRESHOLD_BYTES = 2 * 1024 * 1024; // 2MB
+const LOG_TRIM_KEEP_LINES = 5000;
+const DEFAULT_IMAGE_BATCH_SIZE = 10;
+const DEFAULT_AUDIO_BATCH_SIZE = 25;
 
 function normalizeSupportedModel(
   value: unknown,
@@ -151,7 +187,6 @@ function formatImageProgressLabel(collectionName: string, processedCount: number
   return `${collectionName} - images processed ${processedCount}/${totalCount} (${percentage}%)`;
 }
 
-// Helper function to merge sorted arrays efficiently
 function mergeSortedArrays(sortedChunks: string[][]): string[] {
   if (sortedChunks.length === 0) return [];
   if (sortedChunks.length === 1) return sortedChunks[0];
@@ -212,6 +247,44 @@ function accessibleHtmlPathForPdf(pdfPath: string): string {
   return path.join(dir, `${base}.html`);
 }
 
+// Kept in its own subfolder (rather than loose next to the .txt) so an output folder
+// browsed in Finder/Explorer only shows the user's actual transcripts.
+const OCR_METADATA_SUBDIR = '.mistral_ocr_meta';
+
+function ocrReviewSidecarPathForTranscript(txtPath: string): string {
+  const dir = path.dirname(txtPath);
+  const base = path.basename(txtPath, path.extname(txtPath));
+  return path.join(dir, OCR_METADATA_SUBDIR, `${base}.ocrmeta.json`);
+}
+
+// Sidecar is only written when Mistral actually returned confidence/blocks data
+// (OCR 4+). Older responses or Gemini results simply produce no sidecar, and the review
+// modal's double-click handler falls back to opening the file externally, same as today.
+async function writeOcrReviewSidecar(txtPath: string, sourceImagePath: string, pages: MistralOcrPageResult[]): Promise<void> {
+  const hasReviewData = pages.some(p => p.confidence || p.blocks);
+  if (!hasReviewData) return;
+  const sidecarPath = ocrReviewSidecarPathForTranscript(txtPath);
+  const metaDir = path.dirname(sidecarPath);
+  await fs.promises.mkdir(metaDir, { recursive: true }).catch(() => {});
+  // A leading dot only hides a folder from Finder on macOS/Linux; Windows Explorer
+  // needs the actual hidden file attribute set to match that behavior.
+  if (process.platform === 'win32') {
+    await new Promise<void>(resolve => execFile('attrib', ['+h', metaDir], () => resolve()));
+  }
+  const payload = {
+    sourceImagePath,
+    pages: pages.map(p => ({
+      index: p.index,
+      dimensions: p.dimensions,
+      blocks: p.blocks ?? [],
+      words: p.confidence?.words ?? [],
+      averageConfidence: p.confidence?.averagePageConfidenceScore,
+      minimumConfidence: p.confidence?.minimumPageConfidenceScore
+    }))
+  };
+  await fs.promises.writeFile(sidecarPath, JSON.stringify(payload), 'utf-8').catch(() => {});
+}
+
 function generatedSourceBaseName(fileName: string): string {
   const lowerName = fileName.toLowerCase();
   if (lowerName.endsWith('.txt') || lowerName.endsWith('.srt')) {
@@ -237,833 +310,19 @@ async function rebuildAccessiblePdfFromExistingHtml(pdfPath: string): Promise<bo
   return true;
 }
 
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-const HTML_ENTITY_MAP: Record<string, string> = {
-  amp: '&',
-  lt: '<',
-  gt: '>',
-  quot: '"',
-  apos: "'",
-  nbsp: ' ',
-  ndash: '–',
-  mdash: '—',
-  hellip: '…',
-  lsquo: '‘',
-  rsquo: '’',
-  ldquo: '“',
-  rdquo: '”',
-  bull: '•',
-  middot: '·'
-};
-
-function decodeHtmlEntities(value: string): string {
-  if (!value || !value.includes('&')) return value;
-
-  let decoded = value;
-  for (let pass = 0; pass < 2; pass += 1) {
-    const next = decoded.replace(/&(#(?:x[a-fA-F0-9]+|\d+)|[a-zA-Z][a-zA-Z0-9]+);/g, (match, entity) => {
-      if (entity.startsWith('#x') || entity.startsWith('#X')) {
-        const codePoint = Number.parseInt(entity.slice(2), 16);
-        return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : match;
-      }
-      if (entity.startsWith('#')) {
-        const codePoint = Number.parseInt(entity.slice(1), 10);
-        return Number.isFinite(codePoint) ? String.fromCodePoint(codePoint) : match;
-      }
-
-      return HTML_ENTITY_MAP[entity.toLowerCase()] ?? match;
-    });
-    if (next === decoded) break;
-    decoded = next;
-  }
-
-  return decoded;
-}
-
-interface AccessiblePdfPageContent {
-  index: number;
-  markdownWithImages: string;
-  dimensions?: {
-    width?: number;
-    height?: number;
-    dpi?: number;
-  };
-}
-
-type RenderMode = 'pdf' | 'sidecar';
-
-type RenderedImageToken = {
-  token: string;
-  inlineHtml: string;
-  blockHtml: string;
-};
-
-function escapeHtmlAttribute(value: string): string {
-  return escapeHtml(value).replace(/`/g, '&#96;');
-}
-
-interface RenderMarkdownOptions {
-  minimumHeadingLevel?: number;
-  renderMode?: RenderMode;
-}
-
-function sanitizeHref(rawHref: string): string {
-  const href = rawHref.trim();
-  if (!href) return '';
-  if (/^(https?:|mailto:|tel:|#)/i.test(href)) return href;
-  return '';
-}
-
-const GENERIC_IMAGE_ALT_TEXTS = new Set([
-  'image',
-  'img',
-  'photo',
-  'picture',
-  'graphic',
-  'diagram',
-  'icon',
-  'figure',
-  'screenshot',
-  'scan',
-  'logo'
-]);
-
-const GENERIC_LINK_TEXTS = new Set([
-  'click here',
-  'here',
-  'read more',
-  'learn more',
-  'more',
-  'details',
-  'link',
-  'this',
-  'visit',
-  'open'
-]);
-
-function isPlaceholderImageAltText(value: string): boolean {
-  const normalized = collapseWhitespace(value || '');
-  if (!normalized) return true;
-
-  const lowered = normalized.toLowerCase();
-  if (GENERIC_IMAGE_ALT_TEXTS.has(lowered)) return true;
-
-  const withoutExtension = lowered.replace(/\.[a-z0-9]{1,5}$/i, '');
-  const relaxed = collapseWhitespace(withoutExtension.replace(/[_-]+/g, ' '));
-  if (!relaxed) return true;
-  if (GENERIC_IMAGE_ALT_TEXTS.has(relaxed)) return true;
-
-  return /^(img|image|photo|picture|graphic|figure|diagram|illustration|scan|screenshot|page|pic|dsc|chart|table)\s*(?:[#-]?\s*\d+)?$/i.test(relaxed);
-}
-
-function collapseWhitespace(value: string): string {
-  return value.replace(/\s+/g, ' ').trim();
-}
-
-function safeDecodeURIComponent(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
-function truncateText(value: string, maxLength: number): string {
-  const normalized = collapseWhitespace(value);
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, Math.max(1, maxLength - 3)).trimEnd()}...`;
-}
-
-function stripMarkdownForTitle(value: string): string {
-  if (!value) return '';
-  return collapseWhitespace(
-    decodeHtmlEntities(value)
-      .replace(/!\[[^\]]*]\([^)]+\)/g, ' ')
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-      .replace(/[*_~`>#]/g, ' ')
-      .replace(/^\s*\d+\.\s+/g, '')
-      .replace(/^\s*[-*+]\s+/g, '')
-      .replace(/<[^>]+>/g, ' ')
-  );
-}
-
-function extractDocumentTitleCandidate(source: string): string {
-  if (!source) return '';
-  const lines = source.replace(/\r\n/g, '\n').split('\n');
-
-  for (const rawLine of lines) {
-    const trimmed = rawLine.trim();
-    if (!trimmed) continue;
-    const heading = trimmed.match(/^#{1,6}\s+(.+)$/);
-    if (!heading) continue;
-    const candidate = truncateText(stripMarkdownForTitle(heading[1]), 160);
-    if (candidate.length >= 3) return candidate;
-  }
-
-  for (const rawLine of lines) {
-    const trimmed = rawLine.trim();
-    if (!trimmed) continue;
-    if (/^!\[[^\]]*]\([^)]+\)$/.test(trimmed)) continue;
-    if (/^\|/.test(trimmed)) continue;
-    if (/^(:?-{3,}:?\s*\|)+/.test(trimmed)) continue;
-    const candidate = truncateText(stripMarkdownForTitle(trimmed), 160);
-    if (candidate.length >= 3) return candidate;
-  }
-
-  return '';
-}
-
-function sanitizeProvidedExportTitle(value: string): string {
-  const normalized = collapseWhitespace(decodeHtmlEntities(value || ''));
-  if (!normalized) return '';
-  const withoutOcrSuffix = normalized.replace(/\s+OCR$/i, '');
-  const withoutExtension = withoutOcrSuffix.replace(/\.(pdf|png|jpe?g|tif|tiff|bmp|gif)$/i, '');
-  return collapseWhitespace(withoutExtension);
-}
-
-function resolveAccessibleDocumentTitle(
-  providedTitle: string,
-  text: string,
-  pages: AccessiblePdfPageContent[] = []
-): string {
-  for (const page of pages) {
-    const candidate = extractDocumentTitleCandidate(page.markdownWithImages || '');
-    if (candidate) return candidate;
-  }
-
-  const textCandidate = extractDocumentTitleCandidate(text || '');
-  if (textCandidate) return textCandidate;
-
-  const provided = sanitizeProvidedExportTitle(providedTitle);
-  if (provided) return truncateText(provided, 160);
-
-  return 'OCR Transcript';
-}
-
-function sanitizeImageSrc(rawSrc: string): string {
-  const src = rawSrc.trim();
-  if (!src) return '';
-  if (/^javascript:/i.test(src)) return '';
-  if (/^data:/i.test(src) && !/^data:image\//i.test(src)) return '';
-  return src;
-}
-
-function buildReadableSourceName(rawSrc: string): string {
-  const normalizedSrc = (rawSrc || '').trim().split(/[?#]/)[0] || '';
-  if (!normalizedSrc) return '';
-  const srcBase = path.basename(normalizedSrc, path.extname(normalizedSrc));
-  const decoded = safeDecodeURIComponent(srcBase);
-  const readable = collapseWhitespace(decoded.replace(/[_-]+/g, ' '));
-  if (!readable) return '';
-  if (isPlaceholderImageAltText(readable)) {
-    return '';
-  }
-  return readable;
-}
-
-function buildImageAltText(rawAlt: string, rawSrc: string): string {
-  const alt = collapseWhitespace(decodeHtmlEntities(rawAlt || ''));
-  if (alt && !isPlaceholderImageAltText(alt)) {
-    return truncateText(alt, 160);
-  }
-
-  const readable = buildReadableSourceName(rawSrc);
-  if (readable) {
-    return truncateText(`Image: ${readable}`, 160);
-  }
-
-  return 'Scanned document image';
-}
-
-function sanitizeLanguageTag(rawLang: string): string {
-  const lang = collapseWhitespace(rawLang || '');
-  if (!lang) return 'en';
-  if (!/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(lang)) return 'en';
-  return lang;
-}
-
-function buildLinkFallbackLabel(href: string): string {
-  if (!href) return 'Link';
-  if (/^mailto:/i.test(href)) return 'Email link';
-  if (/^tel:/i.test(href)) return 'Phone link';
-  if (href.startsWith('#')) {
-    const target = collapseWhitespace(href.slice(1).replace(/[-_]+/g, ' '));
-    return target ? `Jump to ${target}` : 'Jump link';
-  }
-  if (/^https?:/i.test(href)) {
-    try {
-      const url = new URL(href);
-      const pathLabel = url.pathname && url.pathname !== '/' ? url.pathname : '';
-      return `${url.hostname}${pathLabel}`;
-    } catch {
-      return href;
-    }
-  }
-  return href;
-}
-
-function buildGenericLinkAriaLabel(href: string): string {
-  const target = buildLinkFallbackLabel(href);
-  return `Open link: ${target}`;
-}
-
-function normalizeTableRow(cells: string[], width: number): string[] {
-  if (width <= 0) return [];
-  const normalized = cells.slice(0, width);
-  while (normalized.length < width) {
-    normalized.push('');
-  }
-  return normalized;
-}
-
-function findUnescapedSequence(source: string, target: string, fromIndex: number): number {
-  let idx = source.indexOf(target, fromIndex);
-  while (idx !== -1) {
-    if (idx === 0 || source[idx - 1] !== '\\') return idx;
-    idx = source.indexOf(target, idx + target.length);
-  }
-  return -1;
-}
-
-function renderLatexMath(latexRaw: string, displayMode: boolean): string {
-  const latex = decodeHtmlEntities(latexRaw).trim();
-  if (!latex) return '';
-  try {
-    const mathMl = katex.renderToString(latex, {
-      displayMode,
-      output: 'mathml',
-      throwOnError: true,
-      strict: 'ignore',
-      trust: false
-    });
-    if (displayMode) {
-      return `<div class="ocr-math-display">${mathMl}</div>`;
-    }
-    return `<span class="ocr-math-inline">${mathMl}</span>`;
-  } catch {
-    const escaped = escapeHtml(latex);
-    if (displayMode) {
-      return `<pre class="ocr-math-fallback">${escaped}</pre>`;
-    }
-    return `<code class="ocr-math-fallback">${escaped}</code>`;
-  }
-}
-
-function tokenizeInlineMath(raw: string): { text: string; tokens: Array<{ token: string; html: string }> } {
-  const tokens: Array<{ token: string; html: string }> = [];
-  if (!raw) return { text: '', tokens };
-
-  const pushToken = (latex: string, displayMode: boolean): string => {
-    const token = `@@OCRMATHTOKEN${tokens.length}@@`;
-    tokens.push({ token, html: renderLatexMath(latex, displayMode) });
-    return token;
-  };
-
-  const findInlineDollarClose = (source: string, fromIndex: number): number => {
-    for (let idx = fromIndex; idx < source.length; idx++) {
-      if (source[idx] !== '$') continue;
-      if (source[idx - 1] === '\\') continue;
-      if (source[idx + 1] === '$') continue;
-      const before = source[idx - 1] || '';
-      const after = source[idx + 1] || '';
-      if (/\s/.test(before)) continue;
-      if (/\d/.test(after)) continue;
-      return idx;
-    }
-    return -1;
-  };
-
-  let result = '';
-  let i = 0;
-
-  while (i < raw.length) {
-    if (raw[i] === '`') {
-      const close = raw.indexOf('`', i + 1);
-      if (close !== -1) {
-        result += raw.slice(i, close + 1);
-        i = close + 1;
-        continue;
-      }
-    }
-
-    if (raw.startsWith('\\(', i)) {
-      const close = findUnescapedSequence(raw, '\\)', i + 2);
-      if (close !== -1) {
-        const latex = raw.slice(i + 2, close);
-        if (latex.trim()) {
-          result += pushToken(latex, false);
-          i = close + 2;
-          continue;
-        }
-      }
-    }
-
-    if (raw.startsWith('$$', i)) {
-      const close = findUnescapedSequence(raw, '$$', i + 2);
-      if (close !== -1) {
-        const latex = raw.slice(i + 2, close);
-        if (latex.trim()) {
-          result += pushToken(latex, false);
-          i = close + 2;
-          continue;
-        }
-      }
-    }
-
-    if (raw[i] === '$' && raw[i - 1] !== '\\' && raw[i + 1] !== '$') {
-      const next = raw[i + 1] || '';
-      if (next && !/\s/.test(next)) {
-        const close = findInlineDollarClose(raw, i + 1);
-        if (close !== -1) {
-          const latex = raw.slice(i + 1, close);
-          if (latex.trim()) {
-            result += pushToken(latex, false);
-            i = close + 1;
-            continue;
-          }
-        }
-      }
-    }
-
-    result += raw[i];
-    i += 1;
-  }
-
-  return { text: result, tokens };
-}
-
-function renderInlineMarkdown(
-  raw: string,
-  imageTokens: RenderedImageToken[]
-): string {
-  if (!raw) return '';
-  const { text: mathTokenizedText, tokens: mathTokens } = tokenizeInlineMath(raw);
-  let html = escapeHtml(mathTokenizedText);
-
-  // Basic inline markdown styles.
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
-  html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/__([^_]+)__/g, '<strong>$1</strong>');
-  html = html.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
-  html = html.replace(/(^|[^\w])_([^_\n]+)_(?=[^\w]|$)/g, '$1<em>$2</em>');
-  html = html.replace(/~~([^~]+)~~/g, '<del>$1</del>');
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, labelRaw, hrefRaw) => {
-    const sanitizedHref = sanitizeHref(String(hrefRaw || ''));
-    const safeHref = escapeHtml(sanitizedHref);
-    const label = collapseWhitespace(String(labelRaw || ''));
-    const normalizedLabel = label.toLowerCase();
-    const resolvedLabel = label || escapeHtml(buildLinkFallbackLabel(sanitizedHref));
-    if (!safeHref) return label;
-    const rel = /^https?:/i.test(sanitizedHref) ? ' rel="noopener noreferrer"' : '';
-    const ariaLabel = GENERIC_LINK_TEXTS.has(normalizedLabel) || !label
-      ? ` aria-label="${escapeHtml(buildGenericLinkAriaLabel(sanitizedHref))}"`
-      : '';
-    return `<a href="${safeHref}"${rel}${ariaLabel}>${resolvedLabel}</a>`;
-  });
-
-  for (const img of imageTokens) {
-    html = html.split(img.token).join(img.inlineHtml);
-  }
-  for (const mathToken of mathTokens) {
-    html = html.split(mathToken.token).join(mathToken.html);
-  }
-
-  return html;
-}
-
-function normalizeBareOcrLatex(fragment: string): string {
-  return fragment
-    .replace(/[−–—]/g, '-')
-    .replace(/×/g, '\\times ')
-    .replace(/÷/g, '\\div ')
-    .replace(/·/g, '\\cdot ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function prepareTableCellInlineMarkdown(raw: string): string {
-  if (!raw || !/(\^\{[^}\n]+\}|_\{[^}\n]+\})/.test(raw)) return raw;
-
-  const protectedSegmentsPattern = /(`[^`]*`|\\\([^]*?\\\)|\\\[[^]*?\\\]|\$\$[^]*?\$\$|\$[^$\n]+\$)/g;
-  const bareLatexPattern = /(^|[\s|[(])([^\s|`$]*?(?:\^\{[^}\n]+\}|_\{[^}\n]+\})[^\s|`$]*)(?=$|[\s|,.;:)\]])/g;
-
-  return raw
-    .split(protectedSegmentsPattern)
-    .map((segment, idx) => {
-      if (idx % 2 === 1) return segment;
-      return segment.replace(bareLatexPattern, (_match, prefix, fragment) => {
-        const normalized = normalizeBareOcrLatex(String(fragment || ''));
-        if (!normalized) return String(prefix || '');
-        return `${String(prefix || '')}$${normalized}$`;
-      });
-    })
-    .join('');
-}
-
-function parseTableCells(line: string): string[] {
-  const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
-  return trimmed.split('|').map(cell => cell.trim());
-}
-
-function renderMarkdownLikeHtml(
+// renderMarkdownLikeHtml (and its helper functions/types) used to live here
+// as a large, synchronous, regex-heavy markdown-to-HTML renderer. A single
+// big OCR export could take long enough on that single-pass regex chain to
+// freeze the whole Electron app (every window, all IPC) while it ran on the
+// main process's event loop. It now lives in markdownRenderWorker.ts and
+// runs on a dedicated worker thread via callMarkdownWorker(), reused lazily
+// across calls, so it can never block the main process regardless of input
+// size.
+async function renderMarkdownLikeHtml(
   markdown: string,
   minimumHeadingLevelOrOptions: number | RenderMarkdownOptions = 2
-): string {
-  if (!markdown) return '';
-  const options = typeof minimumHeadingLevelOrOptions === 'number'
-    ? { minimumHeadingLevel: minimumHeadingLevelOrOptions }
-    : minimumHeadingLevelOrOptions;
-  const renderMode: RenderMode = options.renderMode ?? 'pdf';
-
-  type ParsedListItem = {
-    html: string;
-    explicitValue?: number;
-  };
-
-  const imageTokens: RenderedImageToken[] = [];
-  let tokenized = decodeHtmlEntities(markdown);
-  let imageIndex = 0;
-  tokenized = tokenized.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g, (_full, altRaw, srcRaw, titleRaw) => {
-    const token = `@@OCRIMGTOKEN${imageIndex++}@@`;
-    const sourceAlt = collapseWhitespace(String(altRaw || ''));
-    const normalizedAlt = buildImageAltText(sourceAlt, String(srcRaw || ''));
-    const alt = escapeHtmlAttribute(normalizedAlt);
-    const title = collapseWhitespace(decodeHtmlEntities(String(titleRaw || '')));
-    const captionText = title && title.toLowerCase() !== normalizedAlt.toLowerCase()
-      ? truncateText(title, 320)
-      : '';
-    const sanitizedSrc = sanitizeImageSrc(String(srcRaw || ''));
-    if (!sanitizedSrc) {
-      imageTokens.push({
-        token,
-        inlineHtml: '<span class="ocr-image-note">Image omitted: unsupported source.</span>',
-        blockHtml: '<p class="ocr-image-note">Image omitted: unsupported source.</p>'
-      });
-      return token;
-    }
-    const src = escapeHtml(sanitizedSrc);
-    const accessibleDescription = captionText || normalizedAlt;
-    const ariaLabel = escapeHtmlAttribute(accessibleDescription);
-    const titleAttr = captionText ? ` title="${escapeHtmlAttribute(captionText)}"` : '';
-    const inlineHtml = `<img class="ocr-inline-image" src="${src}" alt="${alt}" aria-label="${ariaLabel}"${titleAttr} />`;
-    const blockHtml = renderMode === 'sidecar'
-      ? `<div class="ocr-figure">${inlineHtml}${captionText ? `<p class="ocr-figure-caption">${escapeHtml(captionText)}</p>` : ''}</div>`
-      : inlineHtml;
-    imageTokens.push({
-      token,
-      inlineHtml,
-      blockHtml
-    });
-    return token;
-  });
-  const imageTokenMap = new Map(imageTokens.map(token => [token.token, token]));
-
-  const lines = tokenized.replace(/\r\n/g, '\n').split('\n');
-  const blocks: string[] = [];
-  let paragraphLines: string[] = [];
-  let listType: 'ul' | 'ol' | null = null;
-  let listItems: ParsedListItem[] = [];
-  let listHadBlankGap = false;
-  let lastHeadingText = '';
-  let tableCount = 0;
-  const normalizedMinimumHeadingLevel = Math.max(1, Math.min(6, options.minimumHeadingLevel ?? 2));
-  let headingOffset: number | null = null;
-  let previousHeadingLevel: number | null = null;
-  const imageTokenForLine = (line: string): RenderedImageToken | undefined => imageTokenMap.get(line.trim());
-
-  const flushParagraph = () => {
-    if (!paragraphLines.length) return;
-    if (renderMode === 'sidecar') {
-      const blockImages = paragraphLines
-        .map(line => imageTokenForLine(line))
-        .filter((token): token is RenderedImageToken => Boolean(token));
-      if (blockImages.length === paragraphLines.length && blockImages.length > 0) {
-        blocks.push(blockImages.map(token => token.blockHtml).join(''));
-        paragraphLines = [];
-        return;
-      }
-    }
-    const content = paragraphLines.map(line => renderInlineMarkdown(line, imageTokens)).join('<br/>');
-    blocks.push(`<p>${content}</p>`);
-    paragraphLines = [];
-  };
-
-  const flushList = () => {
-    if (!listType || !listItems.length) {
-      listType = null;
-      listItems = [];
-      listHadBlankGap = false;
-      return;
-    }
-    if (listType === 'ol') {
-      const itemsHtml = listItems.map(item => {
-        const valueAttr = item.explicitValue !== undefined ? ` value="${item.explicitValue}"` : '';
-        return `<li${valueAttr}>${item.html}</li>`;
-      }).join('');
-      blocks.push(`<ol class="ocr-ordered-list">${itemsHtml}</ol>`);
-    } else {
-      blocks.push(`<ul class="ocr-unordered-list">${listItems.map(item => `<li>${item.html}</li>`).join('')}</ul>`);
-    }
-    listType = null;
-    listItems = [];
-    listHadBlankGap = false;
-  };
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    if (!trimmed) {
-      flushParagraph();
-      if (listType) {
-        listHadBlankGap = true;
-      } else {
-        flushList();
-      }
-      continue;
-    }
-
-    const mathFence = trimmed.match(/^(```|~~~)\s*(math|latex)\s*$/i);
-    if (mathFence) {
-      flushParagraph();
-      flushList();
-      const fenceToken = mathFence[1];
-      const mathLines: string[] = [];
-      i += 1;
-      while (i < lines.length && !lines[i].trim().startsWith(fenceToken)) {
-        mathLines.push(lines[i]);
-        i += 1;
-      }
-      const blockHtml = renderLatexMath(mathLines.join('\n'), true);
-      if (blockHtml) blocks.push(blockHtml);
-      continue;
-    }
-
-    if (trimmed.startsWith('$$')) {
-      const singleLineInline = trimmed.length > 4 && trimmed.endsWith('$$');
-      if (singleLineInline) {
-        flushParagraph();
-        flushList();
-        const blockHtml = renderLatexMath(trimmed.slice(2, -2), true);
-        if (blockHtml) blocks.push(blockHtml);
-        continue;
-      }
-
-      const collected: string[] = [];
-      const startContent = line.slice(line.indexOf('$$') + 2);
-      if (startContent.trim()) collected.push(startContent);
-      let endIndex = -1;
-      for (let j = i + 1; j < lines.length; j++) {
-        const closeAt = lines[j].indexOf('$$');
-        if (closeAt !== -1) {
-          const beforeClose = lines[j].slice(0, closeAt);
-          if (beforeClose.trim()) collected.push(beforeClose);
-          endIndex = j;
-          break;
-        }
-        collected.push(lines[j]);
-      }
-      if (endIndex !== -1) {
-        flushParagraph();
-        flushList();
-        const blockHtml = renderLatexMath(collected.join('\n'), true);
-        if (blockHtml) blocks.push(blockHtml);
-        i = endIndex;
-        continue;
-      }
-    }
-
-    if (trimmed.startsWith('\\[')) {
-      const openIndex = line.indexOf('\\[');
-      const sameLineClose = line.indexOf('\\]', openIndex + 2);
-      if (sameLineClose !== -1) {
-        flushParagraph();
-        flushList();
-        const blockHtml = renderLatexMath(line.slice(openIndex + 2, sameLineClose), true);
-        if (blockHtml) blocks.push(blockHtml);
-        continue;
-      }
-
-      const collected: string[] = [];
-      const startContent = line.slice(openIndex + 2);
-      if (startContent.trim()) collected.push(startContent);
-      let endIndex = -1;
-      for (let j = i + 1; j < lines.length; j++) {
-        const closeAt = lines[j].indexOf('\\]');
-        if (closeAt !== -1) {
-          const beforeClose = lines[j].slice(0, closeAt);
-          if (beforeClose.trim()) collected.push(beforeClose);
-          endIndex = j;
-          break;
-        }
-        collected.push(lines[j]);
-      }
-      if (endIndex !== -1) {
-        flushParagraph();
-        flushList();
-        const blockHtml = renderLatexMath(collected.join('\n'), true);
-        if (blockHtml) blocks.push(blockHtml);
-        i = endIndex;
-        continue;
-      }
-    }
-
-    const fence = trimmed.match(/^(```|~~~)/);
-    if (fence) {
-      flushParagraph();
-      flushList();
-      const fenceToken = fence[1];
-      const codeLines: string[] = [];
-      i += 1;
-      while (i < lines.length && !lines[i].trim().startsWith(fenceToken)) {
-        codeLines.push(lines[i]);
-        i += 1;
-      }
-      blocks.push(`<pre><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`);
-      continue;
-    }
-
-    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
-      flushParagraph();
-      flushList();
-      // Skip decorative horizontal rules to avoid untagged drawing artifacts in PDF output.
-      continue;
-    }
-
-    const heading = trimmed.match(/^(#{1,6})\s+(.+)$/);
-    if (heading) {
-      flushParagraph();
-      flushList();
-      const rawLevel = heading[1].length;
-      if (headingOffset === null) {
-        headingOffset = normalizedMinimumHeadingLevel - rawLevel;
-      }
-      let level = Math.max(
-        normalizedMinimumHeadingLevel,
-        Math.min(6, rawLevel + headingOffset)
-      );
-      if (previousHeadingLevel !== null) {
-        if (level > previousHeadingLevel + 1) {
-          level = previousHeadingLevel + 1;
-        } else if (level < previousHeadingLevel - 1) {
-          level = previousHeadingLevel - 1;
-        }
-      }
-      previousHeadingLevel = level;
-      lastHeadingText = heading[2].trim();
-      blocks.push(`<h${level}>${renderInlineMarkdown(heading[2], imageTokens)}</h${level}>`);
-      continue;
-    }
-
-    if (trimmed.startsWith('>')) {
-      flushParagraph();
-      flushList();
-      const quoteLines: string[] = [];
-      while (i < lines.length && lines[i].trim().startsWith('>')) {
-        quoteLines.push(lines[i].replace(/^\s*>\s?/, ''));
-        i += 1;
-      }
-      i -= 1;
-      const quoteHtml = quoteLines.map(q => renderInlineMarkdown(q, imageTokens)).join('<br/>');
-      blocks.push(`<blockquote>${quoteHtml}</blockquote>`);
-      continue;
-    }
-
-    const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
-    const isTableSeparator = /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$/.test(nextLine);
-    if (trimmed.includes('|') && isTableSeparator) {
-      flushParagraph();
-      flushList();
-      const headerCells = parseTableCells(trimmed);
-      const rowEntries: Array<{ raw: string; cells: string[] }> = [];
-      i += 2;
-      while (i < lines.length) {
-        const rowLine = lines[i].trim();
-        if (!rowLine || !rowLine.includes('|')) {
-          i -= 1;
-          break;
-        }
-        rowEntries.push({ raw: rowLine, cells: parseTableCells(rowLine) });
-        i += 1;
-      }
-      const rows = rowEntries.map(entry => entry.cells);
-      const expectedColumnCount = headerCells.length;
-      const isStructurallyRegular = expectedColumnCount >= 2
-        && rows.length > 0
-        && rows.every(row => row.length === expectedColumnCount);
-      if (!isStructurallyRegular) {
-        const rawTableLines = [trimmed, nextLine, ...rowEntries.map(entry => entry.raw)];
-        blocks.push(`<pre><code>${escapeHtml(rawTableLines.join('\n'))}</code></pre>`);
-        continue;
-      }
-      const normalizedHeaders = normalizeTableRow(headerCells, expectedColumnCount);
-      const normalizedRows = rows.map(row => normalizeTableRow(row, expectedColumnCount));
-      tableCount += 1;
-      const tableId = `ocr-table-${tableCount}`;
-      const captionBase = lastHeadingText || `Table ${tableCount}`;
-      const captionText = lastHeadingText ? `Table ${tableCount}: ${captionBase}` : captionBase;
-      const summaryText = `Data table with ${expectedColumnCount} columns and ${normalizedRows.length} rows.`;
-      const headerIds = normalizedHeaders.map((_cell, colIdx) => `${tableId}-col-${colIdx + 1}`);
-      const captionHtml = `<caption id="${tableId}-caption">${escapeHtml(captionText)}</caption>`;
-      const headHtml = `<tr>${normalizedHeaders.map((cell, colIdx) => {
-        const headerContent = cell
-          ? renderInlineMarkdown(prepareTableCellInlineMarkdown(cell), imageTokens)
-          : `Column ${colIdx + 1}`;
-        return `<th id="${headerIds[colIdx]}" scope="col">${headerContent}</th>`;
-      }).join('')}</tr>`;
-      const bodyHtml = normalizedRows.map(row =>
-        `<tr>${row.map((cell, colIdx) => `<td headers="${headerIds[colIdx]}">${renderInlineMarkdown(prepareTableCellInlineMarkdown(cell), imageTokens)}</td>`).join('')}</tr>`
-      ).join('');
-      blocks.push(`<table aria-describedby="${tableId}-caption" summary="${escapeHtml(summaryText)}">${captionHtml}<thead>${headHtml}</thead><tbody>${bodyHtml}</tbody></table>`);
-      continue;
-    }
-
-    const unordered = line.match(/^\s*[-*+]\s+(.+)$/);
-    const ordered = line.match(/^\s*(\d+)\.\s+(.+)$/);
-    if (unordered || ordered) {
-      const nextType: 'ul' | 'ol' = unordered ? 'ul' : 'ol';
-      flushParagraph();
-      if (listType && listType !== nextType) {
-        flushList();
-      }
-      if (!listType) {
-        listType = nextType;
-      }
-      if (unordered) {
-        listItems.push({ html: renderInlineMarkdown(unordered[1] || '', imageTokens) });
-      } else if (ordered) {
-        const explicitValue = Number.parseInt(ordered[1], 10);
-        listItems.push({
-          html: renderInlineMarkdown(ordered[2] || '', imageTokens),
-          explicitValue: Number.isFinite(explicitValue) ? explicitValue : undefined
-        });
-      }
-      listHadBlankGap = false;
-      continue;
-    }
-
-    if (listType && listItems.length) {
-      if (!listHadBlankGap) {
-        const continuation = renderInlineMarkdown(trimmed, imageTokens);
-        listItems[listItems.length - 1].html = `${listItems[listItems.length - 1].html}<br/>${continuation}`;
-        continue;
-      }
-      flushList();
-    }
-    paragraphLines.push(trimmed);
-  }
-
-  flushParagraph();
-  flushList();
-  return blocks.join('');
+): Promise<string> {
+  return callMarkdownWorker<string>('renderMarkdownLikeHtml', [markdown, minimumHeadingLevelOrOptions]);
 }
 
 function wrapUnmarkedContentAsArtifacts(streamText: string): string {
@@ -1487,24 +746,24 @@ async function remediateAccessiblePdf(pdfBytes: Uint8Array): Promise<Uint8Array>
   return await pdfDoc.save({ useObjectStreams: false });
 }
 
-function buildSearchablePdfHtml(
+async function buildSearchablePdfHtml(
   title: string,
   text: string,
   pages: AccessiblePdfPageContent[] = [],
   language: string = 'en'
-): string {
+): Promise<string> {
   const safeTitle = escapeHtml(title || 'OCR Transcript');
   const safeLanguage = escapeHtml(sanitizeLanguageTag(language));
   const hasPages = pages.length > 0;
   const pageBlocks = hasPages
-    ? pages.map((page, idx) => {
+    ? (await Promise.all(pages.map(async (page, idx) => {
       const pageNumber = page.index || (idx + 1);
       const pageId = `ocr-page-${pageNumber}`;
-      const contentHtml = renderMarkdownLikeHtml(page.markdownWithImages || '', { minimumHeadingLevel: 1, renderMode: 'pdf' });
+      const contentHtml = await renderMarkdownLikeHtml(page.markdownWithImages || '', { minimumHeadingLevel: 1, renderMode: 'pdf' });
       return `<article class="ocr-page ocr-page-content" id="${pageId}" data-page="${pageNumber}"><p class="ocr-page-meta">Page ${pageNumber}</p>${contentHtml}</article>`;
-    }).join('')
+    }))).join('')
     : '';
-  const fallbackHtml = renderMarkdownLikeHtml(text || '', { minimumHeadingLevel: 1, renderMode: 'pdf' });
+  const fallbackHtml = await renderMarkdownLikeHtml(text || '', { minimumHeadingLevel: 1, renderMode: 'pdf' });
   return `<!doctype html>
 <html lang="${safeLanguage}" xml:lang="${safeLanguage}">
   <head>
@@ -1639,17 +898,17 @@ function buildSearchablePdfHtml(
 </html>`;
 }
 
-function buildAccessibleHtmlSidecar(
+async function buildAccessibleHtmlSidecar(
   title: string,
   text: string,
   pages: AccessiblePdfPageContent[] = [],
   language: string = 'en'
-): string {
+): Promise<string> {
   const safeTitle = escapeHtml(title || 'OCR Transcript');
   const safeLanguage = escapeHtml(sanitizeLanguageTag(language));
   const hasPages = pages.length > 0;
   const pageCount = hasPages ? pages.length : 1;
-  const fallbackHtml = renderMarkdownLikeHtml(text || '', { minimumHeadingLevel: 2, renderMode: 'sidecar' });
+  const fallbackHtml = await renderMarkdownLikeHtml(text || '', { minimumHeadingLevel: 2, renderMode: 'sidecar' });
   const pageNav = pageCount > 1
     ? `<nav class="page-nav" aria-labelledby="page-nav-heading">
       <span class="sr-only" id="page-nav-heading">On this page</span>${pages.map((page, idx) => {
@@ -1658,10 +917,10 @@ function buildAccessibleHtmlSidecar(
     }).join('')}</nav>`
     : '';
   const pageSections = hasPages
-    ? pages.map((page, idx) => {
+    ? (await Promise.all(pages.map(async (page, idx) => {
       const pageNumber = page.index || (idx + 1);
       const pageHeadingId = `ocr-page-heading-${pageNumber}`;
-      const contentHtml = renderMarkdownLikeHtml(page.markdownWithImages || '', { minimumHeadingLevel: 3, renderMode: 'sidecar' });
+      const contentHtml = await renderMarkdownLikeHtml(page.markdownWithImages || '', { minimumHeadingLevel: 3, renderMode: 'sidecar' });
       return `<section class="page-card" id="ocr-page-section-${pageNumber}" aria-labelledby="${pageHeadingId}">
         <div class="page-card-header">
           <div>
@@ -1671,7 +930,7 @@ function buildAccessibleHtmlSidecar(
         </div>
         <article class="ocr-page-content" data-page="${pageNumber}">${contentHtml}</article>
       </section>`;
-    }).join('')
+    }))).join('')
     : `<section class="page-card" id="ocr-page-section-1" aria-labelledby="ocr-page-heading-1">
       <div class="page-card-header">
         <div>
@@ -2044,7 +1303,22 @@ function buildAccessibleHtmlSidecar(
 </html>`;
 }
 
+// Each call spins up a hidden Chromium renderer (BrowserWindow) to print the
+// PDF. That's fine one at a time, but the OCR batch pool runs up to
+// MAX_MISTRAL_BATCH_WORKERS of these concurrently, which on weak/integrated
+// GPUs can spike memory and stall the main window. Cap it independently,
+// well below the batch worker count.
+const PDF_EXPORT_CONCURRENCY = 2;
+const pdfExportLimiter = createConcurrencyLimiter(PDF_EXPORT_CONCURRENCY);
+
 async function compileAccessiblePdfFromHtml(
+  htmlPath: string,
+  outPath: string
+): Promise<void> {
+  return pdfExportLimiter(() => compileAccessiblePdfFromHtmlUnthrottled(htmlPath, outPath));
+}
+
+async function compileAccessiblePdfFromHtmlUnthrottled(
   htmlPath: string,
   outPath: string
 ): Promise<void> {
@@ -2087,7 +1361,7 @@ async function writeSearchablePdfFromText(
 ): Promise<void> {
   const htmlOutPath = accessibleHtmlPathForPdf(outPath);
   const resolvedTitle = resolveAccessibleDocumentTitle(title, text, pages);
-  const sidecarHtml = buildAccessibleHtmlSidecar(resolvedTitle, text, pages, language);
+  const sidecarHtml = await buildAccessibleHtmlSidecar(resolvedTitle, text, pages, language);
   await fs.promises.mkdir(path.dirname(outPath), { recursive: true }).catch(() => {});
   await fs.promises.writeFile(htmlOutPath, sidecarHtml, 'utf-8');
   await compileAccessiblePdfFromHtml(htmlOutPath, outPath);
@@ -2125,6 +1399,8 @@ interface MistralBatchJobRecord {
   lastProgressAtMs: number;
   writtenAtMs: number | null;
   lastError: string | null;
+  subtitles?: boolean;
+  interviewMode?: boolean;
 }
 
 interface MistralBatchStateFile {
@@ -2230,7 +1506,9 @@ function normalizeJobRecord(raw: any): MistralBatchJobRecord | null {
     writtenAtMs: raw.writtenAtMs === null || raw.writtenAtMs === undefined
       ? null
       : normalizeTimestamp(raw.writtenAtMs, createdAtMs),
-    lastError: typeof raw.lastError === 'string' && raw.lastError ? raw.lastError : null
+    lastError: typeof raw.lastError === 'string' && raw.lastError ? raw.lastError : null,
+    subtitles: typeof raw.subtitles === 'boolean' ? raw.subtitles : undefined,
+    interviewMode: typeof raw.interviewMode === 'boolean' ? raw.interviewMode : undefined
   };
 }
 
@@ -2427,6 +1705,12 @@ ipcMain.handle('set-image-model', (_e, m: string) => {
 ipcMain.handle('get-audio-prompt', () => store.get('audioPrompt') || '');
 ipcMain.handle('set-audio-prompt', (_e, p: string) => { store.set('audioPrompt', p); });
 
+ipcMain.handle('get-mistral-audio-context-bias', () => store.get('mistralAudioContextBias') || '');
+ipcMain.handle('set-mistral-audio-context-bias', (_e, v: string) => { store.set('mistralAudioContextBias', v); });
+
+ipcMain.handle('get-mistral-audio-language', () => store.get('mistralAudioLanguage') || '');
+ipcMain.handle('set-mistral-audio-language', (_e, v: string) => { store.set('mistralAudioLanguage', v); });
+
 ipcMain.handle('get-image-prompt', () => store.get('imagePrompt') || '');
 ipcMain.handle('set-image-prompt', (_e, p: string) => { store.set('imagePrompt', p); });
 
@@ -2437,6 +1721,12 @@ ipcMain.handle('get-mistral-batch-enabled', () => store.get('mistralBatchEnabled
 ipcMain.handle('set-mistral-batch-enabled', (_e, value: boolean) => {
   if (typeof value !== 'boolean') return;
   store.set('mistralBatchEnabled', value);
+});
+
+ipcMain.handle('get-mistral-audio-batch-enabled', () => store.get('mistralAudioBatchEnabled') ?? false);
+ipcMain.handle('set-mistral-audio-batch-enabled', (_e, value: boolean) => {
+  if (typeof value !== 'boolean') return;
+  store.set('mistralAudioBatchEnabled', value);
 });
 ipcMain.handle(
   'get-mistral-batch-preprocess-workers',
@@ -2526,10 +1816,61 @@ ipcMain.handle('get-mistral-batch-queue', async (): Promise<MistralBatchQueueRow
 });
 
 ipcMain.handle(
+  'remove-mistral-batch-folder',
+  async (
+    _e,
+    payload: { inputPath?: string; outputDir?: string; modelName?: string }
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const rawInputPath = typeof payload?.inputPath === 'string' ? payload.inputPath.trim() : '';
+    const rawOutputDir = typeof payload?.outputDir === 'string' ? payload.outputDir.trim() : '';
+    const modelName = typeof payload?.modelName === 'string' ? payload.modelName.trim() : '';
+    if (!rawInputPath || !rawOutputDir || !modelName) {
+      return { ok: false, error: 'Missing input/output folder path.' };
+    }
+
+    const inputPath = path.resolve(rawInputPath);
+    const outputDir = path.resolve(rawOutputDir);
+    const cacheDir = path.join(app.getPath('userData'), 'temp', 'mistral_cache');
+    const state = await readMistralBatchState(cacheDir);
+    state.jobs = state.jobs.filter(job => !matchesBatchScope(job, inputPath, outputDir, modelName));
+    await writeMistralBatchState(cacheDir, state);
+    return { ok: true };
+  }
+);
+
+// Rough pre-submit estimate shown before a batch run: image cost approximates
+// pages as file count (most scans are one page; multi-page PDFs will
+// undercount — no cheaper way to know page count without OCRing first).
+// Audio cost sums real probed durations, so that side is exact.
+ipcMain.handle(
+  'estimate-batch-cost',
+  async (_e, payload: { mode?: 'audio' | 'image'; inputPath?: string }): Promise<{ unit: 'page' | 'minute'; fileCount: number; quantity: number } | null> => {
+    const inputPath = typeof payload?.inputPath === 'string' ? payload.inputPath.trim() : '';
+    if (!inputPath) return null;
+    try {
+      const stat = await fs.promises.stat(inputPath);
+      if (!stat.isDirectory()) return null;
+      const names = await fs.promises.readdir(inputPath);
+      if (payload?.mode === 'audio') {
+        const files = names
+          .filter(f => /\.(mp3|mp4|wav|m4a|aac|flac|ogg|avi)$/i.test(f))
+          .map(f => path.join(inputPath, f));
+        const totalMinutes = await estimateAudioBatchDurationMinutes(files);
+        return { unit: 'minute', fileCount: files.length, quantity: totalMinutes };
+      }
+      const files = names.filter(f => isMistralSupported(path.join(inputPath, f)));
+      return { unit: 'page', fileCount: files.length, quantity: files.length };
+    } catch {
+      return null;
+    }
+  }
+);
+
+ipcMain.handle(
   'select-mistral-batch-folder',
   async (
     _e,
-    payload: { inputPath?: string; outputDir?: string }
+    payload: { inputPath?: string; outputDir?: string; modelName?: string }
   ): Promise<{ ok: boolean; error?: string }> => {
     const rawInputPath = typeof payload?.inputPath === 'string' ? payload.inputPath.trim() : '';
     const rawOutputDir = typeof payload?.outputDir === 'string' ? payload.outputDir.trim() : '';
@@ -2539,13 +1880,21 @@ ipcMain.handle(
 
     const inputPath = path.resolve(rawInputPath);
     const outputDir = path.resolve(rawOutputDir);
+    const mode: 'audio' | 'image' = String(payload?.modelName || '').toLowerCase().includes('voxtral')
+      ? 'audio'
+      : 'image';
 
-    store.set('imageInputPath', inputPath);
-    store.set('imageOutputDir', outputDir);
-    store.set('activeMode', 'image');
+    if (mode === 'audio') {
+      store.set('audioInputPath', inputPath);
+      store.set('audioOutputDir', outputDir);
+    } else {
+      store.set('imageInputPath', inputPath);
+      store.set('imageOutputDir', outputDir);
+    }
+    store.set('activeMode', mode);
 
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('mistral-batch-folder-selected', inputPath, outputDir);
+      mainWindow.webContents.send('mistral-batch-folder-selected', inputPath, outputDir, mode);
     }
     return { ok: true };
   }
@@ -2615,6 +1964,44 @@ ipcMain.handle(
 
 ipcMain.handle('open-transcript', (_e, file: string) => shell.openPath(file));
 
+// Rebuilds a searchable PDF straight from the current .txt content after a
+// manual edit in the review modal. Uses an empty pages[] (an already-supported
+// fallback in writeSearchablePdfFromText) since the edited plain text no
+// longer maps onto the original OCR's per-page markdown/image structure —
+// the rebuilt PDF is plain-text-searchable but won't re-embed figures.
+ipcMain.handle('regenerate-searchable-pdf', async (_e, txtPath: string, pdfPath: string) => {
+  try {
+    const text = await fs.promises.readFile(txtPath, 'utf-8');
+    const title = path.basename(txtPath, path.extname(txtPath));
+    await writeSearchablePdfFromText(text, pdfPath, title, []);
+    return { ok: true };
+  } catch (error: any) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+});
+
+// The OCR review modal has no way to preview a PDF-sourced scan directly (an
+// <img> can't render PDF bytes, and this codebase has no PDF rasterization
+// lib) — this renders each page to a cached PNG next to the OCR sidecar so
+// the modal can show it through the same <img>-based preview pane as an
+// image-sourced review.
+ipcMain.handle('rasterize-pdf-pages', async (_e, txtPath: string, pdfPath: string, pageCount: number) => {
+  try {
+    const sidecarPath = ocrReviewSidecarPathForTranscript(txtPath);
+    const base = path.basename(sidecarPath, '.ocrmeta.json');
+    // Scoped by this transcript's own basename -- the sidecar directory
+    // (.mistral_ocr_meta) is shared across every file in the output folder,
+    // so an unscoped 'pdf-pages' subfolder would collide page-1.png,
+    // page-2.png, etc. across different PDFs batched into the same folder,
+    // serving one document's cached pages for another.
+    const outDir = path.join(path.dirname(sidecarPath), 'pdf-pages', base);
+    const pagePaths = await rasterizePdfPages(pdfPath, outDir, pageCount);
+    return { ok: true, pagePaths };
+  } catch (error: any) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+});
+
 ipcMain.handle('delete-generated-family', async (_e, filePath: string) => {
   try {
     if (typeof filePath !== 'string' || !filePath.trim()) {
@@ -2647,6 +2034,9 @@ ipcMain.handle('delete-generated-family', async (_e, filePath: string) => {
     for (const candidate of matches) {
       await fs.promises.rm(candidate, { force: true }).catch(() => {});
     }
+    // The family always includes the source .txt, so its OCR review sidecar (if any) is
+    // orphaned too — clean it up alongside the family rather than leaving it behind.
+    await fs.promises.rm(path.join(dir, OCR_METADATA_SUBDIR, `${familyBase}.ocrmeta.json`), { force: true }).catch(() => {});
 
     return {
       ok: true,
@@ -2748,13 +2138,17 @@ ipcMain.handle('cancel-transcription', () => {
 ipcMain.handle('delete-transcript', async (_e, filePath: string) => {
   try {
     await fs.promises.unlink(filePath);
+    // Only the .txt owns an OCR review sidecar; deleting a sibling .srt/.pdf/.html
+    // row should leave it in place since the .txt (and its badge) still exists.
+    if (path.extname(filePath).toLowerCase() === '.txt') {
+      await fs.promises.rm(ocrReviewSidecarPathForTranscript(filePath), { force: true }).catch(() => {});
+    }
     return true;
   } catch {
     return false;
   }
 });
 
-// ── Updated run-transcription to pass flags ──────────────────────────
 ipcMain.handle(
   'run-transcription',
   async (_e,
@@ -2771,10 +2165,10 @@ ipcMain.handle(
     try {
       const logPath = getLogPath(mode);
       const stat = await fs.promises.stat(logPath).catch(() => null);
-      if (stat && stat.size > 2 * 1024 * 1024) { // 2MB
+      if (stat && stat.size > LOG_TRIM_THRESHOLD_BYTES) {
         const data = await fs.promises.readFile(logPath, 'utf-8').catch(() => '');
         const lines = data.split('\n');
-        const keep = lines.slice(-5000); // keep last 5k lines
+        const keep = lines.slice(-LOG_TRIM_KEEP_LINES);
         await fs.promises.writeFile(logPath, keep.join('\n'), 'utf-8');
       }
     } catch {}
@@ -2800,7 +2194,6 @@ ipcMain.handle(
         if (!geminiApiKey) {
           throw new Error('Gemini API key not set. Please enter it in Settings.');
         }
-        process.env.GOOGLE_API_KEY = geminiApiKey;
       }
 
       const rawAudioPrompt = (promptArg || (store.get('audioPrompt') as string) || '').trim();
@@ -2809,6 +2202,13 @@ ipcMain.handle(
         await fs.promises.appendFile(getLogPath('audio'), `[ERR] ${msg}\n`);
         throw new Error(msg);
       }
+      // Voxtral-only accuracy levers (docs.mistral.ai/studio-api/audio/speech_to_text/offline_transcription).
+      const mistralContextBias = useVoxtralAudio
+        ? (store.get('mistralAudioContextBias') || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 100)
+        : undefined;
+      const mistralAudioLanguage = useVoxtralAudio
+        ? (store.get('mistralAudioLanguage') || '').trim() || undefined
+        : undefined;
       const audioCacheDir = path.join(
         app.getPath('userData'),
         'temp',
@@ -2816,6 +2216,13 @@ ipcMain.handle(
         'audio'
       );
       await fs.promises.mkdir(audioCacheDir, { recursive: true }).catch(() => {});
+      // Batch-job state (batch-jobs.json) lives in the mistral_cache root, not the
+      // audio subfolder above — that's the same file the image/OCR batch path and
+      // the Batch Queue UI's get-mistral-batch-queue/get-mistral-batch-stats
+      // handlers read from. audioCacheDir is only for this run's temp/manifest
+      // files; using it for state too would silently hide audio batch jobs from
+      // the UI (which only ever reads the root file).
+      const mistralBatchStateDir = path.join(app.getPath('userData'), 'temp', 'mistral_cache');
       if (useVoxtralAudio) {
         await fs.promises.appendFile(
           getLogPath('audio'),
@@ -2830,7 +2237,6 @@ ipcMain.handle(
         ).catch(() => {});
       }
 
-      // support single file or directory of audio files
       let audioFiles: string[] = [];
       try {
         const stat = await fs.promises.stat(inputPath);
@@ -2840,12 +2246,290 @@ ipcMain.handle(
             .sort((a, b) =>
               a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
             );
-          audioFiles = names.map(f => path.join(inputPath, f));
+          for (const f of names) {
+            const full = path.join(inputPath, f);
+            const fstat = await fs.promises.stat(full).catch(() => null);
+            if (!fstat || !fstat.isFile() || fstat.size === 0) continue;
+            audioFiles.push(full);
+          }
         } else {
           audioFiles = [inputPath];
         }
       } catch {
         audioFiles = [inputPath];
+      }
+
+      // Batch audio transcription: same submit/poll/write-once-per-invocation
+      // pattern as the image OCR batch branch below, reusing the same
+      // MistralBatchJobRecord state file and helpers (job scoping already
+      // separates audio from image via modelName, e.g. 'voxtral-mini-latest'
+      // vs 'mistral-ocr-latest' — no schema change needed).
+      if (useVoxtralAudio && Boolean(extraOptions?.batch)) {
+        const inputStat = await fs.promises.stat(inputPath);
+        if (!inputStat.isDirectory()) {
+          throw new Error('Batch mode requires selecting a folder for Mistral audio transcription.');
+        }
+        const normalizedOutputDir = path.resolve(outputDir);
+        const normalizedInputPath = path.resolve(inputPath);
+        const baseIsFile = false;
+        const batchSize = extraOptions?.batchSize || DEFAULT_AUDIO_BATCH_SIZE;
+        const mistralBatchUploadWorkers = normalizeMistralBatchWorkerCount(
+          store.get('mistralBatchUploadWorkers'),
+          DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS
+        );
+        const collectionName = path.basename(inputPath);
+        const logInfo = async (msg: string) => {
+          await fs.promises.appendFile(getLogPath('audio'), `[INFO] ${msg}\n`, 'utf-8').catch(() => {});
+        };
+
+        // Async (not fs.existsSync) so a large folder doesn't block the whole
+        // app for the duration of the scan — each await yields to the event
+        // loop between files instead of running as one uninterrupted loop.
+        const exists = (p: string) => fs.promises.access(p).then(() => true, () => false);
+        const hasRequiredOutput = async (filePath: string): Promise<boolean> => {
+          const base = path.basename(filePath, path.extname(filePath));
+          return exists(path.join(outputDir, `${base}.txt`));
+        };
+
+        const workFiles: string[] = [];
+        for (const f of audioFiles) {
+          if (!(await hasRequiredOutput(f))) workFiles.push(f);
+        }
+
+        if (!workFiles.length) {
+          const state = await readMistralBatchState(mistralBatchStateDir);
+          const nextJobs = state.jobs.filter(
+            job => !matchesBatchScope(job, normalizedInputPath, normalizedOutputDir, modelName)
+          );
+          if (nextJobs.length !== state.jobs.length) {
+            state.jobs = nextJobs;
+            await writeMistralBatchState(mistralBatchStateDir, state);
+            await logInfo('Removed cached batch-job stats for completed folder.');
+          }
+          return `[OK] All transcripts already exist for ${audioFiles.length} file(s)`;
+        }
+
+        let processedCount = 0;
+        const totalWork = workFiles.length;
+        const activeFileSet = new Set(workFiles.map(f => path.resolve(f)));
+        const unresolvedFiles = new Set(workFiles.map(f => path.resolve(f)));
+        const markResolved = (filePath: string) => {
+          const abs = path.resolve(filePath);
+          if (!unresolvedFiles.has(abs)) return;
+          unresolvedFiles.delete(abs);
+          processedCount = totalWork - unresolvedFiles.size;
+        };
+        const progressLabelFor = (jobIndex: number, totalJobs: number) => {
+          const pct = totalWork > 0 ? Math.round((processedCount / totalWork) * 100) : 100;
+          return `${collectionName} - batch job ${jobIndex}/${totalJobs} - audio processed ${processedCount}/${totalWork} (${pct}%)`;
+        };
+
+        let state = await readMistralBatchState(mistralBatchStateDir);
+        const scopedJobs = state.jobs
+          .filter(job => matchesBatchScope(job, normalizedInputPath, normalizedOutputDir, modelName))
+          .sort(sortBatchJobsInOrder);
+        const trackedFiles = new Set(
+          scopedJobs.filter(shouldResumeBatchJob).flatMap(job => job.files.map(f => path.resolve(f)))
+        );
+        const filesToSubmit = workFiles.filter(f => !trackedFiles.has(path.resolve(f)));
+        const newChunks = partitionFiles(filesToSubmit, batchSize);
+        let nextBatchOrder = scopedJobs.reduce((m, j) => Math.max(m, j.batchOrder), 0);
+
+        const persistJobUpdate = async (job: MistralBatchJobRecord) => {
+          const idx = state.jobs.findIndex(e => e.id === job.id);
+          if (idx >= 0) state.jobs[idx] = job; else state.jobs.push(job);
+          await writeMistralBatchState(mistralBatchStateDir, state);
+        };
+
+        if (newChunks.length) {
+          await logInfo(`Submitting ${newChunks.length} audio batch job(s) before one status check...`);
+        }
+
+        for (let idx = 0; idx < newChunks.length; idx++) {
+          if (cancelRequested) {
+            cancelMistralRequest();
+            throw new Error('terminated by user');
+          }
+          const chunk = newChunks[idx].map(f => path.resolve(f));
+          nextBatchOrder += 1;
+          const label = progressLabelFor(idx + 1, newChunks.length);
+          win?.webContents.send('transcription-progress', label, processedCount, totalWork, `Submitting batch ${idx + 1}/${newChunks.length} (${chunk.length} file(s))...`);
+          try {
+            const submission = await submitMistralAudioBatchJob(chunk, mistralApiKey, modelName, {
+              baseInput: inputPath,
+              logger: logInfo,
+              cacheDir: audioCacheDir,
+              tempRoot: path.join(app.getPath('userData'), 'temp'),
+              uploadWorkers: mistralBatchUploadWorkers,
+              interviewMode,
+              subtitles: generateSubtitles,
+              contextBias: mistralContextBias,
+              language: mistralAudioLanguage
+            });
+            const nowMs = Date.now();
+            const record: MistralBatchJobRecord = {
+              id: submission.jobId,
+              inputPath: normalizedInputPath,
+              outputDir: normalizedOutputDir,
+              modelName,
+              files: chunk,
+              batchOrder: nextBatchOrder,
+              createdAtMs: nowMs,
+              status: submission.status || 'QUEUED',
+              totalRequests: Math.max(submission.totalRequests, chunk.length),
+              succeededRequests: submission.succeededRequests,
+              failedRequests: submission.failedRequests,
+              outputFileId: submission.outputFileId,
+              lastProgressCount: submission.succeededRequests + submission.failedRequests,
+              lastProgressAtMs: nowMs,
+              writtenAtMs: null,
+              lastError: null,
+              subtitles: generateSubtitles,
+              interviewMode
+            };
+            state.jobs.push(record);
+            await writeMistralBatchState(mistralBatchStateDir, state);
+            await logInfo(`Submitted audio batch job ${submission.jobId} (${chunk.length} request(s)) with status ${record.status}`);
+          } catch (err: any) {
+            const cancelled = cancelRequested || err?.cancelled || err?.name === 'AbortError';
+            await fs.promises.appendFile(getLogPath('audio'), `[ERR] batch submit ${idx + 1} - ${cancelled ? 'Cancelled' : (err?.message || err)}\n`, 'utf-8').catch(() => {});
+            if (cancelled) {
+              cancelMistralRequest();
+              throw new Error('terminated by user');
+            }
+            throw err;
+          }
+        }
+
+        while (true) {
+          const pendingJobs = state.jobs
+            .filter(e => matchesBatchScope(e, normalizedInputPath, normalizedOutputDir, modelName))
+            .filter(shouldResumeBatchJob)
+            .map(e => ({ ...e, files: e.files.map(f => path.resolve(f)).filter(f => activeFileSet.has(f)) }))
+            .filter(e => e.files.length > 0)
+            .sort(sortBatchJobsInOrder);
+
+          if (!pendingJobs.length) {
+            state.jobs = state.jobs.filter(e => !matchesBatchScope(e, normalizedInputPath, normalizedOutputDir, modelName));
+            await writeMistralBatchState(mistralBatchStateDir, state);
+            await logInfo('All batch jobs completed. Removed cached batch-job stats for this folder.');
+            return `[OK] Finished batch queue for ${collectionName}.`;
+          }
+
+          const targetIdx = pendingJobs.findIndex(e => e.files.some(f => unresolvedFiles.has(path.resolve(f))));
+          if (targetIdx < 0) {
+            state.jobs = state.jobs.filter(e => !matchesBatchScope(e, normalizedInputPath, normalizedOutputDir, modelName));
+            await writeMistralBatchState(mistralBatchStateDir, state);
+            return `[OK] All transcripts already exist for ${audioFiles.length} file(s)`;
+          }
+
+          let job = pendingJobs[targetIdx];
+          const jobPosition = targetIdx + 1;
+          const totalJobs = pendingJobs.length;
+          const unresolvedInJob = job.files.filter(f => unresolvedFiles.has(path.resolve(f)));
+
+          if (cancelRequested) {
+            cancelMistralRequest();
+            throw new Error('terminated by user');
+          }
+
+          const polled = await fetchMistralBatchJobStatus(job.id, mistralApiKey);
+          const doneRequests = polled.succeededRequests + polled.failedRequests;
+          const totalRequests = Math.max(polled.totalRequests, job.totalRequests, unresolvedInJob.length, 1);
+          job = {
+            ...job,
+            status: polled.status,
+            totalRequests,
+            succeededRequests: polled.succeededRequests,
+            failedRequests: polled.failedRequests,
+            outputFileId: polled.outputFileId
+          };
+          await persistJobUpdate(job);
+
+          const label = progressLabelFor(jobPosition, totalJobs);
+          const statusMessage = `Checking oldest batch ${jobPosition}/${totalJobs} - ${job.status} ${doneRequests}/${totalRequests}`;
+          win?.webContents.send('transcription-progress', label, processedCount, totalWork, statusMessage);
+          await logInfo(`Checked batch job ${job.id} once: status=${job.status} ${doneRequests}/${totalRequests}`);
+
+          if (!isTerminalBatchStatus(job.status)) {
+            const checkBackAt = job.createdAtMs + MISTRAL_BATCH_AVG_COMPLETION_MS;
+            const msg = `Batch job ${job.id} is still ${job.status} (${doneRequests}/${totalRequests}). Check back at ${formatLocalDateTime(checkBackAt)}.`;
+            win?.webContents.send('transcription-progress', label, processedCount, totalWork, msg);
+            await logInfo(msg);
+            return `[INFO] ${msg}`;
+          }
+
+          if (job.status !== 'SUCCESS') {
+            const msg = `Batch job ${job.id} ended with status ${job.status}.`;
+            await persistJobUpdate({ ...job, lastError: msg });
+            await fs.promises.appendFile(getLogPath('audio'), `[ERR] ${msg}\n`, 'utf-8').catch(() => {});
+            throw new Error(msg);
+          }
+          if (!job.outputFileId) {
+            let detail = '';
+            if (polled.errorFileId) {
+              try {
+                const requestErrors = await downloadMistralBatchErrors(polled.errorFileId, mistralApiKey);
+                const sampleErrors = requestErrors.slice(0, 3).map(e => `${e.customId ? `${e.customId}: ` : ''}${e.message}`);
+                if (sampleErrors.length) {
+                  const extra = Math.max(0, requestErrors.length - sampleErrors.length);
+                  detail = ` ${sampleErrors.join('; ')}${extra > 0 ? ` (+${extra} more)` : ''}`;
+                }
+              } catch {
+                if (polled.errorMessages.length) detail = ` ${polled.errorMessages.join('; ')}`;
+              }
+            }
+            const msg = `Batch job ${job.id} completed without an output file.${detail}`.trim();
+            await persistJobUpdate({ ...job, status: polled.failedRequests > 0 ? 'FAILED' : job.status, lastError: msg });
+            await fs.promises.appendFile(getLogPath('audio'), `[ERR] ${msg}\n`, 'utf-8').catch(() => {});
+            throw new Error(msg);
+          }
+
+          win?.webContents.send('transcription-progress', label, processedCount, totalWork, `Downloading results for oldest batch ${jobPosition}/${totalJobs}...`);
+          const batchResults = await downloadMistralAudioBatchResultsDetailed(job.outputFileId, mistralApiKey);
+          await logInfo(`Downloaded ${batchResults.size} result(s) for batch job ${job.id}`);
+
+          for (const file of unresolvedInJob) {
+            if (cancelRequested) {
+              cancelMistralRequest();
+              throw new Error('terminated by user');
+            }
+            const absFile = path.resolve(file);
+            if (!unresolvedFiles.has(absFile)) continue;
+            const name = path.basename(file);
+            const base = path.basename(file, path.extname(file));
+            markResolved(file);
+            const relKey = baseIsFile ? path.basename(file) : path.relative(inputPath, file).split(path.sep).join('/');
+            const resultEntry = batchResults.get(relKey);
+            if (!resultEntry) {
+              const msg = `Missing audio transcription result for ${relKey}`;
+              await fs.promises.appendFile(getLogPath('audio'), `[ERR] ${name} - ${msg}\n`, 'utf-8').catch(() => {});
+              win?.webContents.send('transcription-progress', label, processedCount, totalWork, 'Error');
+              throw new Error(msg);
+            }
+            await writeMistralAudioBatchResult(
+              outputDir,
+              base,
+              resultEntry,
+              job.subtitles ?? generateSubtitles,
+              job.interviewMode ?? interviewMode
+            );
+            win?.webContents.send('transcription-progress', label, processedCount, totalWork, 'Done');
+            await fs.promises.appendFile(getLogPath('audio'), `[OK] ${name}\n`, 'utf-8').catch(() => {});
+          }
+
+          await persistJobUpdate({ ...job, writtenAtMs: Date.now(), lastError: null });
+
+          const remaining = state.jobs
+            .filter(e => matchesBatchScope(e, normalizedInputPath, normalizedOutputDir, modelName))
+            .filter(shouldResumeBatchJob);
+          if (!remaining.length) {
+            state.jobs = state.jobs.filter(e => !matchesBatchScope(e, normalizedInputPath, normalizedOutputDir, modelName));
+            await writeMistralBatchState(mistralBatchStateDir, state);
+            await logInfo('All batch jobs completed. Removed cached batch-job stats for this folder.');
+            return `[OK] Completed batch queue for ${collectionName}.`;
+          }
+        }
       }
 
       for (let i = 0; i < audioFiles.length; i++) {
@@ -2859,11 +2543,11 @@ ipcMain.handle(
         const transcriptOut = path.join(outputDir, `${base}.txt`);
 
         if (fs.existsSync(transcriptOut)) {
-          win.webContents.send('transcription-progress', name, i + 1, audioFiles.length, 'Skipped');
+          win?.webContents.send('transcription-progress', name, i + 1, audioFiles.length, 'Skipped');
           continue;
         }
 
-        win.webContents.send('transcription-progress', name, i + 1, audioFiles.length, 'Transcribing…');
+        win?.webContents.send('transcription-progress', name, i + 1, audioFiles.length, 'Transcribing…');
         try {
           await fs.promises.appendFile(getLogPath('audio'), `[INFO] Starting ${name} with model ${modelName}\n`, 'utf-8').catch(() => {});
           if (!activeAudioAbort) activeAudioAbort = new AbortController();
@@ -2881,6 +2565,8 @@ ipcMain.handle(
               subtitles: generateSubtitles,
               tempDir: audioCacheDir,
               signal: activeAudioAbort.signal,
+              contextBias: mistralContextBias,
+              language: mistralAudioLanguage,
               logger: async (msg: string) => {
                 await fs.promises.appendFile(getLogPath('audio'), `${msg}\n`, 'utf-8').catch(() => {});
               }
@@ -2900,11 +2586,11 @@ ipcMain.handle(
               }
             });
           }
-          win.webContents.send('transcription-progress', name, i + 1, audioFiles.length, 'Done');
+          win?.webContents.send('transcription-progress', name, i + 1, audioFiles.length, 'Done');
           await fs.promises.appendFile(getLogPath('audio'), `[OK] ${name}\n`, 'utf-8');
         } catch (err: any) {
           const cancelled = cancelRequested || err?.cancelled || err?.name === 'AbortError' || err?.signal === 'SIGTERM';
-          win.webContents.send('transcription-progress', name, i + 1, audioFiles.length,
+          win?.webContents.send('transcription-progress', name, i + 1, audioFiles.length,
             cancelled ? 'Cancelled' : 'Error'
           );
           if (cancelled) {
@@ -2923,7 +2609,7 @@ ipcMain.handle(
       const imageModel = modelName || DEFAULT_IMAGE_MODEL;
       const rawImagePrompt = ((store.get('imagePrompt') as string) || '').trim();
       const batchSelected = Boolean(extraOptions?.batch);
-      const batchSize = extraOptions?.batchSize || 10;
+      const batchSize = extraOptions?.batchSize || DEFAULT_IMAGE_BATCH_SIZE;
       const outputPdfSelected = useMistral && Boolean(extraOptions?.outputPdf);
       const mistralBatchPreprocessWorkers = normalizeMistralBatchWorkerCount(
         store.get('mistralBatchPreprocessWorkers'),
@@ -2997,16 +2683,24 @@ ipcMain.handle(
           await fs.promises.appendFile(getLogPath('image'), `[INFO] ${msg}\n`, 'utf-8').catch(() => {});
         };
 
-        const hasRequiredOutputs = (filePath: string): boolean => {
+        // Async (not fs.existsSync) so a large folder doesn't block the whole
+        // app for the duration of the scan — each await yields to the event
+        // loop between files instead of running as one uninterrupted loop.
+        const exists = (p: string) => fs.promises.access(p).then(() => true, () => false);
+        const hasRequiredOutputs = async (filePath: string): Promise<boolean> => {
           const txtOut = transcriptPathFor(filePath, inputPath, baseIsFile, normalizedOutputDir);
-          if (!fs.existsSync(txtOut)) return false;
+          if (!(await exists(txtOut))) return false;
           if (!outputPdfSelected) return true;
-          return fs.existsSync(mistralPdfPathForTranscript(txtOut));
+          return exists(mistralPdfPathForTranscript(txtOut));
         };
 
-        let workFiles = batchSelected
-          ? files.filter(f => !hasRequiredOutputs(f))
-          : [...files];
+        let workFiles = [...files];
+        if (batchSelected) {
+          workFiles = [];
+          for (const f of files) {
+            if (!(await hasRequiredOutputs(f))) workFiles.push(f);
+          }
+        }
 
         if (!workFiles.length) {
           if (batchSelected) {
@@ -3328,9 +3022,7 @@ ipcMain.handle(
               totalWork,
               `Downloading results for oldest batch ${jobPosition}/${totalJobs}...`
             );
-            const batchResults = outputPdfSelected
-              ? await downloadMistralBatchResultsDetailed(job.outputFileId, mistralKey)
-              : await downloadMistralBatchResults(job.outputFileId, mistralKey);
+            const batchResults = await downloadMistralBatchResultsDetailed(job.outputFileId, mistralKey);
             await logInfo(`Downloaded ${batchResults.size} result(s) for batch job ${job.id}`);
 
             for (const file of unresolvedInJob) {
@@ -3376,24 +3068,21 @@ ipcMain.handle(
                 ? path.basename(file)
                 : path.relative(inputPath, file).split(path.sep).join('/');
               const resultEntry = batchResults.get(relKey);
-              const text = outputPdfSelected
-                ? (typeof resultEntry === 'object' && resultEntry ? resultEntry.text : undefined)
-                : resultEntry;
-              if (typeof text !== 'string') {
+              if (typeof resultEntry?.text !== 'string') {
                 const msg = `Missing OCR result for ${relKey}`;
                 await fs.promises.appendFile(getLogPath('image'), `[ERR] ${name} - ${msg}\n`, 'utf-8').catch(() => {});
                 window?.webContents.send('transcription-progress', writeLabel, processedCount, totalWork, 'Error');
                 throw new Error(msg);
               }
+              const text = resultEntry.text;
 
               await fs.promises.mkdir(path.dirname(txtOut), { recursive: true }).catch(() => {});
               await fs.promises.writeFile(txtOut, text, 'utf-8');
               if (outputPdfSelected && pdfOut) {
-                const pages = (typeof resultEntry === 'object' && resultEntry && 'pages' in resultEntry)
-                  ? toAccessiblePdfPages(resultEntry.pages as MistralOcrPageResult[])
-                  : [];
+                const pages = toAccessiblePdfPages(resultEntry.pages);
                 await writeSearchablePdfFromText(text, pdfOut, `${name} OCR`, pages);
               }
+              await writeOcrReviewSidecar(txtOut, file, resultEntry.pages);
               window?.webContents.send('transcription-progress', writeLabel, processedCount, totalWork, 'Done');
               await fs.promises.appendFile(getLogPath('image'), `[OK] ${name}\n`, 'utf-8');
             }
@@ -3544,6 +3233,7 @@ ipcMain.handle(
                     if (outputPdfSelected && pdfOut) {
                       await writeSearchablePdfFromText(text, pdfOut, `${name} OCR`, pages);
                     }
+                    await writeOcrReviewSidecar(txtOut, file, detailed.pages);
                     await fs.promises.appendFile(getLogPath('image'), `[OK] ${name}\n`, 'utf-8').catch(() => {});
 
                     processedCount += 1;
@@ -3627,28 +3317,24 @@ ipcMain.handle(
       if (!geminiApiKey) {
         throw new Error('Gemini API key not set. Please enter it in Settings.');
       }
-      process.env.GOOGLE_API_KEY = geminiApiKey;
 
       const rawPrompt = rawImagePrompt;
       const imageExtRe = /\.(png|jpe?g|jp2|tif{1,2})$/i;
       let files: string[];
       
       if (stat.isDirectory()) {
-        // Show scanning progress for large directories
         const window = BrowserWindow.getAllWindows()[0];
         if (window) {
-          window.webContents.send('transcription-progress', 'Scanning directory...', 0, 1, 'Please wait...');
+          window?.webContents.send('transcription-progress', 'Scanning directory...', 0, 1, 'Please wait...');
         }
         
         const allNames = (await fs.promises.readdir(inputPath)).filter(name => imageExtRe.test(name));
-        // Filter out empty (0-byte) files
         const names: string[] = [];
         for (const name of allNames) {
           const fstat = await fs.promises.stat(path.join(inputPath, name)).catch(() => null);
           if (fstat && fstat.isFile() && fstat.size > 0) names.push(name);
         }
         
-        // Sort in chunks for very large directories
         if (names.length > 5000) {
           console.log(`Sorting ${names.length} files in chunks...`);
           const chunkSize = 1000;
@@ -3659,13 +3345,11 @@ ipcMain.handle(
             chunk.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
             sortedChunks.push(chunk);
             
-            // Yield control during sorting
             if (sortedChunks.length % 10 === 0) {
               await new Promise(resolve => setImmediate(resolve));
             }
           }
           
-          // Merge sorted chunks using the helper function defined above
           const sortedNames = mergeSortedArrays(sortedChunks);
           files = sortedNames.map(name => path.join(inputPath, name));
         } else {
@@ -3673,10 +3357,9 @@ ipcMain.handle(
           files = names.map(name => path.join(inputPath, name));
         }
         
-        // Show collection summary
         if (window) {
           const collectionName = path.basename(inputPath);
-          window.webContents.send('transcription-progress', 
+          window?.webContents.send('transcription-progress', 
             `Found ${files.length} images in ${collectionName}`, 
             0, files.length, 
             'Preparing transcription...'
@@ -3726,7 +3409,7 @@ ipcMain.handle(
           if (fs.existsSync(txtOut)) {
             processedCount += 1;
             if (shouldEmitProgress(processedCount)) {
-              win.webContents.send(
+              win?.webContents.send(
                 'transcription-progress',
                 formatImageProgressLabel(collectionName, processedCount, files.length),
                 processedCount,
@@ -3766,7 +3449,7 @@ ipcMain.handle(
                   }
 
                   if (shouldEmitProgress(processedCount + 1)) {
-                    win.webContents.send(
+                    win?.webContents.send(
                       'transcription-progress',
                       formatImageProgressLabel(collectionName, processedCount, files.length),
                       processedCount,
@@ -3783,7 +3466,7 @@ ipcMain.handle(
 
                   processedCount += 1;
                   if (shouldEmitProgress(processedCount)) {
-                    win.webContents.send(
+                    win?.webContents.send(
                       'transcription-progress',
                       formatImageProgressLabel(collectionName, processedCount, files.length),
                       processedCount,
@@ -3796,7 +3479,7 @@ ipcMain.handle(
                   const cancelled = cancelRequested || isCancellationError(err, imageSignal);
                   const msg = cancelled ? 'Cancelled' : `Error: ${err?.message || err}`;
                   await fs.promises.appendFile(getLogPath('image'), `[ERR] ${name} - ${msg}\n`, 'utf-8').catch(() => {});
-                  win.webContents.send(
+                  win?.webContents.send(
                     'transcription-progress',
                     formatImageProgressLabel(collectionName, processedCount, files.length),
                     processedCount,
@@ -3824,7 +3507,7 @@ ipcMain.handle(
               const cancelled = cancelRequested || isCancellationError(err, imageSignal);
               const msg = cancelled ? 'Cancelled' : `Error: ${err?.message || err}`;
               await fs.promises.appendFile(getLogPath('image'), `[ERR] ${name} - ${msg}\n`, 'utf-8').catch(() => {});
-              win.webContents.send(
+              win?.webContents.send(
                 'transcription-progress',
                 formatImageProgressLabel(collectionName, processedCount, files.length),
                 processedCount,
@@ -3851,7 +3534,7 @@ ipcMain.handle(
           throw new Error('terminated by user');
         }
         const last = files[0];
-        win.webContents.send('transcription-progress', path.basename(last), 1, files.length, 'Error');
+        win?.webContents.send('transcription-progress', path.basename(last), 1, files.length, 'Error');
         throw err;
       } finally {
         if (activeImageAbort === imageSignalController) {
@@ -3868,11 +3551,22 @@ function createMainWindow() {
     height: Math.min(1250, Math.floor(workAreaSize.height * 0.92)),
     minWidth: 1200,
     minHeight: 700,
-    backgroundColor: '#16161f',
+    backgroundColor: '#0e0f16',
     webPreferences: { nodeIntegration: true, contextIsolation: false }
   });
 
   mainWindow = win;
+
+  // Belt-and-suspenders alongside disableHardwareAcceleration above: if the
+  // renderer still goes down (GPU hiccup, OOM, etc.) reload it in place
+  // instead of leaving a permanently blank window with no way back short of
+  // force-quitting the app. Crash-only ('killed'/'oom' etc.) — a clean
+  // renderer exit doesn't need this.
+  win.webContents.on('render-process-gone', (_event, details) => {
+    if (details.reason === 'clean-exit') return;
+    if (win.isDestroyed()) return;
+    win.reload();
+  });
 
   if (isDev()) {
     win.loadURL('http://localhost:5123');
@@ -3895,7 +3589,6 @@ app.on('window-all-closed', () => {
 });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createMainWindow(); });
 
-// settings handlers
 ipcMain.handle('get-api-key', () => store.get('apiKey') || '');
 ipcMain.handle('set-api-key', (_e, key: string) => { store.set('apiKey', key); });
 ipcMain.handle('open-settings', () => {
@@ -3913,15 +3606,15 @@ ipcMain.handle('open-settings', () => {
     parent,
     modal: true,
     resizable: false,
-    backgroundColor: '#16161f',
+    backgroundColor: '#0e0f16',
     webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
 
   if (isDev()) {
-    child.loadURL('http://localhost:5123/#/settings');
+    child.loadURL(`http://localhost:5123/${ROUTE_SETTINGS}`);
   } else {
     const indexPath = path.join(app.getAppPath(), 'dist-react', 'index.html');
-    const indexURL = pathToFileURL(indexPath).toString() + '#/settings';
+    const indexURL = pathToFileURL(indexPath).toString() + ROUTE_SETTINGS;
     child.loadURL(indexURL);
   }
 
@@ -3943,15 +3636,15 @@ ipcMain.handle('open-batch-queue', () => {
     parent,
     modal: true,
     resizable: true,
-    backgroundColor: '#16161f',
+    backgroundColor: '#0e0f16',
     webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
 
   if (isDev()) {
-    child.loadURL('http://localhost:5123/#/batch-queue');
+    child.loadURL(`http://localhost:5123/${ROUTE_BATCH_QUEUE}`);
   } else {
     const indexPath = path.join(app.getAppPath(), 'dist-react', 'index.html');
-    const indexURL = pathToFileURL(indexPath).toString() + '#/batch-queue';
+    const indexURL = pathToFileURL(indexPath).toString() + ROUTE_BATCH_QUEUE;
     child.loadURL(indexURL);
   }
 
@@ -3959,18 +3652,18 @@ ipcMain.handle('open-batch-queue', () => {
 });
 
 ipcMain.handle('scan-quality', async (_e, folder: string, threshold: number) => {
-  // clear any previous quality logs
   const qualityLog = getLogPath('quality');
   await fs.promises.writeFile(qualityLog, '', 'utf-8');
   const result = await scanQualityFolder(folder, threshold, {
-    onProgress: async ({ processed, total, file, blankCount }) => {
+    onProgress: async ({ processed, total, file, blankCount, entry }) => {
       const percent = total > 0 ? Math.round((processed / total) * 100) : 100;
       _e.sender.send('quality-scan-progress', {
         processed,
         total,
         percent,
         file,
-        blankCount
+        blankCount,
+        entry
       });
     }
   });

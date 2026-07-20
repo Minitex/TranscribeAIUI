@@ -1,9 +1,7 @@
 import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import { FaFolder, FaFileAlt, FaPlus, FaTimes } from 'react-icons/fa';
 
-const fs = (window as any).require('fs') as typeof import('fs');
-const path = (window as any).require('path') as typeof import('path');
-const os = (window as any).require('os') as typeof import('os');
+import { fs, path, os } from '../electron';
 
 type PickerEntry = {
   name: string;
@@ -79,9 +77,18 @@ const FolderPickerModal: React.FC<FolderPickerModalProps> = ({
         setEntries(mapped);
         setSelectedFile(null);
       })
-      .catch(err => {
+      .catch((err: unknown) => {
         if (cancelled) return;
-        setError(err?.message || 'Unable to open folder');
+        const code = (err as { code?: string } | null)?.code;
+        if (code === 'EACCES' || code === 'EPERM') {
+          setError('Permission denied. This folder is not readable — choose another or grant access.');
+        } else if (code === 'ENOENT') {
+          setError('Folder no longer exists.');
+        } else if (code === 'ENOTDIR') {
+          setError('That path is not a folder.');
+        } else {
+          setError(err instanceof Error && err.message ? err.message : 'Unable to open folder');
+        }
         setEntries([]);
       })
       .finally(() => {

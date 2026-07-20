@@ -1,4 +1,3 @@
-// src/electron/logHelpers.ts
 import { app } from 'electron';
 import path from 'path';
 

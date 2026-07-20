@@ -7,12 +7,112 @@
 }
 
 :root {
-  --bg-primary: #1e1e28;
-  --bg-secondary: #16161f;
-  --accent: #4e8cff;
-  --button-bg: #2a6fd1;
-  --button-hover: #3c7fee;
+  --bg-primary: #15161e;
+  --bg-secondary: #0e0f16;
+  /* Two mode-specific accents: teal for Audio (tape/waveform), brass for
+     Image (ink/paper). --accent/--accent-rgb below are overridden per
+     mode by the [data-mode] rules further down, so every element that
+     already reads var(--accent) retints automatically on mode switch. */
+  --accent-audio: #2f9d93;
+  --accent-audio-rgb: 47, 157, 147;
+  --accent-image: #c17d3a;
+  --accent-image-rgb: 193, 125, 58;
+  --accent: var(--accent-audio);
+  --accent-rgb: var(--accent-audio-rgb);
+  --font-display: Georgia, 'Iowan Old Style', 'Palatino Linotype', 'Times New Roman', serif;
+  /* RGB channels for the accent, so alpha variants stay in sync:
+     rgba(var(--accent-rgb), 0.2) instead of re-typing the hex */
+  --button-bg: var(--accent);
+  --button-hover: color-mix(in srgb, var(--accent) 82%, white 18%);
   --text-light: #e0e0e0;
+  /* Aliases for selectors that reference these names */
+  --text: var(--text-light);
+  --text-muted: #8f8fa3;
+  --border: #333;
+  --input-bg: #2a2a3d;
+  --surface-1: rgba(255, 255, 255, 0.05);
+  --surface-hover: rgba(255, 255, 255, 0.08);
+  --hairline: rgba(255, 255, 255, 0.2);
+  --danger: #ff6b6b;
+  --danger-rgb: 255, 107, 107;
+  --success: #6dd36d;
+  --success-rgb: 109, 211, 109;
+  --sidebar-bg: var(--bg-secondary);
+  /* Scales */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-pill: 999px;
+  --transition-fast: 0.16s;
+  --transition: 0.2s;
+  /* Layering scale. Overlay sits above the resizer (previously 999 vs 1000,
+     which let the resizer paint over full-screen modals). */
+  --z-tooltip: 100;
+  --z-popover: 120;
+  --z-resizer: 500;
+  --z-overlay: 1000;
+  --z-menu: 2000;
+}
+
+.app-shell[data-mode='audio'],
+.app-shell[data-mode='image'] {
+  /* --button-bg/--button-hover reference var(--accent); custom properties
+     resolve var() using the value visible at the element that DECLARES
+     them, not the element that inherits them. Since :root declares these
+     once, they'd otherwise stay frozen to the :root default forever —
+     redeclaring them here forces a fresh resolution against this mode's
+     --accent. */
+  --button-bg: var(--accent);
+  --button-hover: color-mix(in srgb, var(--accent) 82%, white 18%);
+}
+
+.app-shell[data-mode='audio'] {
+  --accent: var(--accent-audio);
+  --accent-rgb: var(--accent-audio-rgb);
+}
+
+.app-shell[data-mode='image'] {
+  --accent: var(--accent-image);
+  --accent-rgb: var(--accent-image-rgb);
+}
+
+/* Global keyboard-focus ring. Zero-specificity (:where) so any component rule
+   can still override it; only adds a visible ring where one was missing. */
+:where(button, [role='button'], [role='menuitem'], input, select, textarea, a):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Base button look: any element with class="btn" gets a consistent rounded,
+   accent-colored style by default. Components with more specific rules
+   (.scan-btn.btn, .settings-buttons .btn, inline styles) override as needed. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.55rem 1rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  transition: background var(--transition-fast), opacity var(--transition-fast), transform var(--transition-fast);
+}
+
+.btn:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 html,
@@ -35,8 +135,9 @@ body,
 
 .sidebar {
   position: relative;
-  width: 275px;
+  /* width is set inline from sidebarWidth state (default 400, resize MIN 400) */
   min-width: 300px;
+  max-width: 60vw;
   background: var(--bg-secondary);
   padding: 1rem;
   display: flex;
@@ -50,9 +151,9 @@ body,
   width: 100%;
   padding: 0.4rem 0.6rem;
   margin-bottom: 0.75rem;
-  background: #2a2a3d;
-  border: 1px solid #333;
-  border-radius: 4px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   color: #fff !important;
   caret-color: #fff;
 }
@@ -72,6 +173,33 @@ body,
   color: transparent !important;
 }
 
+/* --- Shared sidebar/filter layout utilities (extracted from inline styles) --- */
+.row-center-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.row-center {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.filter-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.9rem;
+}
+
+.filter-field select,
+.filter-field input {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+}
+
 .transcript-list {
   flex: 1;
   margin: 0;
@@ -84,8 +212,16 @@ body,
   display: flex;
   align-items: center;
   padding: 0.5rem;
-  border-bottom: 1px solid #333;
+  border-bottom: 1px solid var(--border);
   gap: 0.5rem;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast);
+  content-visibility: auto;
+  contain-intrinsic-size: 400px 40px;
+}
+
+.transcript-item:hover {
+  background: var(--surface-hover);
 }
 
 .transcript-main {
@@ -143,6 +279,31 @@ body,
   box-shadow: 0 0 0 2px rgba(255, 77, 77, 0.25);
 }
 
+.transcript-reviewed-toggle {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: #666;
+  font-size: 0.75rem;
+  line-height: 1;
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: var(--radius-md);
+  padding: 0;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.transcript-reviewed-toggle:hover {
+  color: var(--text-light);
+  border-color: var(--text-light);
+}
+
+.transcript-reviewed-toggle.active {
+  background: var(--success);
+  border-color: var(--success);
+  color: #0a2b0a;
+}
+
 .transcript-delete {
   background: transparent;
   border: none;
@@ -163,11 +324,11 @@ body,
   width: fit-content;
   max-width: 180px;
   background: #1d1d2b;
-  border: 1px solid #333;
+  border: 1px solid var(--border);
   border-radius: 10px;
   padding: 0.25rem;
   box-shadow: 0 14px 30px rgba(0, 0, 0, 0.38);
-  z-index: 2000;
+  z-index: var(--z-menu);
 }
 
 .transcript-context-item {
@@ -202,7 +363,7 @@ body,
   width: 20px;
   height: 100%;
   cursor: col-resize;
-  z-index: 1000;
+  z-index: var(--z-resizer);
   pointer-events: auto;
 }
 
@@ -225,10 +386,26 @@ body,
 
 
 .logo {
+  font-family: var(--font-display);
   font-size: 2.6rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
   color: var(--accent);
   margin: 1.25rem auto 0rem;
   text-align: center;
+  user-select: none;
+  transition: color var(--transition);
+}
+
+.logo-tagline {
+  display: block;
+  margin: 0.15rem auto 0;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  text-align: center;
+  color: var(--text-muted);
   user-select: none;
 }
 
@@ -252,7 +429,7 @@ body,
 .field-row button {
   background: var(--button-bg);
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.6rem;
   color: #fff;
   font-size: 1.4rem;
@@ -294,9 +471,9 @@ body,
 .path-input-wrapper input {
   width: 100%;
   padding: 0.6rem 2.1rem 0.6rem 0.6rem;
-  background: #2a2a3d;
-  border: 1px solid #333;
-  border-radius: 4px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   color: var(--text-light);
   font-size: 0.95rem;
   white-space: nowrap;
@@ -312,7 +489,7 @@ body,
   padding: 0.6rem 1.2rem;
   background: var(--accent);
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   color: #fff;
   cursor: pointer;
   margin: 0;
@@ -454,7 +631,7 @@ body,
 }
 
 .logs-body {
-  height: clamp(300px, 45vh, 300px);
+  height: clamp(300px, 45vh, 480px);
   padding: 1rem;
   background: #0f1120;
   color: #ccc;
@@ -495,7 +672,7 @@ body,
   background: var(--accent);
   color: #fff;
   padding: 0.15rem 0.75rem;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
   font-size: 0.95rem;
   pointer-events: none;
@@ -520,7 +697,7 @@ body,
   border: 1px solid #e06c75;
   color: #e06c75;
   padding: 0.6rem 1.2rem;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
@@ -549,6 +726,11 @@ body,
   cursor: pointer;
   overflow: hidden;
   margin: 1rem auto;
+  /* reset native <button> chrome so role="switch" looks identical */
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: center;
 }
 
 .mode-toggle .label {
@@ -603,10 +785,32 @@ body,
   color: var(--accent);
   cursor: pointer;
   transition: color 0.2s;
+  /* reset native <button> chrome */
+  background: none;
+  border: none;
+  padding: 0;
+  line-height: 0;
 }
 
 .settings-gear:hover {
   color: #fff;
+}
+
+.settings-gear-badge {
+  position: absolute;
+  top: -10px;
+  right: 6px;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: #ff4d4f;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
 }
 
 
@@ -641,6 +845,8 @@ body,
   margin: 0;
   color: var(--accent);
   font-size: 2rem;
+  font-family: var(--font-display);
+  font-weight: 600;
 }
 
 .settings-container label {
@@ -654,9 +860,9 @@ body,
   padding: 0.75rem 1rem;
   font-size: 1rem;
   text-align: left;
-  background: #2a2a3d;
-  border: 1px solid #333;
-  border-radius: 4px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   color: var(--text-light);
   box-sizing: border-box;
 }
@@ -664,9 +870,9 @@ body,
 .settings-container select {
   font-size: 1.1rem;
   padding: 0.75rem 1rem;
-  background: #2a2a3d;
-  border: 1px solid #333;
-  border-radius: 4px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   color: var(--text-light);
   box-sizing: border-box;
 }
@@ -714,7 +920,7 @@ body,
   transform: translateY(4px);
   pointer-events: none;
   transition: opacity 0.16s ease, transform 0.16s ease;
-  z-index: 120;
+  z-index: var(--z-popover);
 }
 
 .batch-queue-help-box::after {
@@ -764,7 +970,7 @@ body,
 
 .batch-queue-summary-card span {
   font-size: 0.74rem;
-  opacity: 0.75;
+  opacity: 0.9;
 }
 
 .batch-queue-summary-card strong {
@@ -813,8 +1019,36 @@ body,
   transform: translateY(-1px);
 }
 
-.batch-queue-item:disabled {
+.batch-queue-item:disabled,
+.batch-queue-item.disabled {
   opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.batch-queue-remove-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-light);
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  cursor: pointer;
+  transition: border-color 0.16s ease, color 0.16s ease, background 0.16s ease;
+}
+
+.batch-queue-remove-btn:hover:not(:disabled) {
+  border-color: rgba(255, 99, 99, 0.5);
+  background: rgba(255, 99, 99, 0.12);
+  color: #ff6363;
+}
+
+.batch-queue-remove-btn:disabled {
+  opacity: 0.5;
   cursor: not-allowed;
 }
 
@@ -826,6 +1060,13 @@ body,
   margin-bottom: 0.45rem;
 }
 
+.batch-queue-item-top-left,
+.batch-queue-item-top-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .batch-queue-model {
   display: inline-flex;
   align-items: center;
@@ -835,6 +1076,18 @@ body,
   background: rgba(255, 255, 255, 0.08);
   padding: 0 0.45rem;
   font-size: 0.74rem;
+}
+
+.batch-queue-kind {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.25rem;
+  border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.25);
+  color: var(--accent);
+  padding: 0 0.5rem;
+  font-size: 0.74rem;
+  font-weight: 600;
 }
 
 .batch-queue-open-hint {
@@ -917,8 +1170,8 @@ body,
   align-items: center;
   justify-content: space-between;
   width: 100%;
-  background: #2a2a3d;
-  border: 1px solid #333;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.85rem 1rem;
   color: var(--text-light);
@@ -951,7 +1204,7 @@ body,
 .api-key-panel {
   width: 100%;
   background: rgba(42, 42, 61, 0.6);
-  border: 1px solid #333;
+  border: 1px solid var(--border);
   border-radius: 8px;
   padding: 1rem;
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
@@ -993,12 +1246,7 @@ body,
 }
 
 .settings-buttons .btn {
-  padding: 0.55rem 1rem;
   font-size: 0.95rem;
-  border-radius: 6px;
-  border: 1px solid transparent;
-  cursor: pointer;
-  font-weight: 500;
 }
 
 .settings-buttons .cancel {
@@ -1055,9 +1303,9 @@ body,
   box-sizing: border-box;
   padding: 0.75rem 1rem;
   font-size: 1.1rem;
-  background: #2a2a3d;
-  border: 1px solid #333;
-  border-radius: 4px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   color: var(--text-light);
   appearance: none;
 }
@@ -1095,6 +1343,13 @@ body,
 
 .revert-btn {
   color: var(--text-light);
+  background: rgba(0, 0, 0, 0.6);
+  border: none;
+  padding: 10px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
 }
 .revert-btn:hover {
   color: #fff;
@@ -1105,9 +1360,9 @@ body,
   min-height: 160px;
   resize: none;
   padding: 0.75rem;
-  background: #2a2a3d;
-  border: 1px solid #333;
-  border-radius: 4px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   font-family: monospace;
   font-size: 0.85rem;
   color: var(--text-light);
@@ -1129,7 +1384,7 @@ body,
 
 .options-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: flex-start;
   gap: 2rem;
   margin: 0.75rem 0;
@@ -1175,7 +1430,8 @@ body,
   display: inline-flex;
   align-items: center;
   gap: 0.6rem;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
+  margin-top: 0.15rem;
 }
 
 .batch-size-controls {
@@ -1221,7 +1477,7 @@ body,
   width: 1.45rem;
   height: 1.5rem;
   padding: 0;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   border: 1px solid rgba(255, 255, 255, 0.2);
   background: rgba(255, 255, 255, 0.08);
   color: var(--text);
@@ -1255,20 +1511,24 @@ body,
 }
 
 .batch-mini-stat {
-  min-width: 64px;
+  width: 4.8rem;
   padding: 0.18rem 0.36rem;
   border-radius: 6px;
   border: 1px solid rgba(255, 255, 255, 0.16);
   background: rgba(255, 255, 255, 0.05);
   display: flex;
   flex-direction: column;
+  align-items: center;
   justify-content: center;
+  box-sizing: border-box;
 }
 
 .batch-mini-stat span {
   font-size: 0.66rem;
   line-height: 1.05;
   opacity: 0.72;
+  white-space: nowrap;
+  text-align: center;
 }
 
 .batch-mini-stat strong {
@@ -1287,16 +1547,26 @@ body,
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
   color: var(--text);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   height: 2.2rem;
   min-width: 2.2rem;
   padding: 0;
   font-size: 0.86rem;
   cursor: pointer;
   box-sizing: border-box;
+  transition: background var(--transition-fast), border-color var(--transition-fast), transform var(--transition-fast);
+}
+
+.batch-queue-open-btn:hover:not(:disabled) {
+  background: rgba(var(--accent-rgb), 0.18);
+  border-color: rgba(var(--accent-rgb), 0.55);
+}
+
+.batch-queue-open-btn:active:not(:disabled) {
+  transform: scale(0.96);
 }
 
 .batch-queue-open-btn:disabled {
@@ -1315,7 +1585,7 @@ body,
   transform: translateX(-50%);
   background: #1f2330;
   color: #fff;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   padding: 0.24rem 0.42rem;
   font-size: 0.66rem;
   line-height: 1.2;
@@ -1323,7 +1593,7 @@ body,
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.15s ease;
-  z-index: 120;
+  z-index: var(--z-popover);
 }
 
 .batch-queue-tooltip::after {
@@ -1432,12 +1702,24 @@ body,
   background: #1f2330;
   color: #fff;
   padding: 6px 10px;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   font-size: 12px;
-  white-space: normal;
-  width: 200px;
+  white-space: pre-line;
+  width: 220px;
   box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-  z-index: 100;
+  z-index: var(--z-tooltip);
+}
+
+.tooltip-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  cursor: default;
 }
 
 .scan-input {
@@ -1449,7 +1731,7 @@ body,
   padding: 0 0.5rem;
   font-size: 0.9rem;
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   background: var(--sidebar-bg);
   color: var(--text);
   text-align: center;
@@ -1479,7 +1761,7 @@ body,
   padding: 0 1.2rem;
   background: var(--accent);
   border: none;
-  border-radius: 4px;
+  border-radius: var(--radius-md);
   color: #fff;
   font-size: 0.95rem;
   cursor: pointer;
@@ -1494,6 +1776,14 @@ body,
   margin-left: 0.25rem;
   display: inline-flex;
   vertical-align: middle;
+}
+
+/* Undo .field-row button's blue fill so these match every other tooltip. */
+.quality-scan-row .tooltip-trigger {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 4px;
+  border-radius: 50%;
+  color: inherit;
 }
 
 .spin {
@@ -1518,7 +1808,7 @@ body,
 
 .settings-body::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.2);
-  border-radius: 4px;
+  border-radius: var(--radius-md);
 }
 
 .folder-picker-overlay {
@@ -1528,7 +1818,7 @@ body,
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 999;
+  z-index: var(--z-overlay);
   padding: 1.5rem;
 }
 
@@ -1577,7 +1867,7 @@ body,
 .folder-picker-path input {
   flex: 1;
   background: #1f1f2e;
-  border: 1px solid #333;
+  border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text-light);
   padding: 0.45rem 0.6rem;
@@ -1739,7 +2029,7 @@ body,
 }
 
 .folder-picker-row.active {
-  background: rgba(78, 140, 255, 0.2);
+  background: rgba(var(--accent-rgb), 0.2);
 }
 
 .folder-picker-empty {
@@ -1777,23 +2067,574 @@ body,
   cursor: not-allowed;
 }
 
-
-.batch-size-controls {
-  display: flex !important;
-  align-items: center !important;
-  gap: 0.75rem !important;
-  flex-wrap: nowrap !important;
+.ocr-review-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: var(--z-overlay);
+  padding: 1.5rem;
 }
+
+.ocr-review-modal {
+  width: min(1200px, 95vw);
+  height: min(900px, 90vh);
+  max-height: 90vh;
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1.5rem;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.ocr-review-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.ocr-review-header h3 {
+  margin: 0;
+  color: var(--accent);
+}
+
+.ocr-review-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.ocr-review-header-actions button {
+  padding: 0.45rem 0.8rem;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  background: #2b2b3f;
+  color: #fff;
+}
+
+.ocr-review-header-actions button.primary {
+  background: var(--accent);
+}
+
+.ocr-review-header-actions button:hover:not(:disabled) {
+  background: var(--button-hover);
+}
+
+.ocr-review-header-actions button.primary:hover:not(:disabled) {
+  background: var(--accent);
+  opacity: 0.9;
+}
+
+.ocr-review-header-actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.ocr-review-close {
+  font-size: 1.2rem;
+  line-height: 1;
+  width: 2.1rem;
+  height: 2.1rem;
+  padding: 0 !important;
+}
+
+.ocr-review-pager {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.ocr-review-flag-nav {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.ocr-review-flag-nav button,
+.ocr-review-pager button {
+  padding: 0.2rem 0.55rem !important;
+}
+
+.ocr-review-reviewed-toggle {
+  white-space: nowrap;
+}
+
+.ocr-review-reviewed-toggle.active {
+  background: var(--success) !important;
+  color: #0a2b0a !important;
+}
+
+.ocr-review-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  padding: 0.35rem 1rem 0;
+  font-size: 0.8rem;
+  color: #666;
+}
+
+.ocr-review-legend {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  white-space: nowrap;
+}
+
+.ocr-review-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.ocr-review-legend-swatch {
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+}
+
+.ocr-review-status {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+
+.ocr-review-status-ok {
+  background: rgba(109, 211, 109, 0.15);
+  color: var(--success);
+}
+
+.ocr-review-status-error {
+  background: rgba(255, 107, 107, 0.15);
+  color: var(--danger);
+}
+
+.ocr-review-status-warn {
+  background: rgba(234, 88, 12, 0.15);
+  color: #ea580c;
+}
+
+.ocr-review-status-warn button {
+  padding: 0.25rem 0.6rem;
+  border-radius: 6px;
+  border: none;
+  background: #ea580c;
+  color: #fff;
+  cursor: pointer;
+}
+
+.ocr-review-status-warn button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.ocr-review-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  gap: 1rem;
+}
+
+.ocr-review-body.two-pane .ocr-review-image-pane,
+.ocr-review-body.two-pane .ocr-review-text-pane {
+  flex: 1;
+  min-width: 0;
+}
+
+.ocr-review-image-pane {
+  position: relative;
+  overflow: auto;
+  background: #000;
+  border-radius: 8px;
+}
+
+/* Stand-in for the image pane while a PDF's pages are still being
+   rasterized (or failed to be) — same dark pane, just centered status text
+   instead of the zoom controls/image/bbox overlays. */
+.ocr-review-image-pane-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* .ocr-review-empty's default #666 assumes the white text pane; this pane's
+   background is black, so it needs a lighter shade to stay legible. */
+.ocr-review-image-pane-placeholder .ocr-review-empty {
+  color: #999;
+}
+
+.ocr-review-zoom-controls {
+  position: sticky;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: rgba(20, 20, 28, 0.85);
+  border-radius: 999px;
+  padding: 0.3rem 0.5rem;
+  width: fit-content;
+}
+
+.ocr-review-zoom-controls button {
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 999px;
+  border: none;
+  background: #2b2b3f;
+  color: #fff;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.ocr-review-zoom-controls button:hover:not(:disabled) {
+  background: var(--button-hover);
+}
+
+.ocr-review-zoom-controls button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.ocr-review-zoom-controls button.ocr-review-zoom-reset {
+  width: auto;
+  padding: 0 0.55rem;
+}
+
+.ocr-review-zoom-controls span {
+  color: #fff;
+  font-size: 0.8rem;
+  min-width: 2.8rem;
+  text-align: center;
+}
+
+/* Sized to exactly the image's rendered box (width set inline per zoom
+   level, height follows from the image's own aspect ratio) so the
+   percentage-positioned bbox overlays land on the right pixels. Letting
+   the flexbox default (align-items: stretch) size this instead — the
+   previous bug — stretched it to the pane's full height while the image
+   only filled its own shorter aspect-ratio height, throwing off every
+   vertical box position. */
+.ocr-review-image-inner {
+  position: relative;
+}
+
+.ocr-review-image-inner img {
+  width: 100%;
+  display: block;
+}
+
+.ocr-review-bbox {
+  position: absolute;
+  border: 2px solid rgba(var(--accent-rgb), 0.6);
+  background: rgba(var(--accent-rgb), 0.08);
+  cursor: pointer;
+}
+
+.ocr-review-bbox.active {
+  border-color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.25);
+}
+
+.ocr-review-text-pane {
+  overflow-y: auto;
+  padding: 0.75rem 1rem;
+  line-height: 1.7;
+  background: #fff;
+  color: #111111;
+  border-radius: 8px;
+}
+
+.ocr-review-block {
+  padding: 0.15rem 0.3rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.ocr-review-block.active {
+  outline: 2px solid var(--accent);
+}
+
+.ocr-review-word {
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+.ocr-review-word-editable {
+  cursor: text;
+}
+
+.ocr-review-word-editable:hover {
+  outline: 1px dashed rgba(17, 17, 17, 0.35);
+}
+
+.ocr-review-word-confirmable {
+  cursor: context-menu;
+}
+
+.ocr-review-word-confirmable:hover {
+  outline: 1px dashed rgba(17, 17, 17, 0.35);
+  background: rgba(22, 163, 74, 0.12);
+}
+
+.ocr-review-word-resolved {
+  text-decoration: underline dotted rgba(22, 163, 74, 0.6);
+  text-underline-offset: 2px;
+}
+
+.ocr-review-word-input {
+  font: inherit;
+  line-height: inherit;
+  padding: 0 1px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: #fff9db;
+  color: #111111;
+}
+
+.ocr-review-empty {
+  color: #666;
+}
+
+/* Structurally mirrors the .ocr-review-* block above (overlay/modal/header/
+   status/two-pane layout) minus the zoom/bbox rules, which don't apply to a
+   playback pane instead of a zoomable image. */
+.audio-review-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: var(--z-overlay);
+  padding: 1.5rem;
+}
+
+.audio-review-modal {
+  width: min(1200px, 95vw);
+  height: min(900px, 90vh);
+  max-height: 90vh;
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1.5rem;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.audio-review-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.audio-review-header h3 {
+  margin: 0;
+  color: var(--accent);
+}
+
+.audio-review-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.audio-review-header-actions button {
+  padding: 0.45rem 0.8rem;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  background: #2b2b3f;
+  color: #fff;
+}
+
+.audio-review-header-actions button.primary {
+  background: var(--accent);
+}
+
+.audio-review-header-actions button:hover:not(:disabled) {
+  background: var(--button-hover);
+}
+
+.audio-review-header-actions button.primary:hover:not(:disabled) {
+  background: var(--accent);
+  opacity: 0.9;
+}
+
+.audio-review-header-actions button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.audio-review-close {
+  font-size: 1.2rem;
+  line-height: 1;
+  width: 2.1rem;
+  height: 2.1rem;
+  padding: 0 !important;
+}
+
+.audio-review-reviewed-toggle {
+  white-space: nowrap;
+}
+
+.audio-review-reviewed-toggle.active {
+  background: var(--success) !important;
+  color: #0a2b0a !important;
+}
+
+.audio-review-hint {
+  padding: 0.35rem 1rem 0;
+  font-size: 0.8rem;
+  color: #666;
+}
+
+.audio-review-status {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+
+.audio-review-status-ok {
+  background: rgba(109, 211, 109, 0.15);
+  color: var(--success);
+}
+
+.audio-review-status-error {
+  background: rgba(255, 107, 107, 0.15);
+  color: var(--danger);
+}
+
+.audio-review-status-warn {
+  background: rgba(234, 88, 12, 0.15);
+  color: #ea580c;
+}
+
+.audio-review-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  gap: 1rem;
+}
+
+.audio-review-body.two-pane {
+  flex-direction: row;
+}
+
+.audio-review-body.two-pane .audio-review-text-pane {
+  flex: 1;
+  min-width: 0;
+}
+
+.audio-review-player-pane {
+  flex: 0 0 auto;
+}
+
+.audio-review-audio {
+  width: 100%;
+}
+
+.audio-review-body.two-pane .audio-review-player-pane {
+  flex: 0 0 320px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 1rem;
+}
+
+.audio-review-text-pane {
+  overflow-y: auto;
+  padding: 0.75rem 1rem;
+  line-height: 1.7;
+  background: #fff;
+  color: #111111;
+  border-radius: 8px;
+}
+
+.audio-review-segment {
+  padding: 0.3rem 0.4rem;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.audio-review-segment:hover {
+  background: rgba(17, 17, 17, 0.05);
+}
+
+.audio-review-segment.active {
+  outline: 2px solid var(--accent);
+  background: rgba(var(--accent-rgb), 0.1);
+}
+
+.audio-review-segment-time {
+  display: inline-block;
+  min-width: 3.6rem;
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-family: monospace;
+  margin-right: 0.5rem;
+  user-select: none;
+}
+
+.audio-review-segment-textarea {
+  display: block;
+  width: 100%;
+  font: inherit;
+  line-height: inherit;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: #fff9db;
+  color: #111111;
+  resize: vertical;
+}
+
+.audio-review-empty {
+  color: #666;
+}
+
+/* The compact inline-flex layout lives in the primary .batch-size-controls
+   rule above; the previous duplicate here used !important to force a wider
+   flex layout that discarded it, so it has been removed. */
 
 .batch-size-controls button:hover:not(:disabled) {
   background: var(--button-hover) !important;
   transform: translateY(-1px);
-  box-shadow: 0 2px 8px rgba(78, 140, 255, 0.3);
+  box-shadow: 0 2px 8px rgba(var(--accent-rgb), 0.3);
 }
 
 .batch-size-controls button:active:not(:disabled) {
   transform: translateY(0);
-  box-shadow: 0 1px 4px rgba(78, 140, 255, 0.2);
+  box-shadow: 0 1px 4px rgba(var(--accent-rgb), 0.2);
 }
 
 @media (max-width: 800px) {
@@ -1806,5 +2647,20 @@ body,
     width: 100%;
     text-align: center;
     margin-bottom: 0.5rem;
+  }
+}
+
+.mode-toggle {
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.04) inset, 0 6px 16px rgba(0, 0, 0, 0.25);
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 }

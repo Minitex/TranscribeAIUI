@@ -9,7 +9,8 @@
   ],
   "asarUnpack": [
     "node_modules/sharp/**/*",
-    "node_modules/ffmpeg-static/**/*"
+    "node_modules/ffmpeg-static/**/*",
+    "node_modules/@napi-rs/canvas*/**/*"
   ],
   "icon": "./desktopIcon.png",
   "publish": [

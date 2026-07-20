@@ -136,7 +136,7 @@ type ParsedSrtResult = {
   missingHourTimestampCues: number[];
 };
 
-type ScanEntry = {
+export type ScanEntry = {
   file: string;
   confidence: number;
   placeholder_ratio: number;
@@ -171,6 +171,7 @@ export type ScanProgress = {
   total: number;
   file: string;
   blankCount: number;
+  entry?: ScanEntry;
 };
 
 export type ScanQualityOptions = {
@@ -965,7 +966,7 @@ export async function scanQualityFolder(
     }
     processed += 1;
     if (options.onProgress) {
-      await options.onProgress({ processed, total: totalFiles, file: name, blankCount });
+      await options.onProgress({ processed, total: totalFiles, file: name, blankCount, entry });
     }
   }
 

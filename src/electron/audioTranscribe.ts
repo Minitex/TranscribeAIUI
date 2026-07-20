@@ -3,6 +3,7 @@ import path from 'path';
 import { execFile } from 'child_process';
 import ffmpegStatic from 'ffmpeg-static';
 import { GoogleAIFileManager } from '@google/generative-ai/server';
+import { downloadMistralBatchResultBodies } from './mistralImage.js';
 
 let currentController: AbortController | null = null;
 
@@ -36,7 +37,15 @@ function resolveFfmpegPath(binPath: string): string {
 
 const ffmpegPath = resolveFfmpegPath((ffmpegStatic as unknown as string) || '');
 const LONG_AUDIO_SPLIT_THRESHOLD_SECONDS = 3600;
-const MISTRAL_AUDIO_SPLIT_THRESHOLD_SECONDS = 1800;
+// voxtral-mini-latest currently resolves to voxtral-mini-2602 ("Voxtral Mini
+// Transcribe 2"), which accepts ~3h per request (docs.mistral.ai/capabilities/audio).
+// Kept well under that (~3h) cap since it's an approximate, unverified figure and a
+// failed request means re-uploading the whole chunk. Only split once a file exceeds
+// the max single-chunk size below — otherwise a file just past the target (e.g. 100
+// min) would get force-split into two chunks despite fitting in one request.
+const MISTRAL_TARGET_CHUNK_SECONDS = 120 * 60;
+const MISTRAL_MAX_CHUNK_SECONDS = 140 * 60;
+const MISTRAL_AUDIO_SPLIT_THRESHOLD_SECONDS = MISTRAL_MAX_CHUNK_SECONDS;
 const TARGET_CHUNK_SECONDS = 30 * 60;
 const MAX_CHUNK_SECONDS = 35 * 60;
 const CHUNK_OVERLAP_SECONDS = 1.5;
@@ -63,6 +72,11 @@ const AUDIO_MIME_BY_EXT: Record<string, string> = {
   '.flac': 'audio/flac',
   '.ogg': 'audio/ogg'
 };
+
+// Mistral's audio-transcription endpoint natively accepts these containers
+// (docs.mistral.ai/resources/known-limitations); anything else still needs
+// transcoding to MP3 before upload.
+const MISTRAL_NATIVE_AUDIO_EXTS = new Set(['.wav', '.mp3', '.flac', '.ogg', '.webm']);
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -154,22 +168,37 @@ function runFfmpegCapture(args: string[], signal?: AbortSignal): Promise<{ stdou
   });
 }
 
-async function probeDurationSeconds(filePath: string): Promise<number> {
+export async function probeDurationSeconds(filePath: string, signal?: AbortSignal): Promise<number> {
   const bin = ffmpegPath;
   if (!bin) return 0;
   return new Promise((resolve) => {
     const proc = execFile(bin, ['-i', filePath], { windowsHide: true }, (_err, _stdout, stderr) => {
+      cleanup();
       const m = /Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/.exec(stderr || '');
       if (!m) return resolve(0);
       const [h, mm, ss, ms] = m.slice(1).map(Number);
       const frac = Number(`0.${ms}`) || 0;
       resolve(h * 3600 + mm * 60 + ss + frac);
     });
-    proc.on('error', () => resolve(0));
+    proc.on('error', () => {
+      cleanup();
+      resolve(0);
+    });
+
+    const onAbort = () => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {}
+    };
+    const cleanup = () => { if (signal) signal.removeEventListener('abort', onAbort); };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
   });
 }
 
-async function inspectMediaInput(filePath: string): Promise<{
+async function inspectMediaInput(filePath: string, signal?: AbortSignal): Promise<{
   durationSeconds: number;
   hasAudioStream: boolean;
   hasVideoStream: boolean;
@@ -192,6 +221,7 @@ async function inspectMediaInput(filePath: string): Promise<{
         maxBuffer: 20 * 1024 * 1024
       },
       (_err, _stdout, stderr) => {
+        cleanup();
         const details = String(stderr || '');
         const durationMatch = /Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/.exec(details);
         let durationSeconds = 0;
@@ -209,11 +239,25 @@ async function inspectMediaInput(filePath: string): Promise<{
       }
     );
 
-    proc.on('error', () => resolve({
-      durationSeconds: 0,
-      hasAudioStream: false,
-      hasVideoStream: false
-    }));
+    proc.on('error', () => {
+      cleanup();
+      resolve({
+        durationSeconds: 0,
+        hasAudioStream: false,
+        hasVideoStream: false
+      });
+    });
+
+    const onAbort = () => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {}
+    };
+    const cleanup = () => { if (signal) signal.removeEventListener('abort', onAbort); };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
   });
 }
 
@@ -894,12 +938,101 @@ function isEmptyMistralTranscribeResult(result: MistralTranscribeResult): boolea
   return !result.text.trim() && result.segments.length === 0;
 }
 
+// Cost-estimate helper: probes each file's duration (metadata read, not a
+// full decode) with bounded concurrency so a folder of hundreds of files
+// doesn't spawn hundreds of ffmpeg processes at once.
+export async function estimateAudioBatchDurationMinutes(files: string[]): Promise<number> {
+  const CONCURRENCY = 6;
+  let totalSeconds = 0;
+  for (let i = 0; i < files.length; i += CONCURRENCY) {
+    const chunk = files.slice(i, i + CONCURRENCY);
+    const durations = await Promise.all(chunk.map(f => probeDurationSeconds(f)));
+    totalSeconds += durations.reduce((a, b) => a + b, 0);
+  }
+  return totalSeconds / 60;
+}
+
+// Batch counterpart of uploadAndTranscribeMistral's response handling: same
+// payload shape (a batch line's body is the same JSON the sync endpoint
+// returns), so the existing extractors apply unchanged.
+export async function downloadMistralAudioBatchResultsDetailed(
+  outputFileId: string,
+  apiKey: string,
+  signal?: AbortSignal
+): Promise<Map<string, MistralTranscribeResult>> {
+  const bodies = await downloadMistralBatchResultBodies(outputFileId, apiKey, signal);
+  const results = new Map<string, MistralTranscribeResult>();
+  for (const [customId, body] of bodies) {
+    results.set(customId, {
+      text: extractMistralTranscriptionText(body),
+      segments: extractMistralSegments(body)
+    });
+  }
+  return results;
+}
+
+// Same output logic as transcribeAudioMistral's non-chunked branch (subtitles
+// -> SRT+TXT, interview mode -> speaker-formatted TXT, else plain TXT),
+// factored out so the batch write path in main.ts doesn't need chunk
+// handling (batch audio uploads whole files — see submitMistralAudioBatchJob).
+export async function writeMistralAudioBatchResult(
+  outputDir: string,
+  base: string,
+  result: MistralTranscribeResult,
+  subtitles: boolean,
+  interviewMode: boolean
+): Promise<void> {
+  await fs.promises.mkdir(outputDir, { recursive: true });
+
+  if (subtitles) {
+    const cues = result.segments.length ? mistralSegmentsToSrtCues(result.segments) : parseSrtCues(result.text || '');
+    if (!cues.length && !isEmptyMistralTranscribeResult(result)) {
+      throw new Error(`Mistral subtitle mode returned no timestamped segments for ${base}.`);
+    }
+    await fs.promises.writeFile(path.join(outputDir, `${base}.srt`), serializeSrtCues(cues), 'utf-8');
+    await fs.promises.writeFile(path.join(outputDir, `${base}.txt`), srtCuesToTranscript(cues), 'utf-8');
+    return;
+  }
+
+  if (interviewMode) {
+    let entries: Array<{ speaker?: string; transcription?: string }> | null = null;
+    if (result.segments.some(seg => typeof seg.speaker === 'string' && seg.speaker.trim())) {
+      const fromSegments = mistralSegmentsToInterviewEntries(result.segments);
+      if (fromSegments.length) entries = fromSegments;
+    }
+    if (!entries) entries = tryParseSpeakerJson(result.text || '');
+
+    let outText: string;
+    if (entries && entries.length) {
+      const pretty = formatSpeakerTranscript(entries);
+      outText = pretty.endsWith('\n') ? pretty : `${pretty}\n`;
+    } else if (result.segments.length) {
+      outText = mistralSegmentsToTranscriptLines(result.segments).join('\n');
+    } else {
+      outText = sanitizeChunkText(result.text || '');
+    }
+    await fs.promises.writeFile(path.join(outputDir, `${base}.txt`), outText, 'utf-8');
+    return;
+  }
+
+  const outText = result.segments.length
+    ? mistralSegmentsToTranscriptLines(result.segments).join('\n')
+    : sanitizeChunkText(result.text || '');
+  await fs.promises.writeFile(path.join(outputDir, `${base}.txt`), outText, 'utf-8');
+}
+
 async function uploadAndTranscribeMistral(
   filePath: string,
   modelName: string,
   apiKey: string,
   signal: AbortSignal,
-  opts: { subtitles: boolean; interviewMode: boolean; logger?: (msg: string) => Promise<void> | void }
+  opts: {
+    subtitles: boolean;
+    interviewMode: boolean;
+    contextBias?: string[];
+    language?: string;
+    logger?: (msg: string) => Promise<void> | void;
+  }
 ): Promise<MistralTranscribeResult> {
   if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
   const data = await fs.promises.readFile(filePath);
@@ -923,6 +1056,13 @@ async function uploadAndTranscribeMistral(
     }
     if (opts.interviewMode) {
       form.append('diarize', 'true');
+    }
+    if (opts.contextBias?.length) {
+      form.append('context_bias', opts.contextBias.join(','));
+    }
+    // language is documented as mutually exclusive with timestamp_granularities.
+    if (opts.language && !opts.subtitles && !opts.interviewMode) {
+      form.append('language', opts.language);
     }
 
     const resp = await fetch(`${MISTRAL_API_BASE}/audio/transcriptions`, {
@@ -1118,16 +1258,21 @@ async function detectSilenceRanges(
   }
 }
 
-function planBalancedChunkRanges(durationSeconds: number, minimumChunkCount = 1): PlannedChunkRange[] {
-  const safeDuration = Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : TARGET_CHUNK_SECONDS;
-  const minChunksByMax = Math.max(1, Math.ceil(safeDuration / MAX_CHUNK_SECONDS));
-  let chunkCount = Math.max(1, minimumChunkCount, Math.round(safeDuration / TARGET_CHUNK_SECONDS), minChunksByMax);
+function planBalancedChunkRanges(
+  durationSeconds: number,
+  minimumChunkCount = 1,
+  targetChunkSeconds = TARGET_CHUNK_SECONDS,
+  maxChunkSeconds = MAX_CHUNK_SECONDS
+): PlannedChunkRange[] {
+  const safeDuration = Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : targetChunkSeconds;
+  const minChunksByMax = Math.max(1, Math.ceil(safeDuration / maxChunkSeconds));
+  let chunkCount = Math.max(1, minimumChunkCount, Math.round(safeDuration / targetChunkSeconds), minChunksByMax);
 
   if (safeDuration > LONG_AUDIO_SPLIT_THRESHOLD_SECONDS) {
     chunkCount = Math.max(2, minimumChunkCount, chunkCount);
   }
 
-  while (safeDuration / chunkCount > MAX_CHUNK_SECONDS) {
+  while (safeDuration / chunkCount > maxChunkSeconds) {
     chunkCount += 1;
   }
 
@@ -1256,9 +1401,11 @@ async function createAudioChunks(
   totalDurationSeconds: number,
   signal: AbortSignal,
   logger: (msg: string) => Promise<void> | void,
-  minimumChunkCount = 1
+  minimumChunkCount = 1,
+  targetChunkSeconds = TARGET_CHUNK_SECONDS,
+  maxChunkSeconds = MAX_CHUNK_SECONDS
 ): Promise<AudioChunk[]> {
-  const baseRanges = planBalancedChunkRanges(totalDurationSeconds, minimumChunkCount);
+  const baseRanges = planBalancedChunkRanges(totalDurationSeconds, minimumChunkCount, targetChunkSeconds, maxChunkSeconds);
   const targetBoundaries = chunkRangesToBoundaries(baseRanges);
   let logicalRanges = baseRanges;
 
@@ -1279,18 +1426,21 @@ async function createAudioChunks(
   const ranges = applyChunkOverlap(logicalRanges, totalDurationSeconds);
   const avgMinutes = totalDurationSeconds / 60 / Math.max(1, logicalRanges.length);
   await logger(
-    `[INFO] Splitting audio into ${ranges.length} chunk(s) (~${avgMinutes.toFixed(1)} min each, target ${Math.round(TARGET_CHUNK_SECONDS / 60)} min).`
+    `[INFO] Splitting audio into ${ranges.length} chunk(s) (~${avgMinutes.toFixed(1)} min each, target ${Math.round(targetChunkSeconds / 60)} min).`
   );
   if (ranges.length > 1 && CHUNK_OVERLAP_SECONDS > 0) {
     await logger(`[INFO] Applying ${CHUNK_OVERLAP_SECONDS.toFixed(1)}s overlap between adjacent chunks.`);
   }
 
   const splitId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  // -c copy below is a stream copy, so the chunk container must match the
+  // source's — hardcoding .mp3 here would corrupt chunks of any other format.
+  const chunkExt = path.extname(inputPath) || '.mp3';
   const chunks: AudioChunk[] = [];
 
   for (let i = 0; i < ranges.length; i += 1) {
     const range = ranges[i];
-    const fileName = `${base}__chunk_${splitId}_${String(i).padStart(3, '0')}.mp3`;
+    const fileName = `${base}__chunk_${splitId}_${String(i).padStart(3, '0')}${chunkExt}`;
     const audioPath = path.join(outputDir, fileName);
     await runFfmpeg(
       [
@@ -1308,7 +1458,7 @@ async function createAudioChunks(
       signal
     );
 
-    const measuredDuration = await probeDurationSeconds(audioPath);
+    const measuredDuration = await probeDurationSeconds(audioPath, signal);
     const durationSeconds = measuredDuration > 0 ? measuredDuration : range.durationSeconds;
     chunks.push({
       audioPath,
@@ -1458,13 +1608,13 @@ async function writeEmptyAudioOutputs(
   await logger(`[OK] Saved transcript: ${outTxt}`);
 }
 
-async function getPreflightEmptyAudioReason(filePath: string): Promise<string | null> {
+async function getPreflightEmptyAudioReason(filePath: string, signal?: AbortSignal): Promise<string | null> {
   const stat = await fs.promises.stat(filePath).catch(() => null);
   if (stat && stat.isFile() && stat.size === 0) {
     return 'Input file is empty';
   }
 
-  const mediaInfo = await inspectMediaInput(filePath);
+  const mediaInfo = await inspectMediaInput(filePath, signal);
   if (!mediaInfo.hasAudioStream && (mediaInfo.hasVideoStream || mediaInfo.durationSeconds > 0)) {
     return 'No audio stream detected';
   }
@@ -1485,6 +1635,10 @@ type TranscribeOptions = {
   tempDir?: string;
   signal?: AbortSignal;
   logger?: (msg: string) => Promise<void> | void;
+  // Mistral-only accuracy levers (docs.mistral.ai/studio-api/audio/speech_to_text/offline_transcription).
+  // Ignored by the Gemini path.
+  contextBias?: string[];
+  language?: string;
 };
 
 export async function transcribeAudioGemini(filePath: string, opts: TranscribeOptions): Promise<void> {
@@ -1526,7 +1680,7 @@ export async function transcribeAudioGemini(filePath: string, opts: TranscribeOp
 
   try {
     if (useSignal.aborted) throw new DOMException('Aborted', 'AbortError');
-    const preflightEmptyReason = await getPreflightEmptyAudioReason(filePath);
+    const preflightEmptyReason = await getPreflightEmptyAudioReason(filePath, useSignal);
     if (preflightEmptyReason) {
       await writeEmptyAudioOutputs(outputDir, base, subtitles, logger, preflightEmptyReason);
       return;
@@ -1540,7 +1694,7 @@ export async function transcribeAudioGemini(filePath: string, opts: TranscribeOp
       cleanup = async () => { await fs.promises.rm(tmpMp3!).catch(() => {}); };
     }
 
-    const totalDuration = await probeDurationSeconds(inputPath);
+    const totalDuration = await probeDurationSeconds(inputPath, useSignal);
     await logger(`[INFO] Input duration: ${totalDuration.toFixed(2)}s`);
 
     const shouldSplit = totalDuration > LONG_AUDIO_SPLIT_THRESHOLD_SECONDS;
@@ -1675,6 +1829,8 @@ export async function transcribeAudioMistral(filePath: string, opts: TranscribeO
     subtitles,
     tempDir,
     signal,
+    contextBias,
+    language,
     logger = async () => {}
   } = opts;
 
@@ -1702,13 +1858,13 @@ export async function transcribeAudioMistral(filePath: string, opts: TranscribeO
 
   try {
     if (useSignal.aborted) throw new DOMException('Aborted', 'AbortError');
-    const preflightEmptyReason = await getPreflightEmptyAudioReason(filePath);
+    const preflightEmptyReason = await getPreflightEmptyAudioReason(filePath, useSignal);
     if (preflightEmptyReason) {
       await writeEmptyAudioOutputs(outputDir, base, subtitles, logger, preflightEmptyReason);
       return;
     }
 
-    if (path.extname(filePath).toLowerCase() !== '.mp3') {
+    if (!MISTRAL_NATIVE_AUDIO_EXTS.has(path.extname(filePath).toLowerCase())) {
       tmpMp3 = path.join(workTempDir, `${base}__source_${tempRunId}.mp3`);
       await logger(`[INFO] Converting to mp3: ${tmpMp3}`);
       await runFfmpeg(['-y', '-i', filePath, '-vn', '-codec:a', 'libmp3lame', '-qscale:a', '2', tmpMp3], useSignal);
@@ -1716,12 +1872,22 @@ export async function transcribeAudioMistral(filePath: string, opts: TranscribeO
       cleanup = async () => { await fs.promises.rm(tmpMp3!).catch(() => {}); };
     }
 
-    const totalDuration = await probeDurationSeconds(inputPath);
+    const totalDuration = await probeDurationSeconds(inputPath, useSignal);
     await logger(`[INFO] Input duration: ${totalDuration.toFixed(2)}s`);
     const shouldSplit = totalDuration > MISTRAL_AUDIO_SPLIT_THRESHOLD_SECONDS;
     const performTranscriptionAttempt = async (): Promise<void> => {
       if (shouldSplit) {
-        const chunks = await createAudioChunks(inputPath, workTempDir, base, totalDuration, useSignal, logger, 2);
+        const chunks = await createAudioChunks(
+          inputPath,
+          workTempDir,
+          base,
+          totalDuration,
+          useSignal,
+          logger,
+          2,
+          MISTRAL_TARGET_CHUNK_SECONDS,
+          MISTRAL_MAX_CHUNK_SECONDS
+        );
         try {
           if (subtitles) {
             const chunkCueLists: SrtCue[][] = [];
@@ -1732,6 +1898,8 @@ export async function transcribeAudioMistral(filePath: string, opts: TranscribeO
               const result = await uploadAndTranscribeMistral(chunk.audioPath, modelName, apiKey, useSignal, {
                 subtitles: true,
                 interviewMode: false,
+                contextBias,
+                language,
                 logger
               });
               const cues = result.segments.length
@@ -1772,6 +1940,8 @@ export async function transcribeAudioMistral(filePath: string, opts: TranscribeO
               const result = await uploadAndTranscribeMistral(chunk.audioPath, modelName, apiKey, useSignal, {
                 subtitles: false,
                 interviewMode: true,
+                contextBias,
+                language,
                 logger
               });
 
@@ -1820,6 +1990,8 @@ export async function transcribeAudioMistral(filePath: string, opts: TranscribeO
               const result = await uploadAndTranscribeMistral(chunk.audioPath, modelName, apiKey, useSignal, {
                 subtitles: false,
                 interviewMode: false,
+                contextBias,
+                language,
                 logger
               });
               const chunkText = result.segments.length
@@ -1844,6 +2016,8 @@ export async function transcribeAudioMistral(filePath: string, opts: TranscribeO
       const result = await uploadAndTranscribeMistral(inputPath, modelName, apiKey, useSignal, {
         subtitles,
         interviewMode,
+        contextBias,
+        language,
         logger
       });
 

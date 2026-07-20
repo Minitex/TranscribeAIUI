@@ -2,1424 +2,120 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import AudioTranscriber, { Transcript } from './components/AudioTranscriber';
 import ImageTranscriber from './components/ImageTranscriber';
 import FolderPickerModal from './components/FolderPickerModal';
+import OcrReviewModal from './components/OcrReviewModal';
+import AudioReviewModal from './components/AudioReviewModal';
+import BatchFindReplaceModal from './components/BatchFindReplaceModal';
+import InfoTooltip from './components/InfoTooltip';
+import LogsPanel from './components/LogsPanel';
+import SettingsGearBadge from './components/SettingsGearBadge';
+import TranscriptListItem from './components/TranscriptListItem';
+import SettingsView from './views/SettingsView';
+import BatchQueueView from './views/BatchQueueView';
+import { useIpcPersistedState } from './hooks/useIpcPersistedState';
 import {
   DEFAULT_AUDIO_PROMPT,
   INTERVIEW_AUDIO_PROMPT,
-  SUBTITLE_AUDIO_PROMPT,
-  DEFAULT_IMAGE_PROMPT
+  SUBTITLE_AUDIO_PROMPT
 } from '../../defaultPrompts';
-import {
-  FaCog,
-  FaChevronDown,
-  FaChevronUp,
-  FaUndo,
-  FaQuestionCircle,
-  FaSpinner,
-  FaTrash,
-  FaInfoCircle,
-  FaSync,
-  FaDownload,
-  FaCopy,
-} from 'react-icons/fa';
+import { FaUndo, FaSpinner, FaSync, FaDownload, FaCopy } from 'react-icons/fa';
 import './App.css';
-
-const { ipcRenderer } = (window as any).require('electron');
-const fs = (window as any).require('fs') as typeof import('fs');
-const os = (window as any).require('os') as typeof import('os');
-const pathModule = (window as any).require('path') as typeof import('path');
-
-const AUDIO_MODEL_OPTIONS = [
-  'voxtral-mini-latest',
-  'gemini-3.1-pro-preview',
-  'gemini-3-flash-preview',
-  'gemini-2.5-pro',
-  'gemini-2.5-flash'
-];
-const DEFAULT_AUDIO_MODEL = 'gemini-3.1-pro-preview';
-
-const IMAGE_MODEL_OPTIONS = [
-  'mistral-ocr-latest',
-  'gemini-3.1-pro-preview',
-  'gemini-3-flash-preview',
-  'gemini-2.5-pro',
-  'gemini-2.5-flash'
-];
-const DEFAULT_IMAGE_MODEL = 'gemini-2.5-flash';
-const MISTRAL_BATCH_WORKER_OPTIONS = [1, 2, 3, 4, 5] as const;
-const MIN_MISTRAL_BATCH_WORKERS = MISTRAL_BATCH_WORKER_OPTIONS[0];
-const MAX_MISTRAL_BATCH_WORKERS = MISTRAL_BATCH_WORKER_OPTIONS[MISTRAL_BATCH_WORKER_OPTIONS.length - 1];
-const DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS = 2;
-const DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS = 2;
-const DISPLAY_LOG_MAX_BYTES = 256 * 1024;
-const LIVE_LOG_REFRESH_INTERVAL_MS = 2000;
-const LIVE_TRANSCRIPT_REFRESH_INTERVAL_MS = 8000;
-const LIVE_BATCH_UI_REFRESH_INTERVAL_MS = 2000;
-
-const IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.jp2', '.tif', '.tiff', '.bmp', '.gif', '.pdf'];
-const ACCESSIBLE_PDF_PREFIX = 'ACCESSIBLE_';
-
-function resolveSupportedModel(
-  value: string | null | undefined,
-  options: readonly string[],
-  fallback: string
-): string {
-  if (typeof value === 'string' && options.includes(value)) {
-    return value;
-  }
-  return fallback;
-}
-
-function resolveWorkerCount(value: string | number | null | undefined, fallback: number): number {
-  const parsed = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.min(MAX_MISTRAL_BATCH_WORKERS, Math.max(MIN_MISTRAL_BATCH_WORKERS, Math.floor(parsed)));
-}
-
-function getNextWorkerCount(currentValue: number): number {
-  return Math.min(MAX_MISTRAL_BATCH_WORKERS, resolveWorkerCount(currentValue, MAX_MISTRAL_BATCH_WORKERS) + 1);
-}
-
-function getPrevWorkerCount(currentValue: number): number {
-  return Math.max(MIN_MISTRAL_BATCH_WORKERS, resolveWorkerCount(currentValue, MIN_MISTRAL_BATCH_WORKERS) - 1);
-}
-
-function normalizeLocalPath(value: unknown): string {
-  if (typeof value !== 'string') return '';
-  const trimmed = value.trim();
-  if (!trimmed) return '';
-  try {
-    return pathModule.normalize(pathModule.resolve(trimmed));
-  } catch {
-    return trimmed;
-  }
-}
-
-function resolveImageInputPathKind(value: string): 'file' | 'directory' | 'missing' {
-  const normalized = normalizeLocalPath(value);
-  if (!normalized) return 'missing';
-
-  try {
-    const stats = fs.statSync(normalized);
-    if (stats.isDirectory()) return 'directory';
-    if (stats.isFile()) return 'file';
-  } catch {
-    const ext = pathModule.extname(normalized).toLowerCase();
-    if (IMAGE_EXTS.includes(ext)) return 'file';
-    // The UI picker only allows folders here, so keep batch mode available
-    // when a renderer-side stat check is the only thing failing.
-    return 'directory';
-  }
-
-  return 'missing';
-}
-
-type QualityIssueCode =
-  | 'blank_transcript'
-  | 'intro_chatter'
-  | 'outro_chatter'
-  | 'repetition'
-  | 'markdown_image'
-  | 'markdown_link'
-  | 'markdown_code'
-  | 'ai_boilerplate'
-  | 'rare_tokens'
-  | 'encoded_html_entities'
-  | 'srt_timestamp_parse'
-  | 'srt_timestamp_noncanonical'
-  | 'srt_timestamp_missing_hour'
-  | 'srt_timestamp_range'
-  | 'srt_timestamp_overlap';
-
-type QualityIssueDetail = {
-  code: QualityIssueCode;
-  message: string;
-};
-
-type QualityEntry = {
-  confidence: number;
-  blankTranscript?: boolean;
-  nonWhitespaceChars?: number;
-  removeIntroText?: string;
-  removeOutroText?: string;
-  issueDetails?: QualityIssueDetail[];
-  issues?: string[];
-  placeholderCount?: number;
-  placeholderRatio?: number;
-  tokenCount?: number;
-  repetitionRatio?: number;
-  markdownArtifacts?: string[];
-  htmlAmpCount?: number;
-  htmlEntityCount?: number;
-  htmlEntityCounts?: Record<string, number>;
-  srtInvalidTimestampCount?: number;
-  srtInvalidRangeCount?: number;
-  srtOverlapCount?: number;
-  srtNoncanonicalTimestampCount?: number;
-  srtMissingHourTimestampCount?: number;
-  scoreBreakdown?: {
-    placeholderPenalty: number;
-    repetitionPenalty: number;
-    aiPenalty: number;
-    rareTokenPenalty: number;
-    wrapperPenalty: number;
-    markdownPenalty: number;
-    encodedEntityPenalty: number;
-    srtTimestampPenalty: number;
-    totalPenalty: number;
-  };
-};
-
-type ScanResultEntry = {
-  file: string;
-  confidence: number;
-  blank_transcript?: boolean;
-  non_whitespace_chars?: number;
-  remove_intro_text?: string;
-  remove_outro_text?: string;
-  issue_details?: QualityIssueDetail[];
-  issues?: string[];
-  placeholder_count?: number;
-  placeholder_ratio?: number;
-  token_count?: number;
-  repetition_ratio?: number;
-  markdown_artifacts?: string[];
-  html_amp_count?: number;
-  html_entity_count?: number;
-  html_entity_counts?: Record<string, number>;
-  srt_invalid_timestamp_count?: number;
-  srt_invalid_range_count?: number;
-  srt_overlap_count?: number;
-  srt_noncanonical_timestamp_count?: number;
-  srt_missing_hour_timestamp_count?: number;
-  score_breakdown?: {
-    placeholder_penalty: number;
-    repetition_penalty: number;
-    ai_penalty: number;
-    rare_token_penalty: number;
-    wrapper_penalty: number;
-    markdown_penalty: number;
-    encoded_entity_penalty: number;
-    srt_timestamp_penalty: number;
-    total_penalty: number;
-  };
-};
-
-type SortOption = 'name-asc' | 'name-desc' | 'confidence-desc' | 'confidence-asc';
-
-type PathPickerTarget = {
-  target: 'audio-input' | 'audio-output' | 'image-input' | 'image-output' | 'copy-images';
-  allowFiles: boolean;
-};
-
-type MistralBatchStats = {
-  inputPath: string;
-  uploaded: number;
-  processing: number;
-  completed: number;
-  failed: number;
-  total: number;
-};
-
-type MistralBatchQueueRow = MistralBatchStats & {
-  outputDir: string;
-  modelName: string;
-  oldestPendingStartMs: number | null;
-  checkBackAtMs: number | null;
-};
-
-type SettingsProps = {
-  currentVersion: string;
-  latestVersion: string;
-  checkingUpdate: boolean;
-  updateError: string;
-  onCheckLatest: () => void;
-  onOpenUpdatePage: () => void;
-  onOpenUpdateInstructions: () => void;
-};
-
-const stripOuterQuotes = (line: string) =>
-  line.replace(/^[\"'“”‘’]+/, '').replace(/[\"'“”‘’]+$/, '');
-
-const removeWrappersFromContent = (
-  content: string,
-  intro?: string,
-  outro?: string
-) => {
-  if (!intro && !outro) return content;
-
-  const endsWithNewline = /\r?\n$/.test(content);
-  const newline = content.includes('\r\n') ? '\r\n' : '\n';
-  const lines = content.split(/\r?\n/);
-
-  let startIdx = 0;
-  while (startIdx < lines.length && !lines[startIdx].trim()) startIdx++;
-
-  let workingLines = lines.slice();
-  let removedIntro = false;
-  let removedOutro = false;
-
-  if (intro && startIdx < workingLines.length) {
-    const firstLine = stripOuterQuotes(workingLines[startIdx]).trim();
-    if (firstLine.toLowerCase().startsWith(intro.toLowerCase())) {
-      workingLines = workingLines.slice(startIdx + 1);
-      removedIntro = true;
-    }
-  }
-
-  if (removedIntro) {
-    while (workingLines.length && !workingLines[0].trim()) workingLines.shift();
-  }
-
-  if (outro && workingLines.length) {
-    let endIdx = workingLines.length - 1;
-    while (endIdx >= 0 && !workingLines[endIdx].trim()) endIdx--;
-    if (endIdx >= 0) {
-      const lastLine = stripOuterQuotes(workingLines[endIdx]).trim();
-      if (lastLine.toLowerCase().startsWith(outro.toLowerCase())) {
-        workingLines = workingLines.slice(0, endIdx);
-        removedOutro = true;
-      }
-    }
-  }
-
-  if (removedOutro) {
-    while (workingLines.length && !workingLines[workingLines.length - 1].trim()) {
-      workingLines.pop();
-    }
-  }
-
-  if (!removedIntro && !removedOutro) return content;
-
-  const cleaned = workingLines.join(newline);
-  if (!cleaned) return '';
-  return endsWithNewline ? `${cleaned}${newline}` : cleaned;
-};
-
-const stripMarkdownArtifacts = (content: string) => {
-  if (!content) return '';
-  const endsWithNewline = /\r?\n$/.test(content);
-  let cleaned = content;
-  cleaned = cleaned.replace(/!\[[^\]]*\]\([^)]+\)/g, '');
-  cleaned = cleaned.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
-  cleaned = cleaned.replace(/```([\s\S]*?)```/g, (_, inner) => {
-    const trimmed = inner.trim();
-    return trimmed ? `\n${trimmed}\n` : '\n';
-  });
-  cleaned = cleaned.replace(/~~~([\s\S]*?)~~~/g, (_, inner) => {
-    const trimmed = inner.trim();
-    return trimmed ? `\n${trimmed}\n` : '\n';
-  });
-  cleaned = cleaned.replace(/`([^`\n]+)`/g, '$1');
-  cleaned = cleaned.replace(/^\s{0,3}#{1,6}\s+/gm, '');
-  ['**', '__', '*', '_'].forEach(marker => {
-    const escaped = marker.replace(/([.*+?^${}()|\[\]\\])/g, '\\$1');
-    const pattern = new RegExp(`${escaped}([\\s\\S]*?)${escaped}`, 'g');
-    cleaned = cleaned.replace(pattern, '$1');
-  });
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
-  const trimmed = cleaned.trim();
-  if (!trimmed) return '';
-  return endsWithNewline ? `${trimmed}\n` : trimmed;
-};
-
-const InfoTooltip: React.FC<{ text: string }> = ({ text }) => {
-  const [visible, setVisible] = useState(false);
-  return (
-    <div
-      style={{
-        position: 'relative',
-        display: 'inline-flex',
-        alignItems: 'center',
-        marginLeft: 6,
-      }}
-    >
-      <div
-        onMouseEnter={() => setVisible(true)}
-        onMouseLeave={() => setVisible(false)}
-        aria-label="More info"
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          cursor: 'default',
-          padding: 4,
-          borderRadius: '50%',
-          background: 'rgba(255,255,255,0.08)',
-        }}
-      >
-        <FaQuestionCircle size={14} />
-      </div>
-      {visible && (
-        <div
-          role="tooltip"
-          style={{
-            position: 'absolute',
-            top: '110%',
-            left: '50%',
-            transform: 'translateX(-50%)',
-            background: '#1f2330',
-            color: '#fff',
-            padding: '8px 12px',
-            borderRadius: 6,
-            fontSize: 12,
-            lineHeight: 1.3,
-            width: 240,
-            boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
-            zIndex: 100,
-            whiteSpace: 'normal',
-          }}
-        >
-          {text}
-        </div>
-      )}
-    </div>
-  );
-};
-
-function SettingsView({
-  currentVersion,
-  latestVersion,
-  checkingUpdate,
-  updateError,
-  onCheckLatest,
-  onOpenUpdatePage,
-  onOpenUpdateInstructions
-}: SettingsProps) {
-  const [key, setKey] = useState('');
-  const [audioModel, setAudioModel] = useState(DEFAULT_AUDIO_MODEL);
-  const [imageModel, setImageModel] = useState(DEFAULT_IMAGE_MODEL);
-  const [mistralKey, setMistralKey] = useState('');
-  const [audioPrompt, setAudioPrompt] = useState<string>(DEFAULT_AUDIO_PROMPT);
-  const [imagePrompt, setImagePrompt] = useState<string>(DEFAULT_IMAGE_PROMPT);
-  const [mistralBatchPreprocessWorkers, setMistralBatchPreprocessWorkers] = useState<number>(
-    DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS
-  );
-  const [mistralBatchUploadWorkers, setMistralBatchUploadWorkers] = useState<number>(
-    DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS
-  );
-  const [saved, setSaved] = useState(false);
-  const [showApiKeys, setShowApiKeys] = useState(false);
-  const [clearingTempFiles, setClearingTempFiles] = useState(false);
-  const [tempFilesMessage, setTempFilesMessage] = useState('');
-
-  useEffect(() => {
-    ipcRenderer
-      .invoke('get-api-key')
-      .then((k: string) => setKey(k || localStorage.getItem('apiKey') || ''))
-      .catch(() => setKey(localStorage.getItem('apiKey') || ''));
-
-    ipcRenderer
-      .invoke('get-audio-model')
-      .then((m: string) =>
-        setAudioModel(
-          resolveSupportedModel(
-            m || localStorage.getItem('audioModel'),
-            AUDIO_MODEL_OPTIONS,
-            DEFAULT_AUDIO_MODEL
-          )
-        )
-      )
-      .catch(() =>
-        setAudioModel(
-          resolveSupportedModel(localStorage.getItem('audioModel'), AUDIO_MODEL_OPTIONS, DEFAULT_AUDIO_MODEL)
-        )
-      );
-
-    ipcRenderer
-      .invoke('get-image-model')
-      .then((m: string) =>
-        setImageModel(
-          resolveSupportedModel(
-            m || localStorage.getItem('imageModel'),
-            IMAGE_MODEL_OPTIONS,
-            DEFAULT_IMAGE_MODEL
-          )
-        )
-      )
-      .catch(() =>
-        setImageModel(
-          resolveSupportedModel(localStorage.getItem('imageModel'), IMAGE_MODEL_OPTIONS, DEFAULT_IMAGE_MODEL)
-        )
-      );
-
-    ipcRenderer
-      .invoke('get-mistral-key')
-      .then((val: string) => setMistralKey(val || localStorage.getItem('mistralKey') || ''))
-      .catch(() => setMistralKey(localStorage.getItem('mistralKey') || ''));
-
-    ipcRenderer
-      .invoke('get-audio-prompt')
-      .then((p: string) =>
-        setAudioPrompt(
-          p || (localStorage.getItem('audioPrompt') as string) || DEFAULT_AUDIO_PROMPT
-        )
-      )
-      .catch(() =>
-        setAudioPrompt((localStorage.getItem('audioPrompt') as string) || DEFAULT_AUDIO_PROMPT)
-      );
-
-    ipcRenderer
-      .invoke('get-image-prompt')
-      .then((p: string) =>
-        setImagePrompt(
-          p || (localStorage.getItem('imagePrompt') as string) || DEFAULT_IMAGE_PROMPT
-        )
-      )
-      .catch(() =>
-        setImagePrompt((localStorage.getItem('imagePrompt') as string) || DEFAULT_IMAGE_PROMPT)
-      );
-
-    ipcRenderer
-      .invoke('get-mistral-batch-preprocess-workers')
-      .then((value: number) =>
-        setMistralBatchPreprocessWorkers(
-          resolveWorkerCount(
-            value ?? localStorage.getItem('mistralBatchPreprocessWorkers'),
-            DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS
-          )
-        )
-      )
-      .catch(() =>
-        setMistralBatchPreprocessWorkers(
-          resolveWorkerCount(
-            localStorage.getItem('mistralBatchPreprocessWorkers'),
-            DEFAULT_MISTRAL_BATCH_PREPROCESS_WORKERS
-          )
-        )
-      );
-
-    ipcRenderer
-      .invoke('get-mistral-batch-upload-workers')
-      .then((value: number) =>
-        setMistralBatchUploadWorkers(
-          resolveWorkerCount(
-            value ?? localStorage.getItem('mistralBatchUploadWorkers'),
-            DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS
-          )
-        )
-      )
-      .catch(() =>
-        setMistralBatchUploadWorkers(
-          resolveWorkerCount(
-            localStorage.getItem('mistralBatchUploadWorkers'),
-            DEFAULT_MISTRAL_BATCH_UPLOAD_WORKERS
-          )
-        )
-      );
-  }, []);
-
-  const save = async () => {
-    try {
-      await ipcRenderer.invoke('set-api-key', key);
-    } catch {
-      localStorage.setItem('apiKey', key);
-    }
-
-    try {
-      await ipcRenderer.invoke('set-mistral-key', mistralKey);
-    } catch {
-      localStorage.setItem('mistralKey', mistralKey);
-    }
-
-    try {
-      await ipcRenderer.invoke('set-audio-model', audioModel);
-    } catch {
-      localStorage.setItem('audioModel', audioModel);
-    }
-    try {
-      await ipcRenderer.invoke('set-image-model', imageModel);
-    } catch {
-      localStorage.setItem('imageModel', imageModel);
-    }
-
-    try {
-      await ipcRenderer.invoke('set-audio-prompt', audioPrompt);
-    } catch {
-      localStorage.setItem('audioPrompt', audioPrompt);
-    }
-    try {
-      await ipcRenderer.invoke('set-image-prompt', imagePrompt);
-    } catch {
-      localStorage.setItem('imagePrompt', imagePrompt);
-    }
-
-    try {
-      await ipcRenderer.invoke('set-mistral-batch-preprocess-workers', mistralBatchPreprocessWorkers);
-    } catch {
-      localStorage.setItem('mistralBatchPreprocessWorkers', String(mistralBatchPreprocessWorkers));
-    }
-    try {
-      await ipcRenderer.invoke('set-mistral-batch-upload-workers', mistralBatchUploadWorkers);
-    } catch {
-      localStorage.setItem('mistralBatchUploadWorkers', String(mistralBatchUploadWorkers));
-    }
-
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2500);
-  };
-
-  const revertAudioPrompt = () => setAudioPrompt(DEFAULT_AUDIO_PROMPT);
-  const revertImagePrompt = () => setImagePrompt(DEFAULT_IMAGE_PROMPT);
-
-  const clearTempFiles = async () => {
-    setClearingTempFiles(true);
-    setTempFilesMessage('');
-    try {
-      const result = await ipcRenderer.invoke('clear-temp-files');
-      setTempFilesMessage(result.message);
-      setTimeout(() => setTempFilesMessage(''), 3000);
-    } catch (error: any) {
-      setTempFilesMessage(`Error: ${error.message}`);
-      setTimeout(() => setTempFilesMessage(''), 5000);
-    } finally {
-      setClearingTempFiles(false);
-    }
-  };
-  const apiKeyFields = [
-    {
-      id: 'gemini',
-      label: 'Gemini API Key',
-      placeholder: 'Enter your API key',
-      helper: 'Required for Gemini transcription and OCR models.',
-      value: key,
-      onChange: setKey
-    },
-    {
-      id: 'mistral',
-      label: 'Mistral API Key',
-      placeholder: 'Required for Mistral OCR and Voxtral audio',
-      helper: 'Required to use Mistral OCR and Voxtral audio transcription.',
-      value: mistralKey,
-      onChange: setMistralKey
-    }
-  ];
-
-  return (
-    <div className="settings-container" style={{ position: 'relative' }}>
-      <h2 style={{ flexShrink: 0 }}>Settings</h2>
-
-      <div className="settings-scroll">
-        <div className="settings-body">
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              gap: '0.75rem',
-              padding: '0.85rem 1rem',
-              borderRadius: 10,
-              background: 'rgba(255,255,255,0.04)',
-              border: '1px solid rgba(255,255,255,0.08)',
-              flexWrap: 'wrap'
-            }}
-          >
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <div style={{ fontWeight: 600 }}>Software Updates</div>
-              <div style={{ fontSize: '0.9rem', color: 'var(--text-light)' }}>
-                {checkingUpdate
-                  ? 'Checking for updates…'
-                  : latestVersion && currentVersion && latestVersion === currentVersion
-                  ? `You’re up to date on v${currentVersion}.`
-                  : latestVersion && currentVersion
-                  ? `New version v${latestVersion} available.`
-                  : currentVersion
-                  ? `Current v${currentVersion}`
-                  : 'Check for newer versions on GitHub releases.'}
-              </div>
-              {updateError && (
-                <div style={{ color: '#ff8a80', fontSize: '0.85rem' }}>{updateError}</div>
-              )}
-              {latestVersion && currentVersion && latestVersion !== currentVersion && (
-                <div style={{ color: '#6dd36d', fontSize: '0.9rem' }}>
-                  Download from the latest release to update.{' '}
-                  <a
-                    href="#"
-                    onClick={e => {
-                      e.preventDefault();
-                      onOpenUpdateInstructions();
-                    }}
-                    style={{ color: '#8dd3ff', textDecoration: 'underline' }}
-                  >
-                    View instructions on our page.
-                  </a>
-                </div>
-              )}
-            </div>
-            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
-              <button
-                className="btn"
-                onClick={onCheckLatest}
-                disabled={checkingUpdate}
-                style={{ display: 'flex', alignItems: 'center', gap: 8 }}
-                title="Check GitHub for the latest release"
-              >
-                {checkingUpdate ? <FaSpinner className="spin" /> : 'Check'}
-              </button>
-              {latestVersion && currentVersion && latestVersion !== currentVersion && (
-                <button
-                  className="btn save"
-                  onClick={onOpenUpdatePage}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    border: '2px solid #4caf50'
-                  }}
-                  title="Open the latest release page on GitHub"
-                >
-                  New version available
-                </button>
-              )}
-            </div>
-          </div>
-
-          <div className="api-key-section">
-            <button
-              type="button"
-              className="api-key-toggle"
-              onClick={() => setShowApiKeys(prev => !prev)}
-              aria-expanded={showApiKeys}
-              aria-controls="api-keys-panel"
-            >
-              <div className="api-key-toggle-text">
-                <span>Manage API Keys</span>
-                <small>{showApiKeys ? 'Hide sensitive values' : 'Click to reveal & edit keys'}</small>
-              </div>
-              {showApiKeys ? <FaChevronUp /> : <FaChevronDown />}
-            </button>
-            {showApiKeys && (
-              <div id="api-keys-panel" className="api-key-panel">
-                <div className="api-key-list">
-                  {apiKeyFields.map(field => (
-                    <div key={field.id} className="api-key-item">
-                      <label htmlFor={`${field.id}-api-key`}>{field.label}</label>
-                      <input
-                        id={`${field.id}-api-key`}
-                        type="password"
-                        value={field.value}
-                        placeholder={field.placeholder}
-                        onChange={e => field.onChange(e.target.value)}
-                      />
-                      {field.helper && <small className="api-key-helper">{field.helper}</small>}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-
-        <div
-          className="model-prompt-row"
-          style={{
-            display: 'flex',
-            gap: '2rem',
-            flexWrap: 'wrap',
-            alignItems: 'flex-start',
-            width: '100%',
-            marginTop: '1rem',
-          }}
-        >
-          {/* Audio */}
-          <div
-            className="model-with-prompt"
-            style={{ flex: '1 1 0', minWidth: 320, display: 'flex', flexDirection: 'column', gap: 12 }}
-          >
-            <div className="model-group">
-              <label htmlFor="audio-model">Audio Model</label>
-              <div className="model-select">
-                <select
-                  id="audio-model"
-                  className="model-select-input"
-                  value={audioModel}
-                  onChange={e => setAudioModel(e.target.value)}
-                >
-                  {AUDIO_MODEL_OPTIONS.map(option => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-                <FaChevronDown className="model-select-caret" aria-hidden="true" />
-              </div>
-            </div>
-            <div className="prompt-group">
-              <div
-                className="prompt-header"
-                style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <label htmlFor="audio-prompt" style={{ margin: 0 }}>
-                    Audio Prompt
-                  </label>
-                  <InfoTooltip text="Editing this changes the instructions sent to the model for transcription. Click the revert icon to restore the recommended default prompt." />
-                </div>
-                <button
-                  type="button"
-                  className="revert-btn"
-                  onClick={revertAudioPrompt}
-                  aria-label="Revert to default prompt"
-                  style={{
-                    background: 'rgba(0,0,0,0.6)',
-                    border: 'none',
-                    padding: '10px',
-                    borderRadius: 8,
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                  }}
-                >
-                  <FaUndo size={18} />
-                </button>
-              </div>
-              <textarea
-                id="audio-prompt"
-                value={audioPrompt}
-                onChange={e => setAudioPrompt(e.target.value)}
-                style={{ resize: 'none' }}
-              />
-            </div>
-          </div>
-
-          {/* Image */}
-          <div
-            className="model-with-prompt"
-            style={{ flex: '1 1 0', minWidth: 320, display: 'flex', flexDirection: 'column', gap: 12 }}
-          >
-            <div className="model-group">
-              <label htmlFor="image-model">Image Model</label>
-              <div className="model-select">
-                <select
-                  id="image-model"
-                  className="model-select-input"
-                  value={imageModel}
-                  onChange={e => setImageModel(e.target.value)}
-                >
-                  {IMAGE_MODEL_OPTIONS.map(option => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-                <FaChevronDown className="model-select-caret" aria-hidden="true" />
-              </div>
-            </div>
-            <div className="prompt-group">
-              <div
-                className="prompt-header"
-                style={{ justifyContent: 'space-between', alignItems: 'flex-start' }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <label htmlFor="image-prompt" style={{ margin: 0 }}>
-                    Image Prompt
-                  </label>
-                  <InfoTooltip text="Editing this changes the instructions sent to the model for transcription. Click the revert icon to restore the recommended default prompt." />
-                </div>
-                <button
-                  type="button"
-                  className="revert-btn"
-                  onClick={revertImagePrompt}
-                  aria-label="Revert to default prompt"
-                  style={{
-                    background: 'rgba(0,0,0,0.6)',
-                    border: 'none',
-                    padding: '10px',
-                    borderRadius: 8,
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                  }}
-                >
-                  <FaUndo size={18} />
-                </button>
-              </div>
-              <textarea
-                id="image-prompt"
-                value={imagePrompt}
-                onChange={e => setImagePrompt(e.target.value)}
-                style={{ resize: 'none' }}
-              />
-            </div>
-          </div>
-        </div>
-
-        <div
-          className="clear-temp-section"
-          style={{ marginTop: '1.5rem', padding: '1rem', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderRadius: '8px' }}
-        >
-          <div style={{ marginBottom: '0.9rem' }}>
-            <h3 style={{ margin: '0 0 0.25rem 0', fontSize: '1rem', fontWeight: '500' }}>Image Workers</h3>
-            <p style={{ margin: 0, fontSize: '0.875rem', opacity: 0.8 }}>
-              Control how many files preprocess and send OCR requests in parallel for Mistral batch, regular Mistral, and Gemini image runs.
-            </p>
-          </div>
-          <div
-            style={{
-              display: 'grid',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
-              gap: '1rem'
-            }}
-          >
-            <div className="model-group" style={{ marginBottom: 0 }}>
-              <label htmlFor="mistral-batch-preprocess-workers">Preprocess Workers</label>
-              <div
-                className="batch-size-controls"
-                role="group"
-                aria-labelledby="mistral-batch-preprocess-workers"
-                style={{ width: 'fit-content' }}
-              >
-                <div className="batch-size-main">
-                  <button
-                    type="button"
-                    className="batch-step-btn"
-                    onClick={() => setMistralBatchPreprocessWorkers(getPrevWorkerCount(mistralBatchPreprocessWorkers))}
-                    disabled={mistralBatchPreprocessWorkers <= MIN_MISTRAL_BATCH_WORKERS}
-                    aria-label="Decrease preprocess workers"
-                  >
-                    −
-                  </button>
-                  <span className="batch-size-current" aria-live="polite">{mistralBatchPreprocessWorkers}</span>
-                  <button
-                    type="button"
-                    className="batch-step-btn"
-                    onClick={() => setMistralBatchPreprocessWorkers(getNextWorkerCount(mistralBatchPreprocessWorkers))}
-                    disabled={mistralBatchPreprocessWorkers >= MAX_MISTRAL_BATCH_WORKERS}
-                    aria-label="Increase preprocess workers"
-                  >
-                    +
-                  </button>
-                </div>
-              </div>
-              <small style={{ display: 'block', marginTop: 6, opacity: 0.75 }}>
-                Controls JP2/TIFF conversion and image resize work before each OCR request.
-              </small>
-            </div>
-            <div className="model-group" style={{ marginBottom: 0 }}>
-              <label htmlFor="mistral-batch-upload-workers">Upload / Request Workers</label>
-              <div
-                className="batch-size-controls"
-                role="group"
-                aria-labelledby="mistral-batch-upload-workers"
-                style={{ width: 'fit-content' }}
-              >
-                <div className="batch-size-main">
-                  <button
-                    type="button"
-                    className="batch-step-btn"
-                    onClick={() => setMistralBatchUploadWorkers(getPrevWorkerCount(mistralBatchUploadWorkers))}
-                    disabled={mistralBatchUploadWorkers <= MIN_MISTRAL_BATCH_WORKERS}
-                    aria-label="Decrease upload workers"
-                  >
-                    −
-                  </button>
-                  <span className="batch-size-current" aria-live="polite">{mistralBatchUploadWorkers}</span>
-                  <button
-                    type="button"
-                    className="batch-step-btn"
-                    onClick={() => setMistralBatchUploadWorkers(getNextWorkerCount(mistralBatchUploadWorkers))}
-                    disabled={mistralBatchUploadWorkers >= MAX_MISTRAL_BATCH_WORKERS}
-                    aria-label="Increase upload workers"
-                  >
-                    +
-                  </button>
-                </div>
-              </div>
-              <small style={{ display: 'block', marginTop: 6, opacity: 0.75 }}>
-                Higher values are faster, but can increase socket resets, API throttling, or request failures.
-              </small>
-            </div>
-          </div>
-        </div>
-
-        {/* Clear Temp Files Section */}
-        <div className="clear-temp-section" style={{ marginTop: '1.5rem', padding: '1rem', backgroundColor: 'rgba(255, 255, 255, 0.05)', borderRadius: '8px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
-            <div>
-              <h3 style={{ margin: '0 0 0.25rem 0', fontSize: '1rem', fontWeight: '500' }}>Temporary Files</h3>
-              <p style={{ margin: 0, fontSize: '0.875rem', opacity: 0.8 }}>Clear temporary image files created during processing</p>
-            </div>
-            <button
-              type="button"
-              className="btn"
-              onClick={clearTempFiles}
-              disabled={clearingTempFiles}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '0.5rem',
-                backgroundColor: '#dc3545',
-                border: 'none',
-                color: 'white',
-                padding: '0.5rem 1rem',
-                borderRadius: '6px',
-                fontSize: '0.875rem',
-                cursor: clearingTempFiles ? 'not-allowed' : 'pointer',
-                opacity: clearingTempFiles ? 0.6 : 1
-              }}
-            >
-              {clearingTempFiles ? (
-                <>
-                  <FaSpinner className="spin" />
-                  Clearing...
-                </>
-              ) : (
-                <>
-                  <FaTrash />
-                  Clear Temp Files
-                </>
-              )}
-            </button>
-          </div>
-          {tempFilesMessage && (
-            <div style={{
-              marginTop: '0.5rem',
-              padding: '0.5rem',
-              borderRadius: '4px',
-              fontSize: '0.875rem',
-              backgroundColor: tempFilesMessage.includes('Error') ? 'rgba(220, 53, 69, 0.1)' : 'rgba(40, 167, 69, 0.1)',
-              color: tempFilesMessage.includes('Error') ? '#dc3545' : '#28a745',
-              border: `1px solid ${tempFilesMessage.includes('Error') ? 'rgba(220, 53, 69, 0.3)' : 'rgba(40, 167, 69, 0.3)'}`
-            }}>
-              {tempFilesMessage}
-            </div>
-          )}
-        </div>
-      </div> {/* end settings-body */}
-      </div> {/* end settings-scroll */}
-
-      {/* buttons + saved feedback */}
-      <div className="settings-buttons" style={{ flexWrap: 'nowrap' }}>
-        {/* Saved badge positioned above without affecting layout */}
-        {saved && (
-          <div
-            style={{
-              position: 'absolute',
-              top: -24,
-              left: '50%',
-              transform: 'translateX(-50%)',
-              color: '#6dd36d',
-              fontWeight: 500,
-              fontSize: '0.95rem',
-              whiteSpace: 'nowrap',
-            }}
-          >
-            Saved!
-          </div>
-        )}
-
-        <button className="btn cancel" onClick={() => window.close()}>
-          Cancel
-        </button>
-        <button className="btn save" onClick={save}>
-          Save
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function sortTranscripts(list: Transcript[]): Transcript[] {
-  return [...list].sort((a, b) =>
-    a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
-  );
-}
-
-function sourceBaseNameForTranscript(transcriptName: string): string {
-  const lowerName = transcriptName.toLowerCase();
-  if (lowerName.endsWith('.txt') || lowerName.endsWith('.srt')) {
-    return transcriptName.replace(/\.(txt|srt)$/i, '');
-  }
-  if (
-    lowerName.startsWith(ACCESSIBLE_PDF_PREFIX.toLowerCase())
-    && (lowerName.endsWith('.pdf') || lowerName.endsWith('.html'))
-  ) {
-    return transcriptName.slice(ACCESSIBLE_PDF_PREFIX.length, lowerName.endsWith('.html') ? -5 : -4);
-  }
-  if (lowerName.endsWith('.pdf') || lowerName.endsWith('.html')) {
-    return transcriptName.slice(0, lowerName.endsWith('.html') ? -5 : -4);
-  }
-  return transcriptName;
-}
-
-function resolveSourceFileForTranscript(
-  transcript: Transcript,
-  imageInputPath: string,
-  imageOutputDir: string
-): string | null {
-  if (!imageInputPath) return null;
-  const sourceBaseName = sourceBaseNameForTranscript(transcript.name);
-  if (!sourceBaseName) return null;
-
-  try {
-    if (fs.statSync(imageInputPath).isFile()) {
-      const inputBaseName = pathModule.basename(imageInputPath, pathModule.extname(imageInputPath));
-      return inputBaseName === sourceBaseName ? imageInputPath : null;
-    }
-  } catch {
-    return null;
-  }
-
-  const candidateDirs: string[] = [];
-  if (imageOutputDir && transcript.path) {
-    const relativePath = pathModule.relative(imageOutputDir, transcript.path);
-    if (relativePath && !relativePath.startsWith('..') && !pathModule.isAbsolute(relativePath)) {
-      const relativeDir = pathModule.dirname(relativePath);
-      if (relativeDir && relativeDir !== '.') {
-        candidateDirs.push(pathModule.join(imageInputPath, relativeDir));
-      }
-    }
-  }
-  candidateDirs.push(imageInputPath);
-
-  for (const baseDir of candidateDirs) {
-    for (const ext of IMAGE_EXTS) {
-      const candidate = pathModule.join(baseDir, `${sourceBaseName}${ext}`);
-      if (fs.existsSync(candidate)) return candidate;
-    }
-  }
-
-  return null;
-}
-
-function ensureUniquePath(destDir: string, baseName: string): string {
-  const ext = pathModule.extname(baseName);
-  const stem = ext ? baseName.slice(0, -ext.length) : baseName;
-  let candidate = pathModule.join(destDir, baseName);
-  let counter = 1;
-  while (fs.existsSync(candidate)) {
-    const nextName = `${stem}_${counter}${ext}`;
-    candidate = pathModule.join(destDir, nextName);
-    counter += 1;
-  }
-  return candidate;
-}
-
-function splitTranscriptNameForMiddleEllipsis(name: string): { start: string; end: string } {
-  if (!name) return { start: '', end: '' };
-  const ext = pathModule.extname(name);
-  const minTail = ext && ext.length < name.length ? ext.length : 0;
-  const desiredTail = Math.min(
-    28,
-    Math.max(minTail + 10, 16),
-    Math.max(name.length - 1, 1)
-  );
-  if (name.length <= desiredTail + 8) {
-    return { start: name, end: '' };
-  }
-  return {
-    start: name.slice(0, name.length - desiredTail),
-    end: name.slice(name.length - desiredTail)
-  };
-}
-
-const HTML_ENTITY_DECODERS: Array<{
-  entity: string;
-  pattern: RegExp;
-  replacement: string;
-}> = [
-  { entity: '&amp;', pattern: /&amp;/gi, replacement: '&' },
-  { entity: '&quot;', pattern: /&quot;/gi, replacement: '"' },
-  { entity: '&#39;', pattern: /&#39;/g, replacement: "'" },
-  { entity: '&lt;', pattern: /&lt;/gi, replacement: '<' },
-  { entity: '&gt;', pattern: /&gt;/gi, replacement: '>' },
-  { entity: '&nbsp;', pattern: /&nbsp;/gi, replacement: ' ' }
-];
-
-function decodeKnownHtmlEntities(content: string): {
-  decoded: string;
-  total: number;
-  counts: Record<string, number>;
-} {
-  let decoded = content;
-  let total = 0;
-  const counts: Record<string, number> = {};
-  for (const descriptor of HTML_ENTITY_DECODERS) {
-    const matches = decoded.match(descriptor.pattern);
-    const count = matches ? matches.length : 0;
-    if (count > 0) {
-      decoded = decoded.replace(descriptor.pattern, descriptor.replacement);
-      counts[descriptor.entity] = count;
-      total += count;
-    }
-  }
-  return { decoded, total, counts };
-}
-
-function formatPenaltyPercent(value: number): string {
-  return `${(Math.max(0, value) * 100).toFixed(1)}%`;
-}
-
-function buildConfidenceTitle(entry: QualityEntry, display: string): string {
-  if (!entry.scoreBreakdown) {
-    return `Confidence ${display}%`;
-  }
-  const breakdown = entry.scoreBreakdown;
-  return [
-    `Confidence ${display}%`,
-    'Penalty breakdown:',
-    `Placeholder: ${formatPenaltyPercent(breakdown.placeholderPenalty)}`,
-    `Repetition: ${formatPenaltyPercent(breakdown.repetitionPenalty)}`,
-    `Wrapper: ${formatPenaltyPercent(breakdown.wrapperPenalty)}`,
-    `Markdown: ${formatPenaltyPercent(breakdown.markdownPenalty)}`,
-    `Encoded entities: ${formatPenaltyPercent(breakdown.encodedEntityPenalty)}`,
-    `AI boilerplate: ${formatPenaltyPercent(breakdown.aiPenalty)}`,
-    `Rare tokens: ${formatPenaltyPercent(breakdown.rareTokenPenalty)}`,
-    `SRT timestamps: ${formatPenaltyPercent(breakdown.srtTimestampPenalty)}`,
-    `Total: ${formatPenaltyPercent(breakdown.totalPenalty)}`
-  ].join('\n');
-}
-
-type RemediationActions = {
-  clearIntro: boolean;
-  clearOutro: boolean;
-  clearMarkdown: boolean;
-  clearEntities: boolean;
-};
-
-function getRemediationActions(entry: ScanResultEntry): RemediationActions {
-  return {
-    clearIntro: Boolean(entry.remove_intro_text),
-    clearOutro: Boolean(entry.remove_outro_text),
-    clearMarkdown: Boolean(entry.markdown_artifacts && entry.markdown_artifacts.length),
-    clearEntities: Number(entry.html_entity_count ?? entry.html_amp_count ?? 0) > 0
-  };
-}
-
-function hasRemediationActions(actions: RemediationActions): boolean {
-  return (
-    actions.clearIntro ||
-    actions.clearOutro ||
-    actions.clearMarkdown ||
-    actions.clearEntities
-  );
-}
-
-function getIssueCodesToClear(actions: RemediationActions): Set<QualityIssueCode> {
-  const codes = new Set<QualityIssueCode>();
-  if (actions.clearIntro) codes.add('intro_chatter');
-  if (actions.clearOutro) codes.add('outro_chatter');
-  if (actions.clearMarkdown) {
-    codes.add('markdown_image');
-    codes.add('markdown_link');
-    codes.add('markdown_code');
-  }
-  if (actions.clearEntities) {
-    codes.add('encoded_html_entities');
-  }
-  return codes;
-}
-
-function isScanEntryRemediable(entry: ScanResultEntry): boolean {
-  return hasRemediationActions(getRemediationActions(entry));
-}
-
-function BatchQueueView() {
-  const [rows, setRows] = useState<MistralBatchQueueRow[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [selectedKey, setSelectedKey] = useState('');
-
-  const loadRows = useCallback(async (showLoading = false) => {
-    if (showLoading) setLoading(true);
-    try {
-      const queue = await ipcRenderer.invoke('get-mistral-batch-queue') as MistralBatchQueueRow[];
-      setRows(Array.isArray(queue) ? queue : []);
-      setError('');
-    } catch (err: any) {
-      setRows([]);
-      setError(err?.message || 'Failed to load batch queue.');
-    } finally {
-      if (showLoading) setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadRows(true);
-    const onFocus = () => {
-      void loadRows(false);
-    };
-    const intervalId = window.setInterval(() => {
-      void loadRows(false);
-    }, 5000);
-    window.addEventListener('focus', onFocus);
-    return () => {
-      window.clearInterval(intervalId);
-      window.removeEventListener('focus', onFocus);
-    };
-  }, [loadRows]);
-
-  const selectFolder = useCallback(
-    async (row: MistralBatchQueueRow) => {
-      const key = `${row.inputPath}::${row.outputDir}`;
-      setSelectedKey(key);
-      setError('');
-      try {
-        const result = await ipcRenderer.invoke('select-mistral-batch-folder', {
-          inputPath: row.inputPath,
-          outputDir: row.outputDir
-        }) as { ok?: boolean; error?: string };
-        if (!result?.ok) {
-          setError(result?.error || 'Failed to select queue item.');
-          return;
-        }
-        window.close();
-      } catch (err: any) {
-        setError(err?.message || 'Failed to select queue item.');
-      } finally {
-        setSelectedKey('');
-      }
-    },
-    []
-  );
-
-  const formatTime = (timestampMs: number | null) => {
-    if (!timestampMs) return '—';
-    return new Date(timestampMs).toLocaleString();
-  };
-
-  const summary = useMemo(() => {
-    return rows.reduce(
-      (acc, row) => {
-        acc.uploaded += row.uploaded;
-        acc.processing += row.processing;
-        acc.completed += row.completed;
-        acc.failed += row.failed;
-        return acc;
-      },
-      { uploaded: 0, processing: 0, completed: 0, failed: 0 }
-    );
-  }, [rows]);
-
-  return (
-    <div className="settings-container batch-queue-page">
-      <h2 className="batch-queue-title">Mistral Batch Queue</h2>
-      <div className="settings-scroll">
-        {!!rows.length && (
-          <div className="batch-queue-summary">
-            <div className="batch-queue-summary-card">
-              <span>Collections</span>
-              <strong>{rows.length}</strong>
-            </div>
-            <div className="batch-queue-summary-card">
-              <span>Uploaded</span>
-              <strong>{summary.uploaded}</strong>
-            </div>
-            <div className="batch-queue-summary-card">
-              <span>Processing</span>
-              <strong>{summary.processing}</strong>
-            </div>
-            <div className="batch-queue-summary-card">
-              <span>Completed</span>
-              <strong>{summary.completed}</strong>
-            </div>
-          </div>
-        )}
-
-        {error && <div className="batch-queue-error">{error}</div>}
-
-        {!rows.length && !loading && (
-          <div className="batch-queue-empty">
-            No saved batch folders.
-          </div>
-        )}
-
-        <div className="batch-queue-list">
-          {rows.map(row => {
-            const key = `${row.inputPath}::${row.outputDir}`;
-            const selecting = selectedKey === key;
-            return (
-              <button
-                key={key}
-                type="button"
-                onClick={() => selectFolder(row)}
-                disabled={selecting}
-                className="batch-queue-item"
-                title="Load this folder pair in Image mode"
-              >
-                <div className="batch-queue-item-top">
-                  <span className="batch-queue-model">{row.modelName}</span>
-                  <span className="batch-queue-open-hint">
-                    {selecting ? 'Opening…' : 'Click to open'}
-                  </span>
-                </div>
-                <div className="batch-queue-path-row">
-                  <span>Input</span>
-                  <code>{row.inputPath}</code>
-                </div>
-                <div className="batch-queue-path-row">
-                  <span>Output</span>
-                  <code>{row.outputDir}</code>
-                </div>
-                <div className="batch-queue-pill-row">
-                  <span className="batch-queue-pill uploaded">{`Uploaded ${row.uploaded}`}</span>
-                  <span className="batch-queue-pill processing">{`Processing ${row.processing}`}</span>
-                  <span className="batch-queue-pill completed">{`Completed ${row.completed}`}</span>
-                  {row.failed > 0 && <span className="batch-queue-pill failed">{`Failed ${row.failed}`}</span>}
-                </div>
-                <div className="batch-queue-times">
-                  <div>
-                    <span>Oldest start</span>
-                    <strong>{formatTime(row.oldestPendingStartMs)}</strong>
-                  </div>
-                  <div>
-                    <span>Check back</span>
-                    <strong>{formatTime(row.checkBackAtMs)}</strong>
-                  </div>
-                </div>
-              </button>
-            );
-          })}
-        </div>
-
-        {!!rows.length && summary.failed > 0 && (
-          <div className="batch-queue-footnote">
-            Failed jobs remain in the queue until retried or cleared from temp files.
-          </div>
-        )}
-      </div>
-      <div className="settings-buttons batch-queue-actions">
-        <div className="batch-queue-help-tooltip">
-          <button
-            type="button"
-            className="batch-queue-help-trigger"
-            aria-label="Why are my batches taking so long to process?"
-          >
-            <FaInfoCircle size={13} />
-            <span>Why are my batches taking so long to process?</span>
-          </button>
-          <div className="batch-queue-help-box" role="tooltip">
-            Batch processing is designed for non-urgent work and runs when servers have spare capacity. Batches typically complete in around 2 hours, but can take up to 24 hours. In the meantime, you can work on another image collection and check back later.
-          </div>
-        </div>
-        <button className="btn cancel" onClick={() => window.close()}>
-          Close
-        </button>
-      </div>
-    </div>
-  );
-}
+import { ipcRenderer, fs, os, path as pathModule } from './electron';
+import {
+  DISPLAY_LOG_MAX_BYTES,
+  LIVE_LOG_REFRESH_INTERVAL_MS,
+  LIVE_TRANSCRIPT_REFRESH_INTERVAL_MS,
+  LIVE_BATCH_UI_REFRESH_INTERVAL_MS,
+  TOAST_DURATION_MS,
+  LOG_SCROLL_DELAY_MS,
+  UPDATE_CHECK_TIMEOUT_MS,
+  SIDEBAR_DEFAULT_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+  ROUTE_SETTINGS,
+  ROUTE_BATCH_QUEUE,
+  IMAGE_MODEL_OPTIONS,
+  DEFAULT_IMAGE_MODEL,
+  AUDIO_MODEL_OPTIONS,
+  DEFAULT_AUDIO_MODEL,
+  IMAGE_EXTS,
+  AUDIO_EXTS
+} from './lib/constants';
+import { resolveSupportedModel } from './lib/models';
+import { getErrorMessage, isCancellation } from './lib/errors';
+import {
+  normalizeLocalPath,
+  resolveImageInputPathKind,
+  sortTranscripts,
+  transcriptListsEqual,
+  resolveSourceFileForTranscript,
+  ensureUniquePath,
+  loadOcrReviewData,
+  ocrReviewSidecarPathForTranscript,
+  loadMistralQualityEntry,
+  srtPathForTranscript,
+  txtPathForTranscript,
+  loadAudioReviewSegments
+} from './lib/paths';
+import { loadReviewStatus, saveReviewStatus } from './lib/reviewStatus';
+import {
+  toQualityEntry,
+  removeWrappersFromContent,
+  stripMarkdownArtifacts,
+  decodeKnownHtmlEntities,
+  getRemediationActions,
+  hasRemediationActions,
+  getIssueCodesToClear,
+  isScanEntryRemediable,
+  type QualityEntry,
+  type ScanResultEntry,
+  type SortOption
+} from './lib/quality';
+import type { AudioReviewData, BatchCostEstimateData, MistralBatchStats, MistralBatchQueueRow, OcrReviewData, PathPickerTarget } from './lib/types';
 
 export default function App() {
-  const isSettings = window.location.hash === '#/settings';
-  const isBatchQueue = window.location.hash === '#/batch-queue';
+  const isSettings = window.location.hash === ROUTE_SETTINGS;
+  const isBatchQueue = window.location.hash === ROUTE_BATCH_QUEUE;
   const readStoredBoolean = (key: string, fallback: boolean = false): boolean => {
     try {
       const raw = localStorage.getItem(key);
       if (raw === 'true') return true;
       if (raw === 'false') return false;
     } catch {
+      /* localStorage unavailable; fall through to default */
     }
     return fallback;
   };
 
-  const [sidebarWidth, setSidebarWidth] = useState(240);
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_DEFAULT_WIDTH);
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
+  const logsBodyRef = useRef<HTMLPreElement>(null);
 
-  const [mode, setMode] = useState<'audio' | 'image'>('audio');
+  const [mode, setMode] = useIpcPersistedState<'audio' | 'image'>({
+    getChannel: 'get-active-mode',
+    setChannel: 'set-active-mode',
+    storageKey: 'activeMode',
+    initial: 'audio',
+    parse: raw => (raw === 'audio' || raw === 'image' ? raw : undefined)
+  });
 
   const [audioInputPath, setAudioInputPath] = useState('');
   const [audioOutputDir, setAudioOutputDir] = useState('');
   const [audioTranscripts, setAudioTranscripts] = useState<Transcript[]>([]);
+  const [audioModelName, setAudioModelName] = useState<string>(() =>
+    resolveSupportedModel(localStorage.getItem('audioModel'), AUDIO_MODEL_OPTIONS, DEFAULT_AUDIO_MODEL)
+  );
+  const [audioBatchSize, setAudioBatchSize] = useState<number>(25);
+  const [audioBatchEnabled, setAudioBatchEnabled] = useIpcPersistedState<boolean>({
+    getChannel: 'get-mistral-audio-batch-enabled',
+    setChannel: 'set-mistral-audio-batch-enabled',
+    storageKey: 'mistralAudioBatchEnabled',
+    initial: readStoredBoolean('mistralAudioBatchEnabled'),
+    parse: raw =>
+      typeof raw === 'boolean' ? raw : raw === 'true' ? true : raw === 'false' ? false : undefined
+  });
+  const [audioBatchStats, setAudioBatchStats] = useState<MistralBatchStats | null>(null);
+  const [audioBatchCostEstimate, setAudioBatchCostEstimate] = useState<BatchCostEstimateData | null>(null);
+  const [imageBatchCostEstimate, setImageBatchCostEstimate] = useState<BatchCostEstimateData | null>(null);
 
   const [imageModelName, setImageModelName] = useState<string>(() =>
     resolveSupportedModel(localStorage.getItem('imageModel'), IMAGE_MODEL_OPTIONS, DEFAULT_IMAGE_MODEL)
@@ -1428,9 +124,14 @@ export default function App() {
   const [imageOutputDir, setImageOutputDir] = useState('');
   const [imageTranscripts, setImageTranscripts] = useState<Transcript[]>([]);
   const [imageBatchSize, setImageBatchSize] = useState<number>(50);
-  const [imageBatchEnabled, setImageBatchEnabled] = useState<boolean>(() =>
-    readStoredBoolean('mistralBatchEnabled')
-  );
+  const [imageBatchEnabled, setImageBatchEnabled] = useIpcPersistedState<boolean>({
+    getChannel: 'get-mistral-batch-enabled',
+    setChannel: 'set-mistral-batch-enabled',
+    storageKey: 'mistralBatchEnabled',
+    initial: readStoredBoolean('mistralBatchEnabled'),
+    parse: raw =>
+      typeof raw === 'boolean' ? raw : raw === 'true' ? true : raw === 'false' ? false : undefined
+  });
   const [mistralOutputPdf, setMistralOutputPdf] = useState(false);
   const [mistralBatchStats, setMistralBatchStats] = useState<MistralBatchStats | null>(null);
   const [mistralQueueCollectionCount, setMistralQueueCollectionCount] = useState(0);
@@ -1447,6 +148,15 @@ export default function App() {
   const [logs, setLogs] = useState('');
   const [status, setStatus] = useState('');
   const [toast, setToast] = useState<string | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast(null);
+      toastTimerRef.current = null;
+    }, TOAST_DURATION_MS);
+  }, []);
   const [showLogs, setShowLogs] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [contextMenu, setContextMenu] = useState<{
@@ -1455,15 +165,31 @@ export default function App() {
     transcript: Transcript;
   } | null>(null);
   const [pathPicker, setPathPicker] = useState<PathPickerTarget | null>(null);
+  const [ocrReview, setOcrReview] = useState<{ txtPath: string; data: OcrReviewData } | null>(null);
+  const [audioReview, setAudioReview] = useState<{ txtPath: string; srtPath: string; data: AudioReviewData } | null>(null);
+  const [showBatchFindReplace, setShowBatchFindReplace] = useState(false);
   const [fileTypeFilter, setFileTypeFilter] = useState<'all' | 'transcript' | 'subtitle' | 'pdf'>('all');
   const [issueFilter, setIssueFilter] = useState<'all' | 'clean' | 'issues'>('all');
+  const [reviewStatusFilter, setReviewStatusFilter] = useState<'all' | 'unreviewed' | 'reviewed'>('all');
+  const [reviewedStatus, setReviewedStatus] = useState<Record<string, boolean>>({});
   const [sortOption, setSortOption] = useState<SortOption>('name-asc');
   const [showFilters, setShowFilters] = useState(false);
-  const [folderFavorites, setFolderFavorites] = useState<string[]>([]);
-  const favoritesLoadedRef = useRef(false);
-  const mistralBatchSettingLoadedRef = useRef(false);
+  const [folderFavorites, setFolderFavorites] = useIpcPersistedState<string[]>({
+    getChannel: 'get-folder-favorites',
+    setChannel: 'set-folder-favorites',
+    storageKey: 'folderFavorites',
+    initial: [],
+    serialize: JSON.stringify,
+    parse: raw => {
+      try {
+        const v = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        return Array.isArray(v) ? v : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+  });
   const pathsLoadedRef = useRef(false);
-  const modeLoadedRef = useRef(false);
   const [currentVersion, setCurrentVersion] = useState('');
   const [latestVersion, setLatestVersion] = useState('');
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -1489,30 +215,127 @@ export default function App() {
     () => imageModelName.trim().toLowerCase().includes('mistral'),
     [imageModelName]
   );
+  // Mistral OCR supplies real per-file confidence (see displayScores), so the
+  // heuristic scan and its remediation actions are hidden in that mode.
+  const hideHeuristicQualityTools = mode === 'image' && isMistralImageModel;
   const normalizedImageInputPath = useMemo(
     () => normalizeLocalPath(imageInputPath),
     [imageInputPath]
   );
-  const imageInputIsDirectory = useMemo(() => {
-    return resolveImageInputPathKind(normalizedImageInputPath) === 'directory';
+  const [imageInputIsDirectory, setImageInputIsDirectory] = useState(false);
+  useEffect(() => {
+    if (!normalizedImageInputPath) {
+      setImageInputIsDirectory(false);
+      return;
+    }
+    // Debounce so we don't hit the filesystem on every keystroke while typing a path.
+    const handle = setTimeout(() => {
+      setImageInputIsDirectory(resolveImageInputPathKind(normalizedImageInputPath) === 'directory');
+    }, 150);
+    return () => clearTimeout(handle);
   }, [normalizedImageInputPath]);
+  useEffect(() => {
+    if (!imageInputIsDirectory || !isMistralImageModel || !imageBatchEnabled) {
+      setImageBatchCostEstimate(null);
+      return;
+    }
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      try {
+        const estimate = await ipcRenderer.invoke('estimate-batch-cost', {
+          mode: 'image',
+          inputPath: imageInputPath
+        }) as BatchCostEstimateData | null;
+        if (!cancelled) setImageBatchCostEstimate(estimate);
+      } catch {
+        if (!cancelled) setImageBatchCostEstimate(null);
+      }
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [imageInputPath, imageInputIsDirectory, isMistralImageModel, imageBatchEnabled]);
+
   const effectiveImageBatchEnabled = isMistralImageModel && imageInputIsDirectory && imageBatchEnabled;
+  const mistralBatchStatsRequestIdRef = useRef(0);
   const refreshMistralBatchStats = useCallback(async () => {
     if (!imageInputPath || !imageInputIsDirectory || !isMistralImageModel) {
       setMistralBatchStats(null);
       return;
     }
+    const requestId = ++mistralBatchStatsRequestIdRef.current;
     try {
       const stats = await ipcRenderer.invoke('get-mistral-batch-stats', {
         inputPath: imageInputPath,
         outputDir: imageOutputDir || undefined,
         modelName: imageModelName
       }) as MistralBatchStats;
-      setMistralBatchStats(stats);
+      if (mistralBatchStatsRequestIdRef.current === requestId) setMistralBatchStats(stats);
     } catch {
-      setMistralBatchStats(null);
+      if (mistralBatchStatsRequestIdRef.current === requestId) setMistralBatchStats(null);
     }
   }, [imageInputPath, imageInputIsDirectory, imageOutputDir, imageModelName, isMistralImageModel]);
+  const isMistralAudioModel = useMemo(
+    () => audioModelName.trim().toLowerCase().includes('voxtral'),
+    [audioModelName]
+  );
+  const normalizedAudioInputPath = useMemo(
+    () => normalizeLocalPath(audioInputPath),
+    [audioInputPath]
+  );
+  const [audioInputIsDirectory, setAudioInputIsDirectory] = useState(false);
+  useEffect(() => {
+    if (!normalizedAudioInputPath) {
+      setAudioInputIsDirectory(false);
+      return;
+    }
+    const handle = setTimeout(() => {
+      setAudioInputIsDirectory(resolveImageInputPathKind(normalizedAudioInputPath) === 'directory');
+    }, 150);
+    return () => clearTimeout(handle);
+  }, [normalizedAudioInputPath]);
+  const effectiveAudioBatchEnabled = isMistralAudioModel && audioInputIsDirectory && audioBatchEnabled;
+  useEffect(() => {
+    if (!audioInputIsDirectory || !isMistralAudioModel || !audioBatchEnabled) {
+      setAudioBatchCostEstimate(null);
+      return;
+    }
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      try {
+        const estimate = await ipcRenderer.invoke('estimate-batch-cost', {
+          mode: 'audio',
+          inputPath: audioInputPath
+        }) as BatchCostEstimateData | null;
+        if (!cancelled) setAudioBatchCostEstimate(estimate);
+      } catch {
+        if (!cancelled) setAudioBatchCostEstimate(null);
+      }
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [audioInputPath, audioInputIsDirectory, isMistralAudioModel, audioBatchEnabled]);
+  const audioBatchStatsRequestIdRef = useRef(0);
+  const refreshAudioBatchStats = useCallback(async () => {
+    if (!audioInputPath || !audioInputIsDirectory || !isMistralAudioModel) {
+      setAudioBatchStats(null);
+      return;
+    }
+    const requestId = ++audioBatchStatsRequestIdRef.current;
+    try {
+      const stats = await ipcRenderer.invoke('get-mistral-batch-stats', {
+        inputPath: audioInputPath,
+        outputDir: audioOutputDir || undefined,
+        modelName: audioModelName
+      }) as MistralBatchStats;
+      if (audioBatchStatsRequestIdRef.current === requestId) setAudioBatchStats(stats);
+    } catch {
+      if (audioBatchStatsRequestIdRef.current === requestId) setAudioBatchStats(null);
+    }
+  }, [audioInputPath, audioInputIsDirectory, audioOutputDir, audioModelName, isMistralAudioModel]);
   const refreshMistralQueueCollectionCount = useCallback(async () => {
     try {
       const rows = await ipcRenderer.invoke('get-mistral-batch-queue') as MistralBatchQueueRow[];
@@ -1551,6 +374,9 @@ export default function App() {
     }
   }, []);
 
+  const latestOutputDirRef = useRef({ audio: audioOutputDir, image: imageOutputDir });
+  latestOutputDirRef.current = { audio: audioOutputDir, image: imageOutputDir };
+
   const refreshTranscriptListForMode = useCallback(async (targetMode: 'audio' | 'image', force: boolean = false) => {
     const now = Date.now();
     if (!force && now - lastTranscriptRefreshAtRef.current[targetMode] < LIVE_TRANSCRIPT_REFRESH_INTERVAL_MS) {
@@ -1571,13 +397,16 @@ export default function App() {
     try {
       const list = await ipcRenderer.invoke('list-transcripts-subtitles', dir) as Transcript[];
       const sorted = sortTranscripts(list);
-      const activeDir = targetMode === 'audio' ? audioOutputDir : imageOutputDir;
+      const activeDir = latestOutputDirRef.current[targetMode];
 
       if (activeDir === dir) {
+        // Skip the update entirely when nothing actually changed, so an idle
+        // background poll doesn't hand every row a new object identity and
+        // blow past React.memo on the whole sidebar list every few seconds.
         if (targetMode === 'audio') {
-          setAudioTranscripts(sorted);
+          setAudioTranscripts(prev => (transcriptListsEqual(prev, sorted) ? prev : sorted));
         } else {
-          setImageTranscripts(sorted);
+          setImageTranscripts(prev => (transcriptListsEqual(prev, sorted) ? prev : sorted));
         }
         lastTranscriptRefreshAtRef.current[targetMode] = Date.now();
       }
@@ -1599,8 +428,9 @@ export default function App() {
     }
     lastBatchUiRefreshAtRef.current = now;
     void refreshMistralBatchStats();
+    void refreshAudioBatchStats();
     void refreshMistralQueueCollectionCount();
-  }, [refreshMistralBatchStats, refreshMistralQueueCollectionCount]);
+  }, [refreshMistralBatchStats, refreshAudioBatchStats, refreshMistralQueueCollectionCount]);
 
   const fetchCurrentVersion = useCallback(() => {
     ipcRenderer
@@ -1612,17 +442,25 @@ export default function App() {
   const fetchLatestVersion = useCallback(async () => {
     setCheckingUpdate(true);
     setUpdateError('');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), UPDATE_CHECK_TIMEOUT_MS);
     try {
       const res = await fetch('https://api.github.com/repos/Minitex/TranscribeAIUI/releases/latest', {
-        headers: { Accept: 'application/vnd.github+json' }
+        headers: { Accept: 'application/vnd.github+json' },
+        signal: controller.signal
       });
       if (!res.ok) throw new Error(`Update check failed (${res.status})`);
       const data = await res.json();
       const tag = (data?.tag_name || '').trim().replace(/^v/i, '');
       setLatestVersion(tag);
-    } catch (err: any) {
-      setUpdateError(err?.message || 'Could not check for updates.');
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setUpdateError('Update check timed out. Check your connection and try again.');
+      } else {
+        setUpdateError(`Could not check for updates: ${getErrorMessage(err)}`);
+      }
     } finally {
+      clearTimeout(timeout);
       setCheckingUpdate(false);
     }
   }, []);
@@ -1656,106 +494,18 @@ export default function App() {
   }, [refreshMistralBatchStats]);
 
   useEffect(() => {
+    refreshAudioBatchStats();
+  }, [refreshAudioBatchStats]);
+
+  useEffect(() => {
     refreshMistralQueueCollectionCount();
     window.addEventListener('focus', refreshMistralQueueCollectionCount);
     return () => window.removeEventListener('focus', refreshMistralQueueCollectionCount);
   }, [refreshMistralQueueCollectionCount]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const setIfValid = (value: unknown) => {
-      if (cancelled) return;
-      if (typeof value === 'boolean') {
-        setImageBatchEnabled(value);
-        return;
-      }
-      setImageBatchEnabled(readStoredBoolean('mistralBatchEnabled'));
-    };
-    const loadMistralBatchSetting = async () => {
-      try {
-        const stored = await ipcRenderer.invoke('get-mistral-batch-enabled');
-        setIfValid(stored);
-      } catch {
-        setIfValid(undefined);
-      } finally {
-        if (!cancelled) {
-          mistralBatchSettingLoadedRef.current = true;
-        }
-      }
-    };
-    loadMistralBatchSetting();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // Batch-enabled load + persistence handled by useIpcPersistedState above.
 
-  useEffect(() => {
-    if (!mistralBatchSettingLoadedRef.current) return;
-    const persist = async () => {
-      try {
-        await ipcRenderer.invoke('set-mistral-batch-enabled', imageBatchEnabled);
-      } catch {
-      }
-      try {
-        localStorage.setItem('mistralBatchEnabled', String(imageBatchEnabled));
-      } catch {
-      }
-    };
-    persist();
-  }, [imageBatchEnabled]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const readLocal = () => {
-      try {
-        return (localStorage.getItem('activeMode') as 'audio' | 'image' | null) || '';
-      } catch {
-        return '';
-      }
-    };
-    const setIfValid = (value: unknown) => {
-      if (cancelled) return;
-      if (value === 'audio' || value === 'image') {
-        setMode(value);
-        return;
-      }
-      const fallback = readLocal();
-      if (fallback === 'audio' || fallback === 'image') {
-        setMode(fallback);
-      }
-    };
-    const loadMode = async () => {
-      try {
-        const stored = await ipcRenderer.invoke('get-active-mode');
-        setIfValid(stored);
-      } catch {
-        setIfValid(undefined);
-      } finally {
-        if (!cancelled) {
-          modeLoadedRef.current = true;
-        }
-      }
-    };
-    loadMode();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!modeLoadedRef.current) return;
-    const persist = async () => {
-      try {
-        await ipcRenderer.invoke('set-active-mode', mode);
-      } catch {
-      }
-      try {
-        localStorage.setItem('activeMode', mode);
-      } catch {
-      }
-    };
-    persist();
-  }, [mode]);
+  // Active-mode load + persistence handled by useIpcPersistedState above.
 
   useEffect(() => {
     let cancelled = false;
@@ -1787,6 +537,7 @@ export default function App() {
           hydrated = true;
         }
       } catch {
+        /* ipc unavailable; fall back to localStorage below */
       } finally {
         if (!cancelled) {
           if (!hydrated) {
@@ -1808,86 +559,32 @@ export default function App() {
   useEffect(() => {
     if (!pathsLoadedRef.current) return;
     const persist = async () => {
-      try {
-        await ipcRenderer.invoke('set-audio-input-path', audioInputPath);
-      } catch {
-      }
-      try {
-        await ipcRenderer.invoke('set-audio-output-dir', audioOutputDir);
-      } catch {
-      }
-      try {
-        await ipcRenderer.invoke('set-image-input-path', imageInputPath);
-      } catch {
-      }
-      try {
-        await ipcRenderer.invoke('set-image-output-dir', imageOutputDir);
-      } catch {
+      const writes: Array<[string, string]> = [
+        ['set-audio-input-path', audioInputPath],
+        ['set-audio-output-dir', audioOutputDir],
+        ['set-image-input-path', imageInputPath],
+        ['set-image-output-dir', imageOutputDir]
+      ];
+      for (const [channel, value] of writes) {
+        try {
+          await ipcRenderer.invoke(channel, value);
+        } catch (e) {
+          console.error(`Failed to persist ${channel} via IPC`, e);
+        }
       }
       try {
         localStorage.setItem('audioInputPath', audioInputPath);
         localStorage.setItem('audioOutputDir', audioOutputDir);
         localStorage.setItem('imageInputPath', imageInputPath);
         localStorage.setItem('imageOutputDir', imageOutputDir);
-      } catch {
+      } catch (e) {
+        console.error('Failed to persist paths to localStorage', e);
       }
     };
     persist();
   }, [audioInputPath, audioOutputDir, imageInputPath, imageOutputDir]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const loadFavorites = async () => {
-      const readLocal = () => {
-        try {
-          const saved = localStorage.getItem('folderFavorites');
-          if (!saved) return [];
-          const parsed = JSON.parse(saved);
-          return Array.isArray(parsed) ? parsed : [];
-        } catch {
-          return [];
-        }
-      };
-      let hydrated = false;
-      try {
-        const stored: string[] = await ipcRenderer.invoke('get-folder-favorites');
-        if (!cancelled && Array.isArray(stored)) {
-          setFolderFavorites(stored);
-          hydrated = true;
-        }
-      } catch {
-      } finally {
-        if (!cancelled) {
-          if (!hydrated) {
-            const fallback = readLocal();
-            if (fallback.length) {
-              setFolderFavorites(fallback);
-            }
-          }
-          favoritesLoadedRef.current = true;
-        }
-      }
-    };
-    loadFavorites();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!favoritesLoadedRef.current) return;
-    const persist = async () => {
-      try {
-        await ipcRenderer.invoke('set-folder-favorites', folderFavorites);
-      } catch {
-      }
-      try {
-        localStorage.setItem('folderFavorites', JSON.stringify(folderFavorites));
-      } catch {
-      }
-    };
-    persist();
-  }, [folderFavorites]);
+  // Folder-favorites load + persistence handled by useIpcPersistedState above.
 
   useEffect(() => {
     const loadImageModel = () => {
@@ -1917,6 +614,31 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const loadAudioModel = () => {
+      ipcRenderer
+        .invoke('get-audio-model')
+        .then((model: string) => {
+          setAudioModelName(resolveSupportedModel(
+            model || localStorage.getItem('audioModel'),
+            AUDIO_MODEL_OPTIONS,
+            DEFAULT_AUDIO_MODEL
+          ));
+        })
+        .catch(() => {
+          setAudioModelName(resolveSupportedModel(
+            localStorage.getItem('audioModel'),
+            AUDIO_MODEL_OPTIONS,
+            DEFAULT_AUDIO_MODEL
+          ));
+        });
+    };
+
+    loadAudioModel();
+    window.addEventListener('focus', loadAudioModel);
+    return () => window.removeEventListener('focus', loadAudioModel);
+  }, []);
+
+  useEffect(() => {
     void refreshVisibleLogs(mode, true);
   }, [mode, refreshVisibleLogs]);
 
@@ -1936,18 +658,14 @@ export default function App() {
 
   useEffect(() => {
     if (!isTranscribing || !logs) return;
-    
+
     const scrollToBottom = () => {
-      const logContainer = document.querySelector('.logs-body');
-      if (logContainer) {
-        logContainer.scrollTop = logContainer.scrollHeight;
-        console.log('Auto-scrolled logs to bottom');
-      } else {
-        console.log('Could not find .logs-body element for auto-scroll');
-      }
+      const el = logsBodyRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
     };
-    
-    setTimeout(scrollToBottom, 100);
+
+    const timer = window.setTimeout(scrollToBottom, LOG_SCROLL_DELAY_MS);
+    return () => window.clearTimeout(timer);
   }, [logs, isTranscribing]);
 
   const getInitialPathForPicker = useCallback(
@@ -2024,7 +742,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const handler = (_: any, file: string, _idx: number, _total: number, msg: string) => {
+    const handler = (_event: Electron.IpcRendererEvent, file: string, _idx: number, _total: number, msg: string) => {
       const label = (file || '').trim();
       const detail = (msg || '').trim();
       setStatus(label && detail ? `${label} | ${detail}` : (label || detail));
@@ -2043,23 +761,31 @@ export default function App() {
   }, [mode, refreshLiveImageBatchUi, refreshTranscriptListForMode, refreshVisibleLogs]);
 
   useEffect(() => {
-    const handler = async (_: any, nextInputPath: string, nextOutputDir: string) => {
+    const handler = async (
+      _event: Electron.IpcRendererEvent,
+      nextInputPath: string,
+      nextOutputDir: string,
+      folderMode: 'audio' | 'image' = 'image'
+    ) => {
+      const setInputPath = folderMode === 'audio' ? setAudioInputPath : setImageInputPath;
+      const setOutputDir = folderMode === 'audio' ? setAudioOutputDir : setImageOutputDir;
+      const setTranscripts = folderMode === 'audio' ? setAudioTranscripts : setImageTranscripts;
       if (typeof nextInputPath === 'string') {
-        setImageInputPath(normalizeLocalPath(nextInputPath));
+        setInputPath(normalizeLocalPath(nextInputPath));
       }
       if (typeof nextOutputDir === 'string') {
-        setImageOutputDir(normalizeLocalPath(nextOutputDir));
+        setOutputDir(normalizeLocalPath(nextOutputDir));
         try {
           const list = await ipcRenderer.invoke(
             'list-transcripts-subtitles',
             normalizeLocalPath(nextOutputDir)
           ) as Transcript[];
-          setImageTranscripts(sortTranscripts(list));
+          setTranscripts(sortTranscripts(list));
         } catch {
-          setImageTranscripts([]);
+          setTranscripts([]);
         }
       }
-      setMode('image');
+      setMode(folderMode);
       setStatus(`Loaded queue folder ${pathModule.basename(nextInputPath || '')}`);
       refreshMistralQueueCollectionCount();
     };
@@ -2070,21 +796,8 @@ export default function App() {
   }, [refreshMistralQueueCollectionCount]);
 
   const refreshTranscriptList = useCallback(async () => {
-    const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
-    if (!dir) return;
-    
-    try {
-      const list: Transcript[] = await ipcRenderer.invoke('list-transcripts-subtitles', dir);
-      const sorted = sortTranscripts(list);
-      if (mode === 'audio') {
-        setAudioTranscripts(sorted);
-      } else {
-        setImageTranscripts(sorted);
-      }
-    } catch (error) {
-      console.error('Failed to refresh transcript list:', error);
-    }
-  }, [mode, audioOutputDir, imageOutputDir]);
+    await refreshTranscriptListForMode(mode, true);
+  }, [mode, refreshTranscriptListForMode]);
 
   useEffect(() => {
     if (isSettings || isBatchQueue) return;
@@ -2123,46 +836,53 @@ export default function App() {
         decodedEntityCounts?: Record<string, number>;
         decodedEntityTotal?: number;
       }> = [];
-      await Promise.all(
-        entries.map(async entry => {
-          const intro = entry.remove_intro_text;
-          const outro = entry.remove_outro_text;
-          const hasMarkdown = Boolean(entry.markdown_artifacts && entry.markdown_artifacts.length);
-          const hasEncodedEntities = Number(entry.html_entity_count ?? entry.html_amp_count ?? 0) > 0;
-          if (!intro && !outro && !hasMarkdown && !hasEncodedEntities) return;
-          const filePath = lookup.get(entry.file);
-          if (!filePath) return;
+      // Capped concurrency — "Remediate all" on a large batch (hundreds of
+      // flagged files) would otherwise fire that many concurrent file
+      // reads/writes at once and stall the app, especially on slower disks.
+      const CLEANUP_CONCURRENCY = 6;
+      for (let i = 0; i < entries.length; i += CLEANUP_CONCURRENCY) {
+        const chunk = entries.slice(i, i + CLEANUP_CONCURRENCY);
+        await Promise.all(
+          chunk.map(async entry => {
+            const intro = entry.remove_intro_text;
+            const outro = entry.remove_outro_text;
+            const hasMarkdown = Boolean(entry.markdown_artifacts && entry.markdown_artifacts.length);
+            const hasEncodedEntities = Number(entry.html_entity_count ?? entry.html_amp_count ?? 0) > 0;
+            if (!intro && !outro && !hasMarkdown && !hasEncodedEntities) return;
+            const filePath = lookup.get(entry.file);
+            if (!filePath) return;
 
-          try {
-            const original = await fs.promises.readFile(filePath, 'utf-8');
-            let cleaned = removeWrappersFromContent(original, intro, outro);
-            if (hasMarkdown) {
-              cleaned = stripMarkdownArtifacts(cleaned);
+            try {
+              const original = await fs.promises.readFile(filePath, 'utf-8');
+              let cleaned = removeWrappersFromContent(original, intro, outro);
+              if (hasMarkdown) {
+                cleaned = stripMarkdownArtifacts(cleaned);
+              }
+              let decodedEntityTotal = 0;
+              let decodedEntityCounts: Record<string, number> | undefined;
+              if (hasEncodedEntities) {
+                const decoded = decodeKnownHtmlEntities(cleaned);
+                cleaned = decoded.decoded;
+                decodedEntityTotal = decoded.total;
+                decodedEntityCounts = decoded.total > 0 ? decoded.counts : undefined;
+              }
+              if (cleaned === original) return;
+              await fs.promises.writeFile(filePath, cleaned, 'utf-8');
+              cleanedFiles.push({
+                name: entry.file,
+                path: filePath,
+                intro: intro?.trim(),
+                outro: outro?.trim(),
+                markdownArtifacts: hasMarkdown ? entry.markdown_artifacts : undefined,
+                decodedEntityTotal: decodedEntityTotal || undefined,
+                decodedEntityCounts
+              });
+            } catch (error) {
+              console.error('Failed to strip wrappers from', filePath, error);
             }
-            let decodedEntityTotal = 0;
-            let decodedEntityCounts: Record<string, number> | undefined;
-            if (hasEncodedEntities) {
-              const decoded = decodeKnownHtmlEntities(cleaned);
-              cleaned = decoded.decoded;
-              decodedEntityTotal = decoded.total;
-              decodedEntityCounts = decoded.total > 0 ? decoded.counts : undefined;
-            }
-            if (cleaned === original) return;
-            await fs.promises.writeFile(filePath, cleaned, 'utf-8');
-            cleanedFiles.push({
-              name: entry.file,
-              path: filePath,
-              intro: intro?.trim(),
-              outro: outro?.trim(),
-              markdownArtifacts: hasMarkdown ? entry.markdown_artifacts : undefined,
-              decodedEntityTotal: decodedEntityTotal || undefined,
-              decodedEntityCounts
-            });
-          } catch (error) {
-            console.error('Failed to strip wrappers from', filePath, error);
-          }
-        })
-      );
+          })
+        );
+      }
 
       if (cleanedFiles.length) {
         const logLines = cleanedFiles
@@ -2209,8 +929,7 @@ export default function App() {
           cleanedFiles.length === 1
             ? `Remediated ${cleanedFiles[0].name}`
             : `Remediated ${cleanedFiles.length} files`;
-        setToast(message);
-        setTimeout(() => setToast(null), 6000);
+        showToast(message);
       }
       return cleanedFiles.map(file => file.name);
     },
@@ -2222,14 +941,19 @@ export default function App() {
     if (!dir) return;
     setIsScanningQuality(true);
     setStatus('ℹ️ Checking quality...');
+    // Reset so this scan starts from a clean slate: entries stream in below via
+    // progressHandler instead of arriving as one big array at the very end.
+    setScanResults([]);
+    setQualityScores({});
     const progressHandler = (
-      _: any,
+      _event: Electron.IpcRendererEvent,
       payload: {
         processed?: number;
         total?: number;
         percent?: number;
         file?: string;
         blankCount?: number;
+        entry?: ScanResultEntry;
       }
     ) => {
       const processed = Math.max(0, Number(payload?.processed || 0));
@@ -2240,6 +964,13 @@ export default function App() {
       const blankPart = blankCount > 0 ? ` • blank ${blankCount}` : '';
       const filePart = fileLabel ? ` • ${fileLabel}` : '';
       setStatus(`ℹ️ Checking quality ${processed}/${total} (${percent}%)${blankPart}${filePart}`);
+      // Stream each computed entry into state as it arrives so large folders (hundreds-1000+
+      // files) render progressively instead of waiting for the final IPC round-trip.
+      const entry = payload?.entry;
+      if (entry) {
+        setScanResults(prev => [...prev, entry]);
+        setQualityScores(prev => ({ ...prev, [entry.file]: toQualityEntry(entry) }));
+      }
     };
     ipcRenderer.on('quality-scan-progress', progressHandler);
     try {
@@ -2249,43 +980,12 @@ export default function App() {
         threshold
       );
       const entries = result?.all ?? [];
+      // Authoritative reconcile: replace the streamed-in state with the final result so the
+      // outcome is identical to a single non-streamed response, regardless of any streaming
+      // edge cases (dropped/out-of-order progress events, etc).
       setScanResults(entries);
       const map = entries.reduce<Record<string, QualityEntry>>((acc, entry) => {
-        acc[entry.file] = {
-          confidence: entry.confidence,
-          blankTranscript: Boolean(entry.blank_transcript),
-          nonWhitespaceChars: typeof entry.non_whitespace_chars === 'number' ? entry.non_whitespace_chars : undefined,
-          removeIntroText: entry.remove_intro_text,
-          removeOutroText: entry.remove_outro_text,
-          issueDetails: entry.issue_details,
-          issues: entry.issues,
-          placeholderCount: entry.placeholder_count,
-          placeholderRatio: entry.placeholder_ratio,
-          tokenCount: entry.token_count,
-          repetitionRatio: entry.repetition_ratio,
-          markdownArtifacts: entry.markdown_artifacts,
-          htmlAmpCount: entry.html_amp_count,
-          htmlEntityCount: entry.html_entity_count ?? entry.html_amp_count,
-          htmlEntityCounts: entry.html_entity_counts,
-          srtInvalidTimestampCount: entry.srt_invalid_timestamp_count,
-          srtInvalidRangeCount: entry.srt_invalid_range_count,
-          srtOverlapCount: entry.srt_overlap_count,
-          srtNoncanonicalTimestampCount: entry.srt_noncanonical_timestamp_count,
-          srtMissingHourTimestampCount: entry.srt_missing_hour_timestamp_count,
-          scoreBreakdown: entry.score_breakdown
-            ? {
-              placeholderPenalty: entry.score_breakdown.placeholder_penalty,
-              repetitionPenalty: entry.score_breakdown.repetition_penalty,
-              aiPenalty: entry.score_breakdown.ai_penalty,
-              rareTokenPenalty: entry.score_breakdown.rare_token_penalty,
-              wrapperPenalty: entry.score_breakdown.wrapper_penalty,
-              markdownPenalty: entry.score_breakdown.markdown_penalty,
-              encodedEntityPenalty: entry.score_breakdown.encoded_entity_penalty,
-              srtTimestampPenalty: entry.score_breakdown.srt_timestamp_penalty,
-              totalPenalty: entry.score_breakdown.total_penalty
-            }
-            : undefined
-        };
+        acc[entry.file] = toQualityEntry(entry);
         return acc;
       }, {});
       setQualityScores(map);
@@ -2401,8 +1101,7 @@ export default function App() {
       if (!dir) return;
       const entry = scanResults.find(item => item.file === name);
       if (!entry || !isScanEntryRemediable(entry)) {
-        setToast(`No remediation available for ${name}`);
-        setTimeout(() => setToast(null), 6000);
+        showToast(`No remediation available for ${name}`);
         return;
       }
 
@@ -2424,6 +1123,38 @@ export default function App() {
     setQualityScores({});
     setScanResults([]);
   }, [mode, audioOutputDir, imageOutputDir]);
+
+  useEffect(() => {
+    const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
+    setReviewedStatus(dir ? loadReviewStatus(dir) : {});
+  }, [mode, audioOutputDir, imageOutputDir]);
+
+  useEffect(() => {
+    const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
+    if (!dir) return;
+    saveReviewStatus(dir, reviewedStatus);
+  }, [reviewedStatus, mode, audioOutputDir, imageOutputDir]);
+
+  const toggleReviewed = useCallback(
+    (name: string) => {
+      const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
+      if (!dir) return;
+      setReviewedStatus(prev => ({ ...prev, [name]: !prev[name] }));
+    },
+    [mode, audioOutputDir, imageOutputDir]
+  );
+
+  // Stable across unrelated App re-renders (e.g. the 4s background-batch
+  // poll) so OcrReviewModal's React.memo can actually skip re-rendering its
+  // full word tree while a batch runs behind an open review.
+  const closeOcrReview = useCallback(() => setOcrReview(null), []);
+  const toggleOcrReviewReviewed = useCallback(() => {
+    if (ocrReview) toggleReviewed(pathModule.basename(ocrReview.txtPath));
+  }, [ocrReview, toggleReviewed]);
+  const closeAudioReview = useCallback(() => setAudioReview(null), []);
+  const toggleAudioReviewReviewed = useCallback(() => {
+    if (audioReview) toggleReviewed(pathModule.basename(audioReview.txtPath));
+  }, [audioReview, toggleReviewed]);
 
   useEffect(() => {
     const relevantList = mode === 'audio' ? audioTranscripts : imageTranscripts;
@@ -2495,9 +1226,8 @@ export default function App() {
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
       if (!isResizing) return;
-      const MIN = 160;
-      const max = window.innerWidth - MIN;
-      setSidebarWidth(Math.max(MIN, Math.min(e.clientX, max)));
+      const max = window.innerWidth - SIDEBAR_MIN_WIDTH;
+      setSidebarWidth(Math.max(SIDEBAR_MIN_WIDTH, Math.min(e.clientX, max)));
     };
     const onUp = () => setIsResizing(false);
     window.addEventListener('mousemove', onMove);
@@ -2515,7 +1245,12 @@ export default function App() {
   const removeFile = useCallback(
     async (filePath: string) => {
       const fileName = pathModule.basename(filePath);
-      await ipcRenderer.invoke('delete-transcript', filePath);
+      try {
+        await ipcRenderer.invoke('delete-transcript', filePath);
+      } catch (error) {
+        showToast(`❌ Failed to delete ${fileName}: ${getErrorMessage(error)}`);
+        return;
+      }
       const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
       if (!dir) return;
       const rawList: Transcript[] = await ipcRenderer.invoke('list-transcripts-subtitles', dir);
@@ -2574,61 +1309,126 @@ export default function App() {
     ipcRenderer.invoke('open-batch-queue');
   }, []);
 
+  const toggleMistralOutputPdf = useCallback(() => {
+    setMistralOutputPdf(v => !v);
+  }, []);
+
+  const toggleImageBatch = useCallback(() => {
+    setImageBatchEnabled(v => !v);
+  }, []);
+
+  const toggleAudioBatch = useCallback(() => {
+    setAudioBatchEnabled(v => !v);
+  }, []);
+
   const toggleLogs = useCallback(() => {
     setShowLogs(s => !s);
   }, []);
 
-  const currentList = mode === 'audio' ? audioTranscripts : imageTranscripts;
-  const nameFilter = filter.toLowerCase();
-  const filtered = [...currentList]
-    .filter(t => t.name.toLowerCase().includes(nameFilter))
-    .filter(t => {
-      if (fileTypeFilter === 'all') return true;
-      const lowerName = t.name.toLowerCase();
-      const isTranscript = lowerName.endsWith('.txt');
-      const isSubtitle = lowerName.endsWith('.srt');
-      const isPdf = lowerName.endsWith('.pdf') || lowerName.endsWith('.html');
-      if (fileTypeFilter === 'transcript') return isTranscript;
-      if (fileTypeFilter === 'subtitle') return isSubtitle;
-      return isPdf;
-    })
-    .filter(t => {
-      if (issueFilter === 'all') return true;
-      const entry = qualityScores[t.name];
-      if (!entry) return false;
-      const hasIssues = Boolean(entry.issues && entry.issues.length);
-      return issueFilter === 'issues' ? hasIssues : !hasIssues;
-    })
-    .sort((a, b) => {
-      switch (sortOption) {
-        case 'name-asc':
-          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        case 'name-desc':
-          return b.name.localeCompare(a.name, undefined, { numeric: true, sensitivity: 'base' });
-        case 'confidence-asc': {
-          const aScore = qualityScores[a.name]?.confidence ?? Number.POSITIVE_INFINITY;
-          const bScore = qualityScores[b.name]?.confidence ?? Number.POSITIVE_INFINITY;
-          if (aScore !== bScore) return aScore - bScore;
-          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+  const currentList = useMemo(
+    () => (mode === 'audio' ? audioTranscripts : imageTranscripts),
+    [mode, audioTranscripts, imageTranscripts]
+  );
+  // Mistral OCR results carry the model's own average confidence in their
+  // .ocrmeta.json sidecar; that real score overrides the heuristic scan
+  // wherever a sidecar exists. Other files keep the scan-based entry.
+  // Loaded async (statSync/readFileSync per file would block the UI thread
+  // on every list refresh for large output folders on a slow disk).
+  const [mistralQualityOverrides, setMistralQualityOverrides] = useState<Record<string, QualityEntry>>({});
+  const mistralQualityOverridesRef = useRef(mistralQualityOverrides);
+  mistralQualityOverridesRef.current = mistralQualityOverrides;
+  useEffect(() => {
+    if (mode !== 'image' || imageTranscripts.length === 0) {
+      setMistralQualityOverrides({});
+      return;
+    }
+    const pending = imageTranscripts.filter(t => !(t.name in mistralQualityOverridesRef.current));
+    if (pending.length === 0) return;
+    let cancelled = false;
+    // Capped concurrency, same rationale/limit as cleanupWrappers above —
+    // avoid firing hundreds of concurrent sidecar reads on a large batch.
+    const MISTRAL_QUALITY_CONCURRENCY = 6;
+    (async () => {
+      const next: Record<string, QualityEntry> = {};
+      for (let i = 0; i < pending.length; i += MISTRAL_QUALITY_CONCURRENCY) {
+        if (cancelled) return;
+        const chunk = pending.slice(i, i + MISTRAL_QUALITY_CONCURRENCY);
+        const pairs = await Promise.all(
+          chunk.map(async t => [t.name, await loadMistralQualityEntry(t)] as const)
+        );
+        for (const [name, entry] of pairs) {
+          if (entry) next[name] = entry;
         }
-        case 'confidence-desc': {
-          const aScore = qualityScores[a.name]?.confidence ?? Number.NEGATIVE_INFINITY;
-          const bScore = qualityScores[b.name]?.confidence ?? Number.NEGATIVE_INFINITY;
-          if (aScore !== bScore) return bScore - aScore;
-          return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
-        }
-        default:
-          return 0;
       }
-    });
+      if (cancelled) return;
+      setMistralQualityOverrides(prev => ({ ...prev, ...next }));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, imageTranscripts]);
+  const displayScores = useMemo(() => {
+    if (mode !== 'image') return qualityScores;
+    return { ...qualityScores, ...mistralQualityOverrides };
+  }, [mode, qualityScores, mistralQualityOverrides]);
+  const nameFilter = useMemo(() => filter.toLowerCase(), [filter]);
+  const filtered = useMemo(
+    () =>
+      [...currentList]
+        .filter(t => t.name.toLowerCase().includes(nameFilter))
+        .filter(t => {
+          if (fileTypeFilter === 'all') return true;
+          const lowerName = t.name.toLowerCase();
+          const isTranscript = lowerName.endsWith('.txt');
+          const isSubtitle = lowerName.endsWith('.srt');
+          const isPdf = lowerName.endsWith('.pdf') || lowerName.endsWith('.html');
+          if (fileTypeFilter === 'transcript') return isTranscript;
+          if (fileTypeFilter === 'subtitle') return isSubtitle;
+          return isPdf;
+        })
+        .filter(t => {
+          if (issueFilter === 'all') return true;
+          const entry = displayScores[t.name];
+          if (!entry) return false;
+          const hasIssues = Boolean(entry.issues && entry.issues.length);
+          return issueFilter === 'issues' ? hasIssues : !hasIssues;
+        })
+        .filter(t => {
+          if (reviewStatusFilter === 'all') return true;
+          const isReviewed = Boolean(reviewedStatus[t.name]);
+          return reviewStatusFilter === 'reviewed' ? isReviewed : !isReviewed;
+        })
+        .sort((a, b) => {
+          switch (sortOption) {
+            case 'name-asc':
+              return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+            case 'name-desc':
+              return b.name.localeCompare(a.name, undefined, { numeric: true, sensitivity: 'base' });
+            case 'confidence-asc': {
+              const aScore = displayScores[a.name]?.confidence ?? Number.POSITIVE_INFINITY;
+              const bScore = displayScores[b.name]?.confidence ?? Number.POSITIVE_INFINITY;
+              if (aScore !== bScore) return aScore - bScore;
+              return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+            }
+            case 'confidence-desc': {
+              const aScore = displayScores[a.name]?.confidence ?? Number.NEGATIVE_INFINITY;
+              const bScore = displayScores[b.name]?.confidence ?? Number.NEGATIVE_INFINITY;
+              if (aScore !== bScore) return bScore - aScore;
+              return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+            }
+            default:
+              return 0;
+          }
+        }),
+    [currentList, nameFilter, fileTypeFilter, issueFilter, reviewStatusFilter, reviewedStatus, displayScores, sortOption]
+  );
 
   const copyImagesToDestination = useCallback(
     async (destDir: string) => {
       try {
         const sourcePaths = filtered.map(item => item.path);
         if (!sourcePaths.length) {
-          setToast('No files found for the current list.');
-          setTimeout(() => setToast(null), 6000);
+          showToast('No files found for the current list.');
           return;
         }
         let copied = 0;
@@ -2644,11 +1444,9 @@ export default function App() {
         }
         const parts = [`Copied ${copied} file${copied === 1 ? '' : 's'}`];
         if (skipped) parts.push(`${skipped} skipped`);
-        setToast(parts.join(' • '));
-        setTimeout(() => setToast(null), 6000);
-      } catch (error: any) {
-        setToast(`❌ Copy failed: ${error?.message || error}`);
-        setTimeout(() => setToast(null), 6000);
+        showToast(parts.join(' • '));
+      } catch (error) {
+        showToast(`❌ Copy failed: ${getErrorMessage(error)}`);
       }
     },
     [filtered]
@@ -2656,8 +1454,7 @@ export default function App() {
 
   const copyImagesToFolder = useCallback(() => {
     if (!filtered.length) {
-      setToast('No files to copy');
-      setTimeout(() => setToast(null), 6000);
+      showToast('No files to copy');
       return;
     }
     setPathPicker({
@@ -2713,35 +1510,48 @@ export default function App() {
       }
 
       try {
-        await ipcRenderer.invoke(
+        const result = await ipcRenderer.invoke(
           'run-transcription',
           'audio',
           audioInputPath,
           audioOutputDir,
           promptToUse,
           generateSubtitles,
-          interviewMode
-        );
+          interviewMode,
+          {
+            batch: effectiveAudioBatchEnabled,
+            batchSize: audioBatchSize
+          }
+        ) as string;
         await refreshTranscriptListForMode('audio', true);
         await refreshVisibleLogs('audio', true);
-        setStatus('✅ Batch complete');
-        setToast('✅ Done');
-        setTimeout(() => setToast(null), 6000);
-      } catch (err: any) {
-        const cancelled = err.message?.includes('terminated');
-        const msg = cancelled
-          ? '❌ Cancelled by user'
-          : `❌ ${err.message || 'Unknown error'}`;
+        await refreshAudioBatchStats();
+        await refreshMistralQueueCollectionCount();
+        const normalized = typeof result === 'string' ? result.trim() : '';
+        const detail = normalized.replace(/^\[[A-Z]+\]\s*/, '');
+        setStatus(detail ? `✅ ${detail}` : '✅ Batch complete');
+        showToast('✅ Done');
+      } catch (err: unknown) {
+        const cancelled = isCancellation(err);
+        const msg = cancelled ? '❌ Cancelled by user' : `❌ ${getErrorMessage(err)}`;
         setStatus(msg);
         if (!cancelled) {
-          setToast(msg);
-          setTimeout(() => setToast(null), 6000);
+          showToast(msg);
         }
       } finally {
         setIsTranscribing(false);
       }
     },
-    [audioInputPath, audioOutputDir, refreshTranscriptListForMode, refreshVisibleLogs]
+    [
+      audioInputPath,
+      audioOutputDir,
+      effectiveAudioBatchEnabled,
+      audioBatchSize,
+      refreshTranscriptListForMode,
+      refreshVisibleLogs,
+      refreshAudioBatchStats,
+      refreshMistralQueueCollectionCount
+    ]
   );
 
   const transcribeImage = useCallback(async () => {
@@ -2776,17 +1586,13 @@ export default function App() {
       const isInfo = normalized.startsWith('[INFO]');
       const statusText = detail || 'Done';
       setStatus(isInfo ? `ℹ️ ${statusText}` : `✅ ${statusText}`);
-      setToast(isInfo ? `ℹ️ ${statusText}` : '✅ Done');
-      setTimeout(() => setToast(null), 6000);
-    } catch (err: any) {
-      const cancelled = err.message?.includes('terminated');
-      const msg = cancelled
-        ? '❌ Cancelled by user'
-        : `❌ ${err.message || 'Unknown error'}`;
+      showToast(isInfo ? `ℹ️ ${statusText}` : '✅ Done');
+    } catch (err: unknown) {
+      const cancelled = isCancellation(err);
+      const msg = cancelled ? '❌ Cancelled by user' : `❌ ${getErrorMessage(err)}`;
       setStatus(msg);
       if (!cancelled) {
-        setToast(msg);
-        setTimeout(() => setToast(null), 6000);
+        showToast(msg);
       }
     } finally {
       await refreshMistralBatchStats();
@@ -2812,40 +1618,48 @@ export default function App() {
     setIsTranscribing(false);
   }, []);
 
-  const openTranscript = useCallback((p: string) => ipcRenderer.invoke('open-transcript', p), []);
-  const refreshCurrentTranscriptList = useCallback(async () => {
-    const dir = mode === 'audio' ? audioOutputDir : imageOutputDir;
-    if (!dir) return;
-    const rawList: Transcript[] = await ipcRenderer.invoke('list-transcripts-subtitles', dir);
-    const sorted = sortTranscripts(rawList);
-    if (mode === 'audio') {
-      setAudioTranscripts(sorted);
-    } else {
-      setImageTranscripts(sorted);
+  // Double-click always opens the plain text file. OCR Review is a separate,
+  // opt-in action from the right-click menu (openOcrReview).
+  const openTranscript = useCallback((p: string) => {
+    return ipcRenderer.invoke('open-transcript', p);
+  }, []);
+  const openOcrReview = useCallback((p: string) => {
+    const reviewData = loadOcrReviewData(p);
+    if (reviewData) setOcrReview({ txtPath: p, data: reviewData });
+    else showToast('No OCR review data for this file.');
+  }, [showToast]);
+  const openAudioReview = useCallback((transcript: Transcript) => {
+    const srtPath = srtPathForTranscript(transcript.path);
+    const segments = loadAudioReviewSegments(srtPath);
+    if (!segments || !segments.length) {
+      showToast('No timestamp data for this file.');
+      return;
     }
-  }, [audioOutputDir, imageOutputDir, mode]);
+    const txtPath = txtPathForTranscript(transcript.path);
+    const sourceAudioPath = resolveSourceFileForTranscript(transcript, audioInputPath, audioOutputDir, AUDIO_EXTS);
+    setAudioReview({ txtPath, srtPath, data: { sourceAudioPath, segments } });
+  }, [showToast, audioInputPath, audioOutputDir]);
+  const refreshCurrentTranscriptList = useCallback(async () => {
+    await refreshTranscriptListForMode(mode, true);
+  }, [mode, refreshTranscriptListForMode]);
   const openSourceFileForTranscript = useCallback(
     async (transcript: Transcript) => {
       if (!imageInputPath) {
-        setToast('Set an input file or folder first.');
-        setTimeout(() => setToast(null), 6000);
+        showToast('Set an input file or folder first.');
         return;
       }
-      const sourcePath = resolveSourceFileForTranscript(transcript, imageInputPath, imageOutputDir);
+      const sourcePath = resolveSourceFileForTranscript(transcript, imageInputPath, imageOutputDir, IMAGE_EXTS);
       if (!sourcePath) {
-        setToast(`No matching original file found for ${transcript.name}`);
-        setTimeout(() => setToast(null), 6000);
+        showToast(`No matching original file found for ${transcript.name}`);
         return;
       }
       try {
         const err = await ipcRenderer.invoke('open-transcript', sourcePath);
         if (err) {
-          setToast(`❌ ${err}`);
-          setTimeout(() => setToast(null), 6000);
+          showToast(`❌ ${err}`);
         }
-      } catch (error: any) {
-        setToast(`❌ Failed to open original file: ${error?.message || error}`);
-        setTimeout(() => setToast(null), 6000);
+      } catch (error) {
+        showToast(`❌ Failed to open original file: ${getErrorMessage(error)}`);
       }
     },
     [imageInputPath, imageOutputDir]
@@ -2853,8 +1667,7 @@ export default function App() {
   const deleteGeneratedFileFamily = useCallback(
     async (transcript: Transcript) => {
       if (!/\.(pdf|html)$/i.test(transcript.name)) {
-        setToast('Select a generated PDF or HTML file.');
-        setTimeout(() => setToast(null), 6000);
+        showToast('Select a generated PDF or HTML file.');
         return;
       }
       try {
@@ -2880,11 +1693,9 @@ export default function App() {
           setScanResults(prev => prev.filter(entry => !deletedNames.includes(entry.file)));
         }
         const count = typeof result.count === 'number' ? result.count : deletedNames.length;
-        setToast(`Deleted ${count} generated file${count === 1 ? '' : 's'}`);
-        setTimeout(() => setToast(null), 6000);
-      } catch (error: any) {
-        setToast(`❌ Failed to delete generated files: ${error?.message || error}`);
-        setTimeout(() => setToast(null), 6000);
+        showToast(`Deleted ${count} generated file${count === 1 ? '' : 's'}`);
+      } catch (error) {
+        showToast(`❌ Failed to delete generated files: ${getErrorMessage(error)}`);
       }
     },
     [refreshCurrentTranscriptList]
@@ -2895,8 +1706,7 @@ export default function App() {
   }, [mode]);
   const exportLogs = useCallback(async () => {
     if (!logs || !logs.trim()) {
-      setToast('No logs to export');
-      setTimeout(() => setToast(null), 6000);
+      showToast('No logs to export');
       return;
     }
     try {
@@ -2908,25 +1718,22 @@ export default function App() {
       };
       if (result?.canceled) return;
       if (result?.error) {
-        setToast(`❌ ${result.error}`);
-        setTimeout(() => setToast(null), 6000);
+        showToast(`❌ ${result.error}`);
         return;
       }
       const count = result?.count;
-      setToast(
+      showToast(
         typeof count === 'number'
           ? `Exported ${count} log line${count === 1 ? '' : 's'}`
           : 'Exported logs'
       );
-      setTimeout(() => setToast(null), 6000);
-    } catch (error: any) {
-      setToast(`❌ Export failed: ${error?.message || error}`);
-      setTimeout(() => setToast(null), 6000);
+    } catch (error) {
+      showToast(`❌ Export failed: ${getErrorMessage(error)}`);
     }
   }, [logs, mode]);
 
   const contextIssues = contextMenu
-    ? qualityScores[contextMenu.transcript.name]?.issues
+    ? displayScores[contextMenu.transcript.name]?.issues
     : undefined;
   const contextScanEntry = contextMenu
     ? scanResults.find(entry => entry.file === contextMenu.transcript.name)
@@ -2935,11 +1742,21 @@ export default function App() {
   const canOpenContextSourceFile = Boolean(imageInputPath);
   const canRemediateContextFile = Boolean(contextScanEntry && isScanEntryRemediable(contextScanEntry));
   const canDeleteGeneratedContextFamily = Boolean(contextMenu && /\.(pdf|html)$/i.test(contextMenu.transcript.name));
+  // Cheap existence stat (not a full sidecar read) — the OCR Review item only
+  // appears for Mistral image transcripts, which are the ones with a sidecar.
+  const canOcrReviewContextFile = Boolean(
+    contextMenu && fs.existsSync(ocrReviewSidecarPathForTranscript(contextMenu.transcript.path))
+  );
+  // Same cheap existence check as OCR Review's sidecar gate — Audio Review
+  // only works for transcripts that have a sibling .srt (only written when
+  // "Generate subtitles" was checked at transcribe time).
+  const canAudioReviewContextFile = Boolean(
+    contextMenu && mode === 'audio' && fs.existsSync(srtPathForTranscript(contextMenu.transcript.path))
+  );
 
   const exportTranscriptList = useCallback(async () => {
     if (!filtered.length) {
-      setToast('No files to export');
-      setTimeout(() => setToast(null), 6000);
+      showToast('No files to export');
       return;
     }
     try {
@@ -2947,7 +1764,7 @@ export default function App() {
       const result = await ipcRenderer.invoke('export-transcript-list', {
         mode,
         items: filtered.map(item => {
-          const entry = qualityScores[item.name];
+          const entry = displayScores[item.name];
           const confidence = entry?.confidence;
           const issues = entry?.issues?.length ? entry.issues.join('; ') : '';
           return {
@@ -2969,16 +1786,13 @@ export default function App() {
       }) as { canceled?: boolean; filePath?: string; count?: number; error?: string };
       if (result?.canceled) return;
       if (result?.error) {
-        setToast(`❌ ${result.error}`);
-        setTimeout(() => setToast(null), 6000);
+        showToast(`❌ ${result.error}`);
         return;
       }
       const count = result?.count ?? filtered.length;
-      setToast(`Exported ${count} file${count === 1 ? '' : 's'}`);
-      setTimeout(() => setToast(null), 6000);
-    } catch (error: any) {
-      setToast(`❌ Export failed: ${error?.message || error}`);
-      setTimeout(() => setToast(null), 6000);
+      showToast(`Exported ${count} file${count === 1 ? '' : 's'}`);
+    } catch (error) {
+      showToast(`❌ Export failed: ${getErrorMessage(error)}`);
     }
   }, [
     filtered,
@@ -2990,13 +1804,14 @@ export default function App() {
     currentList.length,
     audioOutputDir,
     imageOutputDir,
-    qualityScores
+    displayScores
   ]);
 
   const resetFilters = useCallback(() => {
     setFilter('');
     setFileTypeFilter('all');
     setIssueFilter('all');
+    setReviewStatusFilter('all');
     setSortOption('name-asc');
   }, []);
 
@@ -3029,95 +1844,77 @@ export default function App() {
   }
 
   return (
-    <div className={`app-shell${isResizing ? ' resizing' : ''}`}>
-      <div style={{ position: 'fixed', top: 50, right: 12, zIndex: 20 }}>
-        <FaCog className="settings-gear" onClick={() => ipcRenderer.invoke('open-settings')} />
-        {newVersionAvailable && (
-          <span
-            style={{
-              position: 'absolute',
-              top: -10,
-              right: 6,
-              background: '#ff4d4f',
-              color: '#fff',
-              width: 16,
-              height: 16,
-              borderRadius: '50%',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontSize: '10px',
-              fontWeight: 700,
-              boxShadow: '0 0 0 2px rgba(0,0,0,0.35)'
-            }}
-            aria-label="New version available"
-            title="New version available"
-          >
-            1
-          </span>
-        )}
-      </div>
+    <div className={`app-shell${isResizing ? ' resizing' : ''}`} data-mode={mode}>
+      <SettingsGearBadge newVersionAvailable={newVersionAvailable} />
 
       <aside className="sidebar" ref={sidebarRef} style={{ width: sidebarWidth }}>
-        <div className="controls">
-          <div className="field-row quality-scan-row">
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', width: '100%' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-                <div style={{ position: 'relative', display: 'inline-block' }}>
-                  <input
-                    className="scan-input"
-                    type="number"
-                    inputMode="numeric"
-                    min={0}
-                    max={100}
-                    step={1}
-                    value={threshold}
-                    onKeyDown={e => {
-                      if (['e','E','+','-','.'].includes(e.key)) e.preventDefault();
-                    }}
-                    onChange={e => {
-                      let raw = e.target.value;
-                      raw = raw.replace(/^0+(?=\d)/, '');
-                      let v = parseInt(raw, 10);
-                      if (isNaN(v)) v = 0;
-                      if (v < 0) v = 0;
-                      if (v > 100) v = 100;
-                      setThreshold(v);
-                    }}
-                    title="Minimum confidence (0–100). Files below this value are flagged in red."
-                    style={{ paddingRight: '1.5ch' }}
-                  />
-                  <span style={{ position: 'absolute', right: '0.5ch', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-light)' }}>%</span>
+        {!hideHeuristicQualityTools && (
+          <div className="controls">
+            <div className="field-row quality-scan-row">
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', width: '100%' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                  <div style={{ position: 'relative', display: 'inline-block' }}>
+                    <input
+                      className="scan-input"
+                      type="number"
+                      inputMode="numeric"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={threshold}
+                      onKeyDown={e => {
+                        if (['e','E','+','-','.'].includes(e.key)) e.preventDefault();
+                      }}
+                      onChange={e => {
+                        const raw = e.target.value.trim();
+                        // Allow the field to be empty mid-edit instead of snapping to 0.
+                        if (raw === '') {
+                          setThreshold(0);
+                          return;
+                        }
+                        const parsed = parseInt(raw.replace(/^0+(?=\d)/, ''), 10);
+                        if (Number.isNaN(parsed)) return; // ignore non-numeric input; keep last valid value
+                        setThreshold(Math.min(100, Math.max(0, parsed)));
+                      }}
+                      onBlur={e => {
+                        const parsed = parseInt(e.target.value, 10);
+                        setThreshold(Number.isNaN(parsed) ? 0 : Math.min(100, Math.max(0, parsed)));
+                      }}
+                      title="Minimum confidence (0–100). Files below this value are flagged in red."
+                      style={{ paddingRight: '1.5ch' }}
+                    />
+                    <span style={{ position: 'absolute', right: '0.5ch', top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', color: 'var(--text-light)' }}>%</span>
+                  </div>
+                  <button
+                    className="scan-btn btn"
+                    onClick={scanQuality}
+                    disabled={isScanningQuality || !(audioOutputDir || imageOutputDir)}
+                    aria-label="Scan transcripts to compute confidence"
+                  >
+                    {isScanningQuality ? <FaSpinner className="spin" /> : 'Check Quality'}
+                  </button>
+                  <InfoTooltip text="Enter the minimum acceptable confidence (0–100). Confidence combines placeholder density, repetition, AI boilerplate, unusual token density, wrapper/artifact signals (intro/outro chatter, markdown, encoded entities), and SRT timestamp validation penalties. Empty transcripts are marked as Blank and treated as 0% confidence. Colors: green for ≥99%, yellow between the threshold and 99%, red below the threshold." />
                 </div>
-                <button
-                  className="scan-btn btn"
-                  onClick={scanQuality}
-                  disabled={isScanningQuality || !(audioOutputDir || imageOutputDir)}
-                  aria-label="Scan transcripts to compute confidence"
-                >
-                  {isScanningQuality ? <FaSpinner className="spin" /> : 'Check Quality'}
-                </button>
-                <InfoTooltip text="Enter the minimum acceptable confidence (0–100). Confidence combines placeholder density, repetition, AI boilerplate, unusual token density, wrapper/artifact signals (intro/outro chatter, markdown, encoded entities), and SRT timestamp validation penalties. Empty transcripts are marked as Blank and treated as 0% confidence. Colors: green for ≥99%, yellow between the threshold and 99%, red below the threshold." />
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <button
-                  className="scan-btn btn"
-                  onClick={remediateDocuments}
-                  disabled={
-                    isRemediating ||
-                    !canRemediate ||
-                    !(audioOutputDir || imageOutputDir)
-                  }
-                  aria-label="Apply remediation suggestions from the last scan"
-                  style={{ flexShrink: 0 }}
-                >
-                  {isRemediating ? <FaSpinner className="spin" /> : 'Remediate'}
-                </button>
-                <InfoTooltip text="Uses the last scan’s intro/outro suggestions to clean affected transcripts. Re-scan afterwards if you want fresh confidence scores." />
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  <button
+                    className="scan-btn btn"
+                    onClick={remediateDocuments}
+                    disabled={
+                      isRemediating ||
+                      !canRemediate ||
+                      !(audioOutputDir || imageOutputDir)
+                    }
+                    aria-label="Apply remediation suggestions from the last scan"
+                    style={{ flexShrink: 0 }}
+                  >
+                    {isRemediating ? <FaSpinner className="spin" /> : 'Remediate'}
+                  </button>
+                  <InfoTooltip text="Uses the last scan’s intro/outro suggestions to clean affected transcripts. Re-scan afterwards if you want fresh confidence scores." />
+                </div>
               </div>
             </div>
           </div>
-        </div>
+        )}
         <div style={{ marginTop: '0rem' }}>
           <button
             type="button"
@@ -3156,7 +1953,7 @@ export default function App() {
                 flexDirection: 'column',
                 gap: '0.75rem',
                 background: 'rgba(21, 24, 34, 0.95)',
-                borderRadius: 12,
+                borderRadius: 'var(--radius-lg)',
                 padding: '1rem',
                 boxShadow: '0 10px 20px rgba(0,0,0,0.25)',
                 border: '1px solid rgba(255,255,255,0.08)'
@@ -3181,7 +1978,7 @@ export default function App() {
                     padding: 0,
                     background: 'rgba(255,255,255,0.06)',
                     border: '1px solid rgba(255,255,255,0.12)',
-                    borderRadius: '4px',
+                    borderRadius: 'var(--radius-sm)',
                     color: 'var(--text-light)',
                     cursor: 'pointer',
                     display: 'flex',
@@ -3239,6 +2036,18 @@ export default function App() {
                     <option value="clean">No issues</option>
                   </select>
                 </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: '0.9rem' }}>
+                  <span>Review</span>
+                  <select
+                    value={reviewStatusFilter}
+                    onChange={e => setReviewStatusFilter(e.target.value as 'all' | 'unreviewed' | 'reviewed')}
+                    style={{ width: '100%', padding: '0.45rem 0.6rem' }}
+                  >
+                    <option value="all">All files</option>
+                    <option value="unreviewed">Unreviewed</option>
+                    <option value="reviewed">Reviewed</option>
+                  </select>
+                </label>
               </div>
             </div>
           )}
@@ -3271,7 +2080,7 @@ export default function App() {
               fontSize: '0.85rem',
               background: 'var(--accent)',
               border: 'none',
-              borderRadius: '6px',
+              borderRadius: 'var(--radius-md)',
               color: '#fff',
               cursor: 'pointer',
               display: 'flex',
@@ -3291,7 +2100,7 @@ export default function App() {
               fontSize: '0.85rem',
               background: 'rgba(255,255,255,0.1)',
               border: '1px solid rgba(255,255,255,0.2)',
-              borderRadius: '6px',
+              borderRadius: 'var(--radius-md)',
               color: 'var(--text)',
               cursor: 'pointer',
               display: 'flex',
@@ -3303,80 +2112,39 @@ export default function App() {
           >
             <FaDownload size={12} /> Export
           </button>
+          <button
+            className="btn"
+            onClick={() => setShowBatchFindReplace(true)}
+            disabled={!filtered.length}
+            style={{
+              padding: '0.4rem 0.6rem',
+              fontSize: '0.85rem',
+              background: 'rgba(255,255,255,0.1)',
+              border: '1px solid rgba(255,255,255,0.2)',
+              borderRadius: 'var(--radius-md)',
+              color: 'var(--text)',
+              cursor: 'pointer',
+              transition: 'all 0.2s ease'
+            }}
+            title="Find and replace text across every listed transcript"
+          >
+            Find &amp; Replace
+          </button>
         </div>
         <ul className="transcript-list">
-          {filtered.map(t => {
-            const entry = qualityScores[t.name];
-            const displayName = splitTranscriptNameForMiddleEllipsis(t.name);
-            const issues = entry?.issues;
-            const issueSummary = issues?.length ? `• ${issues.join('\n• ')}` : null;
-            let confidenceNode: React.ReactNode = null;
-            if (entry) {
-              if (entry.blankTranscript) {
-                confidenceNode = (
-                  <span className="transcript-score transcript-score-blank" title="Transcript appears blank">
-                    Blank
-                  </span>
-                );
-              } else {
-                const confidence = entry.confidence;
-                const color =
-                  confidence < threshold ? 'red' : confidence >= 99 ? 'green' : 'yellow';
-                const display = confidence
-                  .toFixed(2)
-                  .replace(/\.00$/, '')
-                  .replace(/(\.\d)0$/, '$1');
-                confidenceNode = (
-                  <span
-                    className="transcript-score"
-                    style={{ color }}
-                    title={buildConfidenceTitle(entry, display)}
-                  >
-                    {display}%
-                  </span>
-                );
-              }
-            }
-            return (
-              <li
-                key={t.path}
-                className="transcript-item"
-                onContextMenu={(event) => onTranscriptContextMenu(event, t)}
-              >
-                <div className="transcript-main">
-                  {issueSummary && (
-                    <span
-                      className="issue-dot"
-                      aria-label={issueSummary}
-                      title={issueSummary}
-                    />
-                  )}
-                  <span
-                    className="transcript-name"
-                    title={t.name}
-                    onDoubleClick={() => openTranscript(t.path)}
-                  >
-                    {displayName.end ? (
-                      <>
-                        <span className="transcript-name-start">{displayName.start}</span>
-                        <span className="transcript-name-end">{displayName.end}</span>
-                      </>
-                    ) : (
-                      t.name
-                    )}
-                  </span>
-                  {confidenceNode}
-                </div>
-                <button
-                  className="transcript-delete"
-                  onClick={() => removeFile(t.path)}
-                  title="Remove"
-                >
-                  ×
-                </button>
-              </li>
-            );
-          })}
+          {filtered.map(t => (
+            <TranscriptListItem
+              key={t.path}
+              transcript={t}
+              entry={displayScores[t.name]}
+              threshold={threshold}
+              reviewed={Boolean(reviewedStatus[t.name])}
+              onOpen={openTranscript}
+              onRemove={removeFile}
+              onToggleReviewed={toggleReviewed}
+              onContextMenu={onTranscriptContextMenu}
+            />
+          ))}
         </ul>
         <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: '0.75rem' }}>
           <button
@@ -3388,7 +2156,7 @@ export default function App() {
               fontSize: '0.85rem',
               background: 'rgba(255,255,255,0.1)',
               border: '1px solid rgba(255,255,255,0.2)',
-              borderRadius: '6px',
+              borderRadius: 'var(--radius-md)',
               color: 'var(--text)',
               cursor: 'pointer',
               display: 'flex',
@@ -3407,8 +2175,29 @@ export default function App() {
             className="transcript-context-menu"
             style={{ top: contextMenu.y, left: contextMenu.x }}
             role="menu"
+            aria-label="Transcript actions"
+            ref={el => {
+              if (el && !el.contains(document.activeElement)) {
+                (el.querySelector('button:not(:disabled)') as HTMLButtonElement | null)?.focus();
+              }
+            }}
+            onKeyDown={e => {
+              if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+              e.preventDefault();
+              const items = Array.from(
+                e.currentTarget.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')
+              );
+              if (!items.length) return;
+              const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+              const next =
+                e.key === 'ArrowDown'
+                  ? items[(idx + 1) % items.length]
+                  : items[(idx - 1 + items.length) % items.length];
+              next.focus();
+            }}
           >
             <button
+              role="menuitem"
               className="transcript-context-item"
               onClick={() => {
                 openSourceFileForTranscript(contextMenu.transcript);
@@ -3418,8 +2207,33 @@ export default function App() {
             >
               Open original file
             </button>
+            {canOcrReviewContextFile && (
+              <button
+                role="menuitem"
+                className="transcript-context-item"
+                onClick={() => {
+                  openOcrReview(contextMenu.transcript.path);
+                  closeContextMenu();
+                }}
+              >
+                Open in OCR Review
+              </button>
+            )}
+            {canAudioReviewContextFile && (
+              <button
+                role="menuitem"
+                className="transcript-context-item"
+                onClick={() => {
+                  openAudioReview(contextMenu.transcript);
+                  closeContextMenu();
+                }}
+              >
+                Open in Audio Review
+              </button>
+            )}
             {canDeleteGeneratedContextFamily && (
               <button
+                role="menuitem"
                 className="transcript-context-item"
                 onClick={() => {
                   void deleteGeneratedFileFamily(contextMenu.transcript);
@@ -3431,6 +2245,7 @@ export default function App() {
               </button>
             )}
             <button
+              role="menuitem"
               className="transcript-context-item"
               onClick={() => {
                 void remediateSingleDocument(contextMenu.transcript.name);
@@ -3441,6 +2256,7 @@ export default function App() {
               Remediate file
             </button>
             <button
+              role="menuitem"
               className="transcript-context-item"
               onClick={() => {
                 clearTranscriptWarnings(contextMenu.transcript.name);
@@ -3456,26 +2272,52 @@ export default function App() {
       </aside>
 
       <main className="content">
-        <div className="logo">TranscribeAI</div>
-
-        <div
-          className={`mode-toggle ${mode}`}
-          onClick={() => setMode(m => (m === 'audio' ? 'image' : 'audio'))}
-        >
-          <div className={mode === 'audio' ? 'label active' : 'label'}>Audio</div>
-          <div className={mode === 'image' ? 'label active' : 'label'}>Image</div>
-          <div className="toggle-thumb" />
+        <div className="logo">
+          TranscribeAI
+          <span className="logo-tagline">Audio &amp; Document Transcription</span>
         </div>
+
+        <button
+          type="button"
+          className={`mode-toggle ${mode}`}
+          role="switch"
+          aria-checked={mode === 'image'}
+          aria-label="Transcription mode: Audio or Image"
+          onClick={() => setMode(m => (m === 'audio' ? 'image' : 'audio'))}
+          onKeyDown={e => {
+            if (e.key === 'ArrowLeft' || e.key === 'Home') {
+              e.preventDefault();
+              setMode('audio');
+            } else if (e.key === 'ArrowRight' || e.key === 'End') {
+              e.preventDefault();
+              setMode('image');
+            }
+          }}
+        >
+          <span className={mode === 'audio' ? 'label active' : 'label'}>Audio</span>
+          <span className={mode === 'image' ? 'label active' : 'label'}>Image</span>
+          <span className="toggle-thumb" />
+        </button>
 
         {mode === 'audio' ? (
           <AudioTranscriber
             inputPath={audioInputPath}
             outputDir={audioOutputDir}
             isTranscribing={isTranscribing}
+            mistralVoxtralMode={isMistralAudioModel}
+            batchEnabled={effectiveAudioBatchEnabled}
+            batchSize={audioBatchSize}
+            inputIsDirectory={audioInputIsDirectory}
+            batchStats={audioBatchStats}
+            costEstimate={audioBatchCostEstimate}
             onSelectInput={selectInput}
             onSelectOutput={selectOutput}
             onClearInput={clearAudioInputPath}
             onClearOutput={clearAudioOutputDir}
+            onToggleBatch={toggleAudioBatch}
+            onBatchSizeChange={setAudioBatchSize}
+            onOpenBatchQueue={openBatchQueueWindow}
+            queueCollectionCount={mistralQueueCollectionCount}
             onTranscribe={transcribeAudio}
             onCancel={cancel}
           />
@@ -3490,13 +2332,14 @@ export default function App() {
             batchSize={imageBatchSize}
             inputIsDirectory={imageInputIsDirectory}
             batchStats={mistralBatchStats}
+            costEstimate={imageBatchCostEstimate}
             onSelectInput={selectInput}
             onSelectOutput={selectOutput}
             onClearInput={clearImageInputPath}
             onClearOutput={clearImageOutputDir}
-            onToggleOutputPdf={() => setMistralOutputPdf(v => !v)}
-            onToggleBatch={() => setImageBatchEnabled(v => !v)}
-            onBatchSizeChange={(size: number) => setImageBatchSize(size)}
+            onToggleOutputPdf={toggleMistralOutputPdf}
+            onToggleBatch={toggleImageBatch}
+            onBatchSizeChange={setImageBatchSize}
             onOpenBatchQueue={openBatchQueueWindow}
             queueCollectionCount={mistralQueueCollectionCount}
             onTranscribe={transcribeImage}
@@ -3504,67 +2347,27 @@ export default function App() {
           />
         )}
 
-        {status && <div className="status-bar">{status}</div>}
-
-        <section className={`logs-panel ${showLogs ? 'open' : 'collapsed'}`}>
-          <div
-            className="logs-header"
-            role="button"
-            tabIndex={0}
-            aria-expanded={showLogs}
-            onClick={toggleLogs}
-            onKeyDown={e => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                toggleLogs();
-              }
-            }}
-          >
-            <div className="logs-title-group">
-              <h3>Activity Logs</h3>
-              <span className="logs-hint" aria-label="Activity log details">
-                <FaInfoCircle />
-                <span className="logs-hint-text">
-                  Monitor recent transcription events and quality cleanups.
-                </span>
-              </span>
-            </div>
-            <div className="logs-actions">
-              <span
-                className="logs-indicator"
-                aria-label={showLogs ? 'Hide logs' : 'Show logs'}
-              >
-                {showLogs ? <FaChevronUp /> : <FaChevronDown />}
-              </span>
-              <button
-                className="logs-export"
-                onClick={e => {
-                  e.stopPropagation();
-                  exportLogs();
-                }}
-                title="Export logs"
-                aria-label="Export logs"
-              >
-                <FaDownload />
-              </button>
-              <button
-                className="logs-clear"
-                onClick={e => {
-                  e.stopPropagation();
-                  clearLogs();
-                }}
-                title="Clear logs"
-                aria-label="Clear logs"
-              >
-                <FaTrash />
-              </button>
-            </div>
+        {status && (
+          <div className="status-bar" role="status" aria-live="polite">
+            {status}
           </div>
-          {showLogs && <pre className="logs-body">{logs || '— no logs —'}</pre>}
-        </section>
+        )}
+
+        <LogsPanel
+          logs={logs}
+          showLogs={showLogs}
+          onToggle={toggleLogs}
+          onExport={exportLogs}
+          onClear={clearLogs}
+          logsBodyRef={logsBodyRef}
+        />
       </main>
 
-      {toast && <div className="toast">{toast}</div>}
+      {toast && (
+        <div className="toast" role="status" aria-live="polite" aria-atomic="true">
+          {toast}
+        </div>
+      )}
 
       {pathPicker && (
         <FolderPickerModal
@@ -3587,6 +2390,38 @@ export default function App() {
           onCancel={closePathPicker}
         />
       )}
+
+      {ocrReview && (
+        <OcrReviewModal
+          isOpen
+          txtPath={ocrReview.txtPath}
+          data={ocrReview.data}
+          onClose={closeOcrReview}
+          onSaved={refreshCurrentTranscriptList}
+          reviewed={Boolean(reviewedStatus[pathModule.basename(ocrReview.txtPath)])}
+          onToggleReviewed={toggleOcrReviewReviewed}
+        />
+      )}
+
+      {audioReview && (
+        <AudioReviewModal
+          isOpen
+          txtPath={audioReview.txtPath}
+          srtPath={audioReview.srtPath}
+          data={audioReview.data}
+          onClose={closeAudioReview}
+          onSaved={refreshCurrentTranscriptList}
+          reviewed={Boolean(reviewedStatus[pathModule.basename(audioReview.txtPath)])}
+          onToggleReviewed={toggleAudioReviewReviewed}
+        />
+      )}
+
+      <BatchFindReplaceModal
+        isOpen={showBatchFindReplace}
+        files={filtered}
+        onClose={() => setShowBatchFindReplace(false)}
+        onDone={refreshCurrentTranscriptList}
+      />
     </div>
   );
 }
