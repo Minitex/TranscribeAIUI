@@ -1,7 +1,7 @@
 {
   "name": "TranscribeAI",
   "private": true,
-  "version": "4.0.0",
+  "version": "4.0.1",
   "type": "module",
   "author": "Ninh Tran <ninhtran@umn.edu>",
   "main": "dist-electron/main.js",
@@ -26,7 +26,7 @@
     "@napi-rs/canvas": "^1.0.2",
     "electron-store": "^11.0.2",
     "ffmpeg-static": "^5.3.0",
-    "katex": "^0.17.0",
+    "katex": "^0.18.1",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^6.1.200",
     "react": "^19.2.7",

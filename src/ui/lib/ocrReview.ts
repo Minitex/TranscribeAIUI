@@ -258,6 +258,24 @@ export function alignWordsToRawText(
   return offsets;
 }
 
+// Folds a review session's edits/confirmations back into a page's own word
+// records. wordOverrides only ever lives in the modal's React state and the
+// saved .txt gets the corrected text — the OCR sidecar's word.text does not
+// — so without this, reopening the review shows the original (wrong) OCR
+// guess again even though the .txt file itself already has the fix.
+export function resolveWordEdits(
+  words: OcrReviewWord[],
+  wordOverrides: Map<OcrReviewWord, string>,
+  confirmedWords: Set<OcrReviewWord>
+): OcrReviewWord[] {
+  return words.map(w => {
+    const override = wordOverrides.get(w);
+    if (override !== undefined) return { ...w, text: override, confidence: 1 };
+    if (confirmedWords.has(w)) return { ...w, confidence: 1 };
+    return w;
+  });
+}
+
 export function alignWordsToBlocks(
   blocks: OcrReviewBlock[],
   words: OcrReviewWord[]

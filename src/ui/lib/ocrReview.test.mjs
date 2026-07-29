@@ -13,7 +13,8 @@ import {
   confidenceTierRank,
   isLineBreakWord,
   isRenderableWord,
-  readJpegOrientation
+  readJpegOrientation,
+  resolveWordEdits
 } from './ocrReview.ts';
 
 // Mirrors the real Mistral OCR 4 payload shape that broke naive token
@@ -154,6 +155,24 @@ test('confidenceTierRank orders the flag jump worst-tier-first', () => {
   // Same tier, different exact confidence -> same rank, so a later tiebreak
   // (reading order) decides instead of the raw score.
   assert.equal(confidenceTierRank(0.5), confidenceTierRank(0.7));
+});
+
+test('resolveWordEdits folds an edited word\'s corrected text back in, not just its confidence', () => {
+  const edited = w('teh', 0.4);
+  const confirmed = w('weird', 0.9);
+  const untouched = w('fine', 0.99);
+  const pageWords = [edited, confirmed, untouched];
+  const wordOverrides = new Map([[edited, 'the']]);
+  const confirmedWords = new Set([confirmed]);
+
+  const resolved = resolveWordEdits(pageWords, wordOverrides, confirmedWords);
+
+  assert.deepEqual(resolved[0], { text: 'the', confidence: 1 }); // correction applied
+  assert.deepEqual(resolved[1], { text: 'weird', confidence: 1 }); // text kept, confidence bumped
+  assert.deepEqual(resolved[2], untouched); // neither edited nor confirmed: untouched
+  // originals are not mutated in place
+  assert.equal(edited.text, 'teh');
+  assert.equal(edited.confidence, 0.4);
 });
 
 test('bboxToDisplayRect maps stored-frame boxes into the displayed frame', () => {

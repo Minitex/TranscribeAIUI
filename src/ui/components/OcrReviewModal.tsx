@@ -10,7 +10,8 @@ import {
   confidenceTierRank,
   isLineBreakWord,
   isRenderableWord,
-  readJpegOrientation
+  readJpegOrientation,
+  resolveWordEdits
 } from '../lib/ocrReview';
 import { accessiblePdfPathForTranscript, ocrReviewSidecarPathForTranscript } from '../lib/paths';
 import type { OcrReviewData, OcrReviewWord } from '../lib/types';
@@ -284,14 +285,15 @@ const OcrReviewModal: React.FC<OcrReviewModalProps> = ({
     return true;
   };
 
-  // A human has now looked at every edited or confirmed word, so treat them
-  // as fully confident and fold that into the OCR sidecar's per-page average
-  // — otherwise the confidence shown in the transcript list would stay
-  // frozen at whatever the original OCR pass scored, even after review.
+  // A human has now looked at every edited or confirmed word: fold the
+  // correction (if any) and full confidence back into the OCR sidecar, so
+  // reopening the review shows the fixed text instead of the original OCR
+  // guess, and the confidence shown in the transcript list doesn't stay
+  // frozen at whatever the original OCR pass scored.
   const persistResolvedConfidence = () => {
     try {
       const pages = data.pages.map(p => {
-        const words = p.words.map(w => (wordOverrides.has(w) || confirmedWords.has(w)) ? { ...w, confidence: 1 } : w);
+        const words = resolveWordEdits(p.words, wordOverrides, confirmedWords);
         const scores = words.map(w => w.confidence).filter((c): c is number => Number.isFinite(c));
         return {
           ...p,
